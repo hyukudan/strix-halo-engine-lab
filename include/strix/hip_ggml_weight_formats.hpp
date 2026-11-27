@@ -1,7 +1,7 @@
 #pragma once
 
 // Device decode of one weight element for the GSQ-RCO GGUF formats (Q2_0, Q4_0, Q5_0, Q3_K, Q6_K,
-// IQ2_S, IQ3_XXS, IQ3_S; Q4_K/Q5_K/Q8_0/IQ4_NL/IQ4_XS/Q5_1 stay in each launcher). Every value is the
+// IQ2_S, IQ3_XXS, IQ3_S; the launcher load path of Q8_0/IQ4_NL/IQ4_XS is below). Every value is the
 // same float operations, in the same order, as strix::ggml_dequant (= llama.cpp's dequantize_row_*),
 // written with __fmul_rn / __fadd_rn so no contraction can change a bit. Row-major ggml blocks:
 // element (row, feature) lives in block row * (row_width / block) + feature / block.
@@ -175,6 +175,74 @@ __device__ inline float block_element<type_iq4_nl>(const std::uint8_t* x, std::u
     const auto byte = x[2U + e % 16U];
     return __fmul_rn(half_bits(x), static_cast<float>(kvalues_iq4nl[e < 16U ? (byte & 0xFU) : (byte >> 4U)]));
 }
+// Block layouts and element decoders of the formats the launchers decode on their own load path
+// (Q8_0, IQ4_NL, IQ4_XS). One home for every HIP launcher: the operand order is the launchers' (scale
+// times code; IQ4_XS: block scale times local scale times code), products only, so no contraction
+// applies and a launcher that binds them emits the instructions of its former private copy.
+struct Q8Block {
+    __half scale;
+    std::int8_t values[32];
+};
+
+struct IQ4NLBlock {
+    __half d;
+    std::uint8_t qs[16];
+};
+
+struct IQ4XSBlock {
+    __half d;
+    std::uint16_t scales_h;
+    std::uint8_t scales_l[4];
+    std::uint8_t qs[128];
+};
+
+static_assert(sizeof(Q8Block) == 34);
+static_assert(sizeof(IQ4NLBlock) == 18);
+static_assert(sizeof(IQ4XSBlock) == 136);
+
+// Six-bit local scale of 32-element sub-block `subblock` (low nibble from scales_l, top two bits from scales_h).
+__device__ __forceinline__ std::uint8_t iq4_local_scale(const IQ4XSBlock& block, std::uint32_t subblock) {
+    const auto low_byte = block.scales_l[subblock / 2U];
+    const auto low = static_cast<std::uint8_t>((low_byte >> (4U * (subblock % 2U))) & 0x0fU);
+    const auto high = static_cast<std::uint8_t>((block.scales_h >> (2U * subblock)) & 0x03U);
+    return static_cast<std::uint8_t>(low | static_cast<std::uint8_t>(high << 4U));
+}
+
+// Element (row, feature) of a row-major tensor of `row_width` columns.
+__device__ __forceinline__ float q8_0_value(const void* weights, std::uint32_t row_width, std::uint64_t row,
+                                            std::uint32_t feature) {
+    const auto* blocks = static_cast<const Q8Block*>(weights);
+    const auto blocks_per_row = row_width / 32U;
+    const auto& block = blocks[row * blocks_per_row + feature / 32U];
+    return __half2float(block.scale) * static_cast<float>(block.values[feature % 32U]);
+}
+
+__device__ __forceinline__ float iq4_nl_value(const void* weights, std::uint32_t row_width, std::uint64_t row,
+                                              std::uint32_t feature) {
+    const auto* blocks = static_cast<const IQ4NLBlock*>(weights);
+    const auto blocks_per_row = row_width / 32U;
+    const auto& block = blocks[row * blocks_per_row + feature / 32U];
+    const auto within = feature % 32U;
+    const auto packed = block.qs[within % 16U];
+    const auto code = within < 16U ? static_cast<std::uint8_t>(packed & 0x0fU) : static_cast<std::uint8_t>(packed >> 4U);
+    return __half2float(block.d) * static_cast<float>(kvalues_iq4nl[code]);
+}
+
+__device__ __forceinline__ float iq4_xs_value(const void* weights, std::uint32_t row_width, std::uint64_t row,
+                                              std::uint32_t feature) {
+    const auto* blocks = static_cast<const IQ4XSBlock*>(weights);
+    const auto blocks_per_row = row_width / 256U;
+    const auto& block = blocks[row * blocks_per_row + feature / 256U];
+    const auto within = feature % 256U;
+    const auto subblock = within / 32U;
+    const auto suboffset = within % 32U;
+    const auto packed = block.qs[subblock * 16U + suboffset % 16U];
+    const auto code =
+        suboffset < 16U ? static_cast<std::uint8_t>(packed & 0x0fU) : static_cast<std::uint8_t>(packed >> 4U);
+    const int local = static_cast<int>(iq4_local_scale(block, subblock)) - 32;
+    return __half2float(block.d) * static_cast<float>(local) * static_cast<float>(kvalues_iq4nl[code]);
+}
+
 // block_iq4_xs: d, scales_h (u16), scales_l[4], qs[128]
 template <>
 __device__ inline float block_element<type_iq4_xs>(const std::uint8_t* x, std::uint32_t e) {

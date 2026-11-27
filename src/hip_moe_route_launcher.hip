@@ -1,5 +1,6 @@
 #include "strix/hip/legacy_intrinsics.hpp"
 #include "strix/hip/legacy_launch.hpp"
+#include "strix/hip_ggml_weight_formats.hpp"
 #include "strix/cohort_step_plan.hpp"
 #include "strix/env_flags.hpp"
 #include "moe_core/route.hpp"
@@ -75,12 +76,7 @@ constexpr std::uint64_t fnv_offset =
 constexpr std::uint64_t fnv_prime =
     1099511628211ULL;
 
-struct Q8Block {
-    __half scale;
-    std::int8_t values[32];
-};
-
-static_assert(sizeof(Q8Block) == 34);
+using hip_ggml::Q8Block;
 
 enum class RouterWeightKind {
     f32,
@@ -259,22 +255,7 @@ __device__ float load_weight<
     std::uint32_t hidden_size,
     std::uint32_t expert,
     std::uint32_t feature) {
-    const auto* blocks =
-        static_cast<const Q8Block*>(
-            weights);
-    const auto blocks_per_row =
-        hidden_size / 32U;
-    const auto& block =
-        blocks[
-            static_cast<std::uint64_t>(
-                expert) *
-                blocks_per_row +
-            feature / 32U];
-    return __half2float(
-               block.scale) *
-           static_cast<float>(
-               block.values[
-                   feature % 32U]);
+    return hip_ggml::q8_0_value(weights, hidden_size, expert, feature);
 }
 
 __device__ bool better(

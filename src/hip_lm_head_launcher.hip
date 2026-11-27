@@ -47,34 +47,9 @@ constexpr std::uint64_t fnv_offset =
 constexpr std::uint64_t fnv_prime =
     1099511628211ULL;
 
-struct Q8Block {
-    __half scale;
-    std::int8_t values[32];
-};
-
-struct IQ4NLBlock {
-    __half d;
-    std::uint8_t qs[16];
-};
-
-struct IQ4XSBlock {
-    __half d;
-    std::uint16_t scales_h;
-    std::uint8_t scales_l[4];
-    std::uint8_t qs[128];
-};
-
-static_assert(sizeof(Q8Block) == 34);
-static_assert(sizeof(IQ4NLBlock) == 18);
-static_assert(sizeof(IQ4XSBlock) == 136);
-
-__device__ __constant__
-std::int8_t iq4_codebook[16] = {
-    -127, -104, -83, -65,
-    -49, -35, -22, -10,
-       1,   13,  25,  38,
-      53,   69,  89, 113,
-};
+using hip_ggml::Q8Block;
+using hip_ggml::IQ4NLBlock;
+using hip_ggml::IQ4XSBlock;
 
 enum class WeightKind {
     f32,
@@ -175,27 +150,6 @@ __device__ float load_activation(
     return bf16_to_float(*value);
 }
 
-__device__ std::uint8_t iq4_local_scale(
-    const IQ4XSBlock& block,
-    std::uint32_t subblock) {
-    const auto low_byte =
-        block.scales_l[subblock / 2U];
-    const auto low =
-        static_cast<std::uint8_t>(
-            (low_byte >>
-             (4U * (subblock % 2U))) &
-            0x0fU);
-    const auto high =
-        static_cast<std::uint8_t>(
-            (block.scales_h >>
-             (2U * subblock)) &
-            0x03U);
-    return static_cast<std::uint8_t>(
-        low |
-        static_cast<std::uint8_t>(
-            high << 4U));
-}
-
 template <WeightKind Kind>
 __device__ float load_weight(
     const void* weights,
@@ -253,19 +207,7 @@ __device__ float load_weight<WeightKind::q8_0>(
     std::uint32_t row_width,
     std::uint32_t row,
     std::uint32_t feature) {
-    const auto* blocks =
-        static_cast<const Q8Block*>(weights);
-    const auto blocks_per_row =
-        row_width / 32U;
-    const auto& block =
-        blocks[
-            static_cast<std::uint64_t>(row) *
-                blocks_per_row +
-            feature / 32U];
-    return __half2float(block.scale) *
-           static_cast<float>(
-               block.values[
-                   feature % 32U]);
+    return hip_ggml::q8_0_value(weights, row_width, row, feature);
 }
 
 template <>
@@ -274,28 +216,7 @@ __device__ float load_weight<WeightKind::iq4_nl>(
     std::uint32_t row_width,
     std::uint32_t row,
     std::uint32_t feature) {
-    const auto* blocks =
-        static_cast<const IQ4NLBlock*>(weights);
-    const auto blocks_per_row =
-        row_width / 32U;
-    const auto& block =
-        blocks[
-            static_cast<std::uint64_t>(row) *
-                blocks_per_row +
-            feature / 32U];
-    const auto within =
-        feature % 32U;
-    const auto packed =
-        block.qs[within % 16U];
-    const auto code =
-        within < 16U
-            ? static_cast<std::uint8_t>(
-                  packed & 0x0fU)
-            : static_cast<std::uint8_t>(
-                  packed >> 4U);
-    return __half2float(block.d) *
-           static_cast<float>(
-               iq4_codebook[code]);
+    return hip_ggml::iq4_nl_value(weights, row_width, row, feature);
 }
 
 template <>
@@ -304,43 +225,7 @@ __device__ float load_weight<WeightKind::iq4_xs>(
     std::uint32_t row_width,
     std::uint32_t row,
     std::uint32_t feature) {
-    const auto* blocks =
-        static_cast<const IQ4XSBlock*>(weights);
-    const auto blocks_per_row =
-        row_width / 256U;
-    const auto& block =
-        blocks[
-            static_cast<std::uint64_t>(row) *
-                blocks_per_row +
-            feature / 256U];
-
-    const auto within =
-        feature % 256U;
-    const auto subblock =
-        within / 32U;
-    const auto suboffset =
-        within % 32U;
-    const auto packed =
-        block.qs[
-            subblock * 16U +
-            suboffset % 16U];
-    const auto code =
-        suboffset < 16U
-            ? static_cast<std::uint8_t>(
-                  packed & 0x0fU)
-            : static_cast<std::uint8_t>(
-                  packed >> 4U);
-    const int local =
-        static_cast<int>(
-            iq4_local_scale(
-                block,
-                subblock)) -
-        32;
-
-    return __half2float(block.d) *
-           static_cast<float>(local) *
-           static_cast<float>(
-               iq4_codebook[code]);
+    return hip_ggml::iq4_xs_value(weights, row_width, row, feature);
 }
 
 #define STRIX_GGML_KIND_LOAD(kind, type)                                                          \

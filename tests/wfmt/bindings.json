@@ -2214,7 +2214,6 @@
         "hipLaunchKernelGGL",
         "identify_tensors",
         "invalid_argument",
-        "iq4_local_scale",
         "k_group_factors",
         "kernel_id",
         "kernel_symbol",
@@ -2828,6 +2827,7 @@
       "operations": [
         "block_element",
         "ggml_dequant",
+        "iq4_local_scale",
         "k_scale_min",
         "scales_h",
         "supported"

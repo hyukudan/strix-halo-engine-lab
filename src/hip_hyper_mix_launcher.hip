@@ -1,5 +1,6 @@
 #include "strix/hip/legacy_intrinsics.hpp"
 #include "strix/hip/legacy_launch.hpp"
+#include "strix/hip_ggml_weight_formats.hpp"
 #include "strix/cohort_step_plan.hpp"
 #include "strix/hip_mtp_prime_rows.hpp"
 #include "strix/env_flags.hpp"
@@ -69,28 +70,8 @@ constexpr std::uint64_t fnv_offset =
 constexpr std::uint64_t fnv_prime =
     1099511628211ULL;
 
-struct Q8Block {
-    __half scale;
-    std::int8_t values[32];
-};
-
-struct IQ4XSBlock {
-    __half d;
-    std::uint16_t scales_h;
-    std::uint8_t scales_l[4];
-    std::uint8_t qs[128];
-};
-
-static_assert(sizeof(Q8Block) == 34);
-static_assert(sizeof(IQ4XSBlock) == 136);
-
-__device__ __constant__
-std::int8_t iq4_codebook[16] = {
-    -127, -104, -83, -65,
-    -49, -35, -22, -10,
-       1,   13,  25,  38,
-      53,   69,  89, 113,
-};
+using hip_ggml::Q8Block;
+using hip_ggml::IQ4XSBlock;
 
 void hash_u64(
     std::uint64_t& hash,
@@ -229,30 +210,6 @@ __device__ void store_activation(
 
 #include "hip_qpf2k_pinned.inc"
 
-__device__ std::uint8_t iq4_local_scale(
-    const IQ4XSBlock& block,
-    std::uint32_t subblock) {
-    const auto packed =
-        block.scales_l[
-            subblock / 2U];
-    const auto low =
-        static_cast<std::uint8_t>(
-            (packed >>
-             (4U *
-              (subblock % 2U))) &
-            0x0fU);
-    const auto high =
-        static_cast<std::uint8_t>(
-            (block.scales_h >>
-             (2U * subblock)) &
-            0x03U);
-    return
-        static_cast<std::uint8_t>(
-            low |
-            static_cast<std::uint8_t>(
-                high << 4U));
-}
-
 __device__ float load_linear_weight(
     const void* weights,
     std::uint32_t ggml_type,
@@ -283,68 +240,11 @@ __device__ float load_linear_weight(
                 const std::uint16_t*>(
                     weights)[flat]);
 
-    case 8: {
-        const auto blocks_per_row =
-            row_width / 32U;
-        const auto& block =
-            static_cast<
-                const Q8Block*>(
-                    weights)[
-                static_cast<
-                    std::uint64_t>(
-                    output_index) *
-                    blocks_per_row +
-                input_index / 32U];
-        return
-            __half2float(
-                block.scale) *
-            static_cast<float>(
-                block.values[
-                    input_index % 32U]);
-    }
+    case 8:
+        return hip_ggml::q8_0_value(weights, row_width, output_index, input_index);
 
-    case 23: {
-        const auto blocks_per_row =
-            row_width / 256U;
-        const auto& block =
-            static_cast<
-                const IQ4XSBlock*>(
-                    weights)[
-                static_cast<
-                    std::uint64_t>(
-                    output_index) *
-                    blocks_per_row +
-                input_index / 256U];
-        const auto within =
-            input_index % 256U;
-        const auto subblock =
-            within / 32U;
-        const auto suboffset =
-            within % 32U;
-        const auto packed =
-            block.qs[
-                subblock * 16U +
-                suboffset % 16U];
-        const auto code =
-            suboffset < 16U
-                ? static_cast<
-                      std::uint8_t>(
-                      packed & 0x0fU)
-                : static_cast<
-                      std::uint8_t>(
-                      packed >> 4U);
-        const int local =
-            static_cast<int>(
-                iq4_local_scale(
-                    block,
-                    subblock)) -
-            32;
-        return
-            __half2float(block.d) *
-            static_cast<float>(local) *
-            static_cast<float>(
-                iq4_codebook[code]);
-    }
+    case 23:
+        return hip_ggml::iq4_xs_value(weights, row_width, output_index, input_index);
 
     default:
         return NAN;
