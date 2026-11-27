@@ -2178,6 +2178,13 @@ inline strix::qwen::profile::Resolution resolve_request_product_profile(Options&
         o.product_profile_requested.value_or(strix::qwen::profile::Name::standard), inputs);
 }
 
+// EXACT (the default column) runs the dense-a8 reference prefill: the product profile's prefill_f16wmma row resolved
+// to its off value. The one reading of that row, shared by the CLI prompt route, the HTTP route and the YaRN route.
+inline bool product_profile_prefill_f16_off(const Options& o) {
+    const auto* row = o.product_profile.find("prefill_f16wmma");
+    return row && strix::profile::applied(row->status) && row->value == row->lever->off;
+}
+
 inline Options parse_options(
     int argc,
     char** argv, bool defer_qpf2k_defaults = false, std::string bundle_path = {},

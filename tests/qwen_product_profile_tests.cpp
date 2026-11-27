@@ -59,7 +59,9 @@ void product() {
             const bool provisional = profile == pr::Name::fast;
             // Fast applies the runnable GDN chunk row as provisional, with or without permission.
             const bool gdn = provisional;
-            check(exported.size() == (provisional ? (gdn ? 6U : 4U) : 0U), "provisional runnable rows and provenance export without permission");
+            check(exported.size() == (provisional ? (gdn ? 6U : 4U) : 2U),
+                "provisional runnable rows and provenance export without permission (EXACT and quality export the HC output WMMA off value)");
+            check(provisional || exported.at("STRIX_PREFILL_HC_OUTPUT_WMMA") == "0", "EXACT switches the HC output WMMA off");
             if (gdn) check(exported.at("STRIX_QPF2K_GDN_FP16_CHUNK") == "1" &&
                 exported.at("STRIX_QWEN_PROFILE_OWNED_gdn_fp16_chunk") == "fast:provisional:1", "fast applies the GDN chunk row without permission");
             if (provisional) {
@@ -68,13 +70,13 @@ void product() {
                     "fast exports distinct provisional provenance without permission");
             }
             check(r.qualification() == (provisional ? "qualification in progress: qsa_budget,moe_route_bf16,gdn_fp16_chunk" : "qualified"), "qualification names applied provisional rows");
-            check(r.entries.size() == (profile == pr::Name::fast ? 4U : 0U), "only fast has product rows");
+            check(r.entries.size() == (profile == pr::Name::fast ? 6U : 2U), "fast carries the product rows; EXACT and quality only the FP16 prefill off rows");
             const auto json = strix::serve::parse_json_unique(r.json());
             check(json.find("profile")->as_string() == pr::name(profile), "JSON profile name");
             check(json.find("unqualified")->size() == 0U, "provisional is distinct from unqualified rows");
             check(json.find("provisional")->size() == (provisional ? 3U : 0U) &&
                 (!provisional || json.find("provisional")->as_array()[0].as_string() == "qsa_budget"), "JSON provisional list");
-            check(json.find("pending")->size() == r.entries.size() - (provisional ? 2U : 0U) - (gdn ? 1U : 0U), "JSON pending rows");
+            check(json.find("pending")->size() == r.entries.size() - (provisional ? 4U : 2U) - (gdn ? 1U : 0U), "JSON pending rows");
             for (const auto& entry : r.entries) {
                 if (provisional && entry.lever->name == "moe_route_bf16") {
                     check(entry.status == pr::Status::provisional && entry.value == "1", "provisional row applies");
@@ -87,12 +89,16 @@ void product() {
                     check(entry.status == pr::Status::provisional && entry.value == "1536", "provisional QSA budget applies");
                 } else if (gdn && entry.lever->name == "gdn_fp16_chunk") {
                     check(entry.status == pr::Status::provisional && entry.value == "1", "provisional GDN chunk row applies");
+                } else if (entry.lever->name == "prefill_f16wmma" || entry.lever->name == "hc_output_wmma") {
+                    check(provisional ? entry.value == "1" && entry.status == pr::Status::builtin
+                                      : entry.value == "0" && entry.status == pr::Status::set,
+                          "FP16 WMMA prefill rows: FAST keeps the incumbent route, EXACT and quality run the reference");
                 } else {
                     check(entry.status == pr::Status::pending && entry.value == entry.lever->builtin, "pending keeps builtin");
                     check(!entry.target.empty(), "pending records declared target");
                 }
             }
-            check(r.notices().size() == (profile == pr::Name::quality ? 1U : r.entries.size()),
+            check(r.notices().size() == (profile == pr::Name::quality ? 1U : provisional ? r.entries.size() - 2U : 0U),
                 "one notice per provisional or pending row");
             unsigned provisional_notices = 0;
             for (const auto& notice : r.notices()) if (notice.find("moe_route_bf16") != std::string::npos) {
@@ -107,10 +113,12 @@ void product() {
     check(pr::resolve(pr::Name::quality, inputs).json().find("\"note\":\"quality: no quality rows for this model, using default\"") != std::string::npos &&
         pr::resolve(pr::Name::standard, inputs).json().find("\"note\"") == std::string::npos, "quality receipt names the default it runs");
     for (const auto& lever : pr::levers()) {
-        check(!lever.name.empty() && (!lever.option.empty() || !lever.env.empty()) && !lever.source.empty(), "editable table has provenance and a CLI or environment control");
-        check(lever.value[0].empty() && lever.value[2].empty(), "default and quality leave every lever alone");
-        check(!lever.ready[1] && lever.runnable[1] == (lever.name == "qsa_budget" || lever.name == "moe_route_bf16" || lever.name == "gdn_fp16_chunk" ||
-                lever.name == "moe_route_prune"),
+        check(!lever.name.empty() && (!lever.option.empty() || !lever.env.empty() || lever.name == "prefill_f16wmma") && !lever.source.empty(), "editable table has provenance and a CLI or environment control");
+        const bool exact_off = lever.name == "prefill_f16wmma" || lever.name == "hc_output_wmma";
+        check(exact_off ? lever.value[0] == lever.off && lever.value[2] == lever.off : lever.value[0].empty() && lever.value[2].empty(),
+            "default and quality leave every lever alone except the FP16 WMMA prefill rows, which they switch off");
+        check((exact_off ? lever.ready[1] && lever.value[1] == lever.builtin : !lever.ready[1]) && lever.runnable[1] == (lever.name == "qsa_budget" || lever.name == "moe_route_bf16" || lever.name == "gdn_fp16_chunk" ||
+                lever.name == "moe_route_prune" || exact_off),
             "QSA budget, MoE route storage, the GDN chunk route and the optional route prune are runnable");
         check(!lever.provisional[0] && !lever.provisional[2] &&
             lever.provisional[1] == (lever.name == "qsa_budget" || lever.name == "moe_route_bf16" || lever.name == "gdn_fp16_chunk"),
@@ -276,7 +284,10 @@ void cli_and_receipts() {
             gdn_env["STRIX_QPF2K_GDN_FP16_CHUNK"] = "1";
             gdn_env["STRIX_QPF2K_QSA_BUDGET"] = "1536";
         }
-        auto expected = strix::serve::parse_json_unique(dc::effective_config_json(dc::resolve_effective_config({plain,gdn_env}, strix::ModelContract::qwen38_flash_next(), {}, {}, "", {}, {})));
+        // The plain run is EXACT (the default column switches the FP16 WMMA prefill rows off): fast takes its own rows.
+        auto plain_tier = plain;
+        if (fast) plain_tier.product_profile = o.product_profile;
+        auto expected = strix::serve::parse_json_unique(dc::effective_config_json(dc::resolve_effective_config({plain_tier,gdn_env}, strix::ModelContract::qwen38_flash_next(), {}, {}, "", {}, {})));
         expected.set("profile", *json.find("profile"));
         expected.set("kv", *json.find("kv"));  // the KV receipt names the tier (and turbo's note)
         if (fast) {
@@ -353,7 +364,7 @@ void native_switch_and_yarn() {
         const bool fast = std::string_view(profile) == "fast";
         // YaRN admits BF16 route storage and the GDN chunk route (no rotary sites), so fast applies them there as on native.
         const Env fast_env{{"STRIX_QPF2K_MOE_ROUTE_BF16", "1"}, {"STRIX_QPF2K_GDN_FP16_CHUNK", "1"}};
-        check(fast ? execution == fast_env : execution.empty(), "YaRN exports only admitted profile switches");
+        check(fast ? execution == fast_env : execution == Env{{"STRIX_PREFILL_HC_OUTPUT_WMMA", "0"}}, "YaRN exports only admitted profile switches");
         check(!fast || exported.at("STRIX_QWEN_PROFILE_OWNED_moe_route_bf16") == "fast:provisional:1",
             "YaRN exports provisional provenance");
         check(o.product_profile.qualification() == (fast ? "qualification in progress: moe_route_bf16,gdn_fp16_chunk" : "qualified"), "YaRN stamps the applied provisional row");

@@ -404,7 +404,8 @@ inline EffectiveConfig resolve_yarn_config(const RequestedOptions& request,
         apply_measured_prompt_organization(o);
         o.numerical_profile = dense_a8_profile;
         // Keep one explicit lineage across all T trials. No FP16-to-A8 fallback.
-        if (capabilities.fp16_operands && !env_is(request.environment,"STRIX_PREFILL_F16","0")) {
+        if (capabilities.fp16_operands && !env_is(request.environment,"STRIX_PREFILL_F16","0") &&
+            !product_profile_prefill_f16_off(o)) {
             o.prefill_numerical_profile = DecodeNumericalProfile::fast_prefill_f16wmma_v1;
             o.prefill_profile_automatic = true;
         }

@@ -191,9 +191,9 @@
     "engine": "qwen",
     "name": "HC output FP16 WMMA",
     "flag_or_env": "STRIX_PREFILL_HC_OUTPUT_WMMA; --prefill-disable hc_output_wmma; config prefill_disable",
-    "default": "ON",
+    "default": "ON in FAST and TURBO; OFF in EXACT (--profile exact resolves STRIX_PREFILL_HC_OUTPUT_WMMA=0)",
     "exact": "hc_output_wmma passed a pre-declared confirmation held-out set; its NLL endpoint is measured against a rounding-equivalent control whose per-case movement is capped at +-0.02 nats/token (a bounded control allowance, not an unbiased estimate of the uncapped difference); the absolute NLL change vs the exact reference also passed (-0.37 % NLL/token, upper bound +0.38 %). The off switch restores the exact output path.",
-    "gain": "No new throughput claim.",
+    "gain": "No new throughput claim. EXACT no longer runs it with the FP16 WMMA prefill: audit-measured EXACT prefill cost about +4.4 s at 32K and +66.9 s at 262K (not a new measurement).",
     "preconditions": "Fast HC admitted wide shape, FP32 normalized rows and compatible output selector. Fast HC option excluded from MTP and nested admission pending qualification. Server-level only.",
     "off_switch": "STRIX_PREFILL_HC_OUTPUT_WMMA=0 / --prefill-disable hc_output_wmma / prefill_disable = [\"hc_output_wmma\"]; master STRIX_PREFILL_EXACT_FP16=1 / --prefill-exact-fp16 / prefill_exact_fp16 = true",
     "doc_anchor": "docs/optimizations.md#bit-changing-prefill-options"
@@ -338,9 +338,9 @@
     "engine": "qwen",
     "name": "Automatic tiled prefill, expert union and router rows",
     "flag_or_env": "--known-prefix-window; --known-prefix-full-rows; --known-prefix-prefill-rows; --known-prefix-expert-union; --known-window-router-rows; --prefill-numerical-profile",
-    "default": "auto",
+    "default": "auto; FP16 WMMA prefill arithmetic under FAST and TURBO, dense-a8 reference prefill under EXACT",
     "exact": "Tokens and terminal FP32 logits digests match the reference for the selected profile pair, including 32K/64K/128K/262K. Fast FP16 prefill is exact relative to its own reference, not bit-identical to dense-A8 serial prefill; longer-context fidelity remains outside the 8192 qualification.",
-    "gain": "One Strix Halo node, public main 85353311b: 32K 19.13 s = 1,713 tok/s; 131,072 tokens 81.08 s = 1,617 tok/s; 262,143 tokens 173.74 s = 1,509 tok/s. Previous documented default externally reported about 119 tok/s versus about 822 with union + router rows; separate from local measurements.",
+    "gain": "One Strix Halo node, public main 85353311b: 32K 19.13 s = 1,713 tok/s; 131,072 tokens 81.08 s = 1,617 tok/s; 262,143 tokens 173.74 s = 1,509 tok/s. Previous documented default externally reported about 119 tok/s versus about 822 with union + router rows; separate from local measurements. EXACT (--profile exact, the default word) runs the dense-a8 reference prefill with the HC output WMMA off; FAST and TURBO run fast-prefill-f16wmma-v1. Cost of the exact prefill measured by the audit verification (not a new measurement): about +4.4 s at 32K and +66.9 s at 262K.",
     "preconditions": "Pinned verified checkpoint, qualified gfx1151 target, A8 runtime, >=16 prompt tokens, positive generation, eligible eager registered mapping, unambiguous UMA/GTT observations and sufficient backing capacity.",
     "off_switch": "--baseline / STRIX_BASELINE=1 restores historical resolution; STRIX_PREFILL_F16=0 or --known-prefix-window=0 declines automatic tiling. --prefill-numerical-profile dense-a8 retains tiling with dense-A8 arithmetic. Controlled feature =0 or STRIX_QPF2K_DEFAULTS=0 also declines auto selection; exact operator A/B needs an explicit route with the same profile pair.",
     "doc_anchor": "docs/optimizations.md#qwen-tiled"

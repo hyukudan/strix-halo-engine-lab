@@ -1204,7 +1204,7 @@ static int run_decode_entry(
             "  --print-device-profile / STRIX_PRINT_DEVICE_PROFILE=1 (HIP probe JSON; exits without model/peer setup)\n"
             "  --mtp-bundle FILE (YaRN MTP pins/policy/budgets; otherwise discover MODEL.gguf.mtp-bundle.json)\n"
             "  --print-cache-family (resolved qualification identity; hashes assets, no inference)\n"
-            "  --prefill-numerical-profile dense-a8|fast-prefill-f16wmma-v1 (automatic tiled default: FP16)\n"
+            "  --prefill-numerical-profile dense-a8|fast-prefill-f16wmma-v1 (automatic tiled route: FP16 under --profile fast|turbo, dense-a8 under --profile exact)\n"
             "  --prefill-exact-fp16 / STRIX_PREFILL_EXACT_FP16=1 (plain FP16 prefill identity)\n"
             "  --prefill-disable NAME[,NAME...] (disable bit-changing options; server-level only)\n"
             "  --no-early-setup --no-eager-code-load (exact startup policies; default on)\n"

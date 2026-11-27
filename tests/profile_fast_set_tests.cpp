@@ -4,7 +4,8 @@
 //   - a row qualified (ready) or selected (provisional) for fast is not in the resolved FAST set,
 //   - a row is marked qualified for fast but its fast cell is empty (the qualified lever would never run),
 //   - fast resolves to the same set as exact while such a row exists,
-//   - the exact column enables a bit-changing row, or a qualified fast cell carries no receipt,
+//   - the exact column enables a bit-changing row (it may only pin one to its off value: the reference identity), or a
+//     qualified fast cell carries no receipt,
 //   - a FAST bundle qualified for the word (fast_profile::Bundle::profile_receipt) has a member whose fast cell is not
 //     qualified with the member's value (the gated lever never runs under the word: the original MiniMax defect),
 //   - a FAST gate ledger receipt (strix::profile::FastGate) names a value the resolved fast set does not apply, or a
@@ -92,7 +93,8 @@ void check_table(std::string_view tag, std::span<const p::Lever> rows, bool extr
     for (const auto& l : rows) {
         const std::string where = std::string(tag) + "/" + std::string(l.name);
         if (l.kind != p::Kind::exact)
-            require(l.value[kExact].empty() || l.value[kExact] == l.builtin, where + ": exact column enables a bit-changing value");
+            require(l.value[kExact].empty() || l.value[kExact] == l.builtin || (!l.off.empty() && l.value[kExact] == l.off),
+                    where + ": exact column enables a bit-changing value");
         if (l.ready[kFast] && l.kind != p::Kind::exact && !l.provisional[kFast])
             require(!l.value[kFast].empty() || !l.runnable[kFast],
                     where + ": marked qualified for fast but the fast cell is empty (the lever never runs under fast)");
@@ -104,7 +106,8 @@ void check_table(std::string_view tag, std::span<const p::Lever> rows, bool extr
         if (l.ready[kFast]) require(!l.source.empty(), where + ": qualified FAST cell without a receipt");
     }
     for (const auto& e : exact.entries)
-        require(!p::applied(e.status), std::string(tag) + "/" + std::string(e.lever->name) + ": exact applies a lever");
+        require(!p::applied(e.status) || (e.lever->kind != p::Kind::exact && !e.lever->off.empty() && e.value == e.lever->off),
+                std::string(tag) + "/" + std::string(e.lever->name) + ": exact applies a lever");
     if (any && !extra_fast)
         require(fast.fingerprint() != exact.fingerprint() && fast.profile_applied(),
                 std::string(tag) + ": fast resolves to the exact set while a FAST row is qualified or selected");
