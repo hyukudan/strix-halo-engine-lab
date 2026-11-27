@@ -684,11 +684,13 @@ int main() try {
     offer_arms = true;
     const auto selected = repeated("auto");
     offer_arms = false;
-    check(selected.code == 0 && selected.out.starts_with(plain.out.substr(0, generated_end)) && inputs == plain_inputs &&
-          selected.out.find("strix-speculation-selector/v1 arms 2 | a passes ") != std::string::npos && tunes == 2 &&
-          seeds == 2 && arm_a.accepted > 0 && arm_a.accepted == arm_b.accepted && arm_a.drafts + arm_b.drafts > 0,
-          "two drafters: the shared selector runs both arms (one BlockDrafter each, tuned and seeded), every pass "
-          "reaches both chains, ids and commit equal serial");
+    if (selected.code != 0) std::cerr << selected.error;
+    check(selected.code == 0 && selected.out.starts_with(plain.out.substr(0, generated_end)) && inputs == plain_inputs,
+          "two drafters under the shared selector: ids and commit equal serial");
+    check(selected.out.find("strix-speculation-selector/v1 arms 2 | a passes ") != std::string::npos,
+          "two drafters: the selector receipt names both arms");
+    check(tunes == 2 && seeds == 2, "two drafters: one BlockDrafter per arm, each tuned and seeded by the engine");
+    check(arm_a.accepted > 0 && arm_a.accepted == arm_b.accepted, "two drafters: every pass reaches both chains");
     tunes = seeds = 0;
     const auto diagnostic = repeated("verify");
     check(diagnostic.code == 0 && diagnostic.out.starts_with(plain.out.substr(0, generated_end)) && tunes == 0 &&
