@@ -8,6 +8,8 @@
 #include <limits>
 #include <vector>
 
+#include "strix/weight/formats/exl3_dense.hpp"
+
 namespace strix::minimax::rtxpf::ref {
 
 inline float f32_of(std::uint32_t b) { float f; std::memcpy(&f, &b, 4); return f; }
@@ -37,40 +39,16 @@ inline std::uint16_t float_to_half(float f) {
     std::uint32_t out = e >= -14 ? base + (r - 0x400U) : r;  // normal: drop the implicit bit (carry into the exponent works)
     return static_cast<std::uint16_t>(sign | out);
 }
-inline float round_half(float v) { return half_to_float(float_to_half(v)); }
-
-inline std::uint32_t tile_state(const std::uint32_t* w, int bits, int position) {
-    const int words = bits * 8;
-    const int end = (position + 1) * bits + 256 * bits;
-    const int start = end - 16;
-    const std::uint32_t earlier = w[(start / 32) % words];
-    const std::uint32_t later = w[((end - 1) / 32) % words];
-    const std::uint64_t pair = (static_cast<std::uint64_t>(earlier) << 32) | later;
-    return static_cast<std::uint32_t>(pair >> ((32 - (end & 31)) & 31)) & 65535U;
-}
-inline float mul1(std::uint32_t state) {
-    const std::uint32_t p = state * 0x83dcd12dU;
-    const unsigned sum = (p & 255U) + ((p >> 8) & 255U) + ((p >> 16) & 255U) + (p >> 24);
-    return round_half(std::fmaf(static_cast<float>(1024 + sum), 0x1.bb8p-8F, -0x1.4c4p+3F));
-}
-inline void pos_kn(int lane, int j, int& k, int& n) {
-    k = 2 * (lane % 4) + (j % 2) + 8 * ((j / 2) % 2);
-    n = lane / 4 + 8 * (j / 4);
-}
-// Dense FP32 copy of an EXL3 matrix: w[k * output + n].
+// MUL1 codebook value of a 16-bit trellis state and the dense FP32 copy of an EXL3 matrix: both are the shared reader's
+// (strix/weight/formats/exl3_dense.hpp), so the host reference and the engines expand a trellis the same way.
+inline float mul1(std::uint32_t state) { return strix::core::trellis::mul1_value(state); }
+// Dense FP32 copy of an EXL3 matrix: w[k * output + n] (the transformed-domain coefficients, no scales).
 inline std::vector<float> decode(const std::uint32_t* trellis, unsigned input, unsigned output, int bits) {
-    std::vector<float> w(static_cast<std::size_t>(input) * output);
-    for (unsigned tk = 0; tk < input / 16; ++tk)
-        for (unsigned tn = 0; tn < output / 16; ++tn) {
-            const std::uint32_t* t = trellis + (static_cast<std::size_t>(tk) * (output / 16) + tn) * static_cast<std::size_t>(bits) * 8;
-            for (int lane = 0; lane < 32; ++lane)
-                for (int j = 0; j < 8; ++j) {
-                    int k, n;
-                    pos_kn(lane, j, k, n);
-                    w[static_cast<std::size_t>(tk * 16 + static_cast<unsigned>(k)) * output + tn * 16 + static_cast<unsigned>(n)] = mul1(tile_state(t, bits, 8 * lane + j));
-                }
-        }
-    return w;
+    const std::size_t count = static_cast<std::size_t>(input / 16) * (output / 16) * static_cast<std::size_t>(bits) * 8;
+    std::vector<std::uint8_t> bytes(count * 4);  // the checkpoint's little-endian ring words
+    for (std::size_t i = 0; i < count; ++i)
+        for (unsigned b = 0; b < 4; ++b) bytes[i * 4 + b] = static_cast<std::uint8_t>(trellis[i] >> (8U * b));
+    return strix::weight::exl3_dense::coefficients_kn(bytes, input, output, static_cast<unsigned>(bits));
 }
 // hadamard128 on 128 values laid out as v[lane + 32 j].
 inline void hadamard128(float* x) {

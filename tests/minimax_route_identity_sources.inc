@@ -141,7 +141,7 @@
 {"src/minimax/rtxpf/fp32_identity.hip", 0xd1902b5d22c11b90ULL},
 {"src/minimax/rtxpf/fp32_identity.hpp", 0x9f32626d24743cd1ULL},
 {"src/minimax/rtxpf/fp32_identity_device.inc", 0xbf14d0d63036a622ULL},
-{"src/minimax/rtxpf/fp32_identity_ref.hpp", 0x8ded5b0b0b59d3bdULL},
+{"src/minimax/rtxpf/fp32_identity_ref.hpp", 0x0a4c42b5bc11e092ULL},
 {"src/minimax/rtxpf/fp32_identity_tests.inc", 0xe4124d32ea82844cULL},
 {"src/minimax/serve/fixtures/minimax_tokenizer_fixtures.json", 0x9ddf67438eb479f7ULL},
 {"src/minimax/serve/minimax_api.cpp", 0x8353a53acb7550b3ULL},
