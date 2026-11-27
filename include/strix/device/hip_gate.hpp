@@ -36,6 +36,14 @@ const Bound& bind_hip(Request request = {}, const std::string& devices_path = {}
 void bind_hip_main(int& argc, char** argv, std::FILE* receipt = stderr, CodeLoad code_load = CodeLoad::shared,
                    HostRegistration registration = HostRegistration::engine_pages);
 
+// For a service that has no main() of its own (the unified server binary): the start gate's runtime policy and
+// bind without a command line to strip. Same order and receipts as bind_hip_main (host memory mode, eager code
+// loading, device bind), so a served engine runs under the policy of its rank binary. Call before the first device
+// touch; the restart it may do repeats the whole process from /proc/self/cmdline. Refuses (throws Refusal) like
+// bind_hip. Without the HIP runtime it does nothing.
+void bind_hip_service(std::FILE* receipt = stderr, CodeLoad code_load = CodeLoad::shared,
+                      HostRegistration registration = HostRegistration::engine_pages);
+
 // The binding made by this process, or null before the first bind (and always null without the HIP runtime).
 [[nodiscard]] const Bound* hip_bound() noexcept;
 

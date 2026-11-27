@@ -55,7 +55,9 @@ const Bound& bind_hip(Request request, const std::string& devices_path, std::FIL
     return *state.bound;
 }
 
-void bind_hip_main(int& argc, char** argv, std::FILE* receipt, CodeLoad code_load, HostRegistration registration) {
+namespace {
+// Host memory mode + eager code loading + their receipt lines: the part of the start gate before any device touch.
+void apply_runtime_policy(char** argv, std::FILE* receipt, CodeLoad code_load, HostRegistration registration) {
     // Runtime host memory mode first (runtime_host_memory.hpp): the eager-code restart then carries every value in one
     // exec. Still here afterwards with values this image inserted: restart for them, or roll them back.
     // The default applies where the device memory is host memory, to binaries that register only their own pinned pages.
@@ -90,6 +92,11 @@ void bind_hip_main(int& argc, char** argv, std::FILE* receipt, CodeLoad code_loa
                                                              runtime_host_memory_restart_error(), host_pages_default);
         if (!line.empty()) std::fprintf(receipt, "%s\n", line.c_str());
     }
+}
+} // namespace
+
+void bind_hip_main(int& argc, char** argv, std::FILE* receipt, CodeLoad code_load, HostRegistration registration) {
+    apply_runtime_policy(argv, receipt, code_load, registration);
     try {
         const auto cli = take_command_line(argc, argv);
         Request request;
@@ -99,6 +106,18 @@ void bind_hip_main(int& argc, char** argv, std::FILE* receipt, CodeLoad code_loa
         // Node topology (strix-topology-v1): keep --topology/--node for the family; `topology:` beside `device:`.
         keep_topology_command_line(take_topology_command_line(argc, argv));
         if (const auto line = gate_topology_line(argc, argv); receipt && !line.empty()) std::fprintf(receipt, "%s\n", line.c_str());
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "%s\n", e.what());
+        std::fflush(stderr);
+        std::exit(2);
+    }
+}
+
+void bind_hip_service(std::FILE* receipt, CodeLoad code_load, HostRegistration registration) {
+    char* no_argv[] = {nullptr};  // the restart reads /proc/self/cmdline; argv is only its fallback
+    apply_runtime_policy(no_argv, receipt, code_load, registration);
+    try {
+        (void)bind_hip(Request{}, {}, receipt);
     } catch (const std::exception& e) {
         std::fprintf(stderr, "%s\n", e.what());
         std::fflush(stderr);
