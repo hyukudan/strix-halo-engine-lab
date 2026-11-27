@@ -132,7 +132,7 @@ int main() try {
     auto states = whole.embed_rows(prompt);
     ernie::ReferenceRows saved;
     const auto end = whole.prefill(std::move(states), 0, ernie::kLayerCount,
-        [&](auto boundary, const auto& rows) { if (boundary == 7) saved = rows; });
+        [&](auto boundary, const auto& boundary_rows) { if (boundary == 7) saved = boundary_rows; });
     const auto resumed = whole.prefill(std::move(saved), 7, ernie::kLayerCount);
     check(resumed == end, "cached boundary changed the result of causal prefill");
     ernie::CpuReference threaded(shape, fixture, soft, {}, {}, [&](auto count, const auto& work) {
@@ -140,6 +140,23 @@ int main() try {
     });
     check(threaded.prefill(threaded.embed_rows(prompt), 0, ernie::kLayerCount) == end,
           "attention head scheduler changed the prefill");
+    {
+        // Slabbed head projection equals one whole-matrix pass, with and without BF16 stores.
+        std::vector<float> head_matrix(shape.hidden * shape.vocab);
+        fixture("lm_head.weight", std::span(head_matrix), 0);
+        const ernie::ReferenceRows head_rows{whole.head_input(end.back()), whole.head_input(end.front())};
+        const auto read_slab = [&](std::span<float> dest, std::size_t first) {
+            std::copy_n(head_matrix.begin() + static_cast<std::ptrdiff_t>(first), dest.size(), dest.begin());
+        };
+        const auto store_column = [&](std::span<const float> head_weight, ernie::ReferenceRows& head_logits, std::size_t col) {
+            for (std::size_t row = 0; row < head_rows.size(); ++row) head_logits[row][col] = core::dot_f32(head_weight, head_rows[row]);
+        };
+        for (const bool bf16 : {false, true}) {
+            const auto slabbed_logits = core::streamed_head_projection(lane, 4, head_rows.size(), shape.vocab, shape.hidden, 3, bf16, read_slab, store_column);
+            const auto whole_logits = core::streamed_head_projection(lane, 1, head_rows.size(), shape.vocab, shape.hidden, shape.vocab, bf16, read_slab, store_column);
+            check(slabbed_logits == whole_logits, "slab size changed the streamed head projection");
+        }
+    }
     std::vector<float> head(shape.hidden * shape.vocab), scores(shape.vocab);
     fixture("lm_head.weight", std::span(head), 0);
     core::linear_reference(head, whole.head_input(end.back()), scores);
@@ -189,7 +206,7 @@ int main() try {
     }), "checkpoint prefill and incremental decode changed logits");
     const auto checkpoint_rows = checkpoint_batch.prefill(checkpoint_batch.embed_rows(prompt), 0, ernie::kLayerCount);
     const ernie::CpuReference reverse_heads(checkpoint, fixture, soft, {}, {}, [](auto count, const auto& work) {
-        for (auto end = count; end != 0; --end) work(end - 1, end);
+        for (auto last = count; last != 0; --last) work(last - 1, last);
     });
     check(reverse_heads.prefill(reverse_heads.embed_rows(prompt), 0, ernie::kLayerCount) == checkpoint_rows,
           "independent head scheduling changed checkpoint attention bits");

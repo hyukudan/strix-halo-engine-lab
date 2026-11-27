@@ -71,8 +71,6 @@ void set_variant(Options& opts, std::string_view name) {
     else if (name == "rope-base-160k") c.rope_base = 160000;
     else if (name == "rms-eps-1e-5") c.rms_epsilon = 1e-5F;
     else if (name == "mxfp4-nibble-swap") opts.decode.high_nibble_first = true;
-    else if (name == "mxfp4-transposed-experts") opts.decode.transpose_experts = true;
-    else if (name == "fp8-transposed-scales") opts.decode.transpose_fp8_scales = true;
     else throw std::invalid_argument("unknown host contract " + std::string(name));
     opts.variants.emplace_back(name);
 }
@@ -144,8 +142,7 @@ Options parse_options(int argc, char** argv) {
     }
     for (const auto variant : overrides) set_variant(opts, variant);
     if (multimax_override) opts.multimax = *multimax_override;
-    if (opts.multimax != "checkpoint" && opts.multimax != "identity" && opts.multimax != "hinge" &&
-        opts.multimax != "signed-hinge" && opts.multimax != "softplus")
+    if (opts.multimax != "checkpoint" && opts.multimax != "identity")
         throw std::invalid_argument("unknown vocabulary activation");
     if (!opts.steps || opts.steps > 4096 || !opts.threads || opts.threads > 16 || opts.cache_mib > 32768)
         throw std::invalid_argument("expected 1-4096 output tokens, 1-16 threads and 0-32768 MiB of decoded cache");
@@ -184,31 +181,7 @@ core::LinearQuadraticHinges load_logit_transform(std::string_view mode, const er
 }
 
 void transform_logits(std::span<float> logits, std::string_view mode, const core::LinearQuadraticHinges& policy) {
-    if (mode == "identity") return;
-    const auto& ranges = policy.thresholds;
-    const auto& strengths = policy.gains;
-    if (mode == "checkpoint") {
-        core::apply_logit_epilogue(logits, policy);
-    } else if (mode == "hinge" || mode == "signed-hinge") {
-        for (auto& z : logits) {
-            const auto x = mode == "signed-hinge" ? std::abs(z) : z;
-            float y = x;
-            for (std::size_t i = 0; i < std::size(ranges); ++i)
-                y += std::expm1(strengths[i]) * std::max(0.0F, x - ranges[i]);
-            z = mode == "signed-hinge" ? std::copysign(y, z) : y;
-        }
-    } else if (mode == "softplus") {
-        for (auto& z : logits) {
-            float delta = 0;
-            for (std::size_t i = 0; i < std::size(ranges); ++i) {
-                const float t = z - ranges[i];
-                delta += std::expm1(strengths[i]) * (std::max(t, 0.0F) + std::log1p(std::exp(-std::abs(t))));
-            }
-            z += delta;
-        }
-    } else {
-        throw std::invalid_argument("unknown MultiMax candidate");
-    }
+    if (mode == "checkpoint") core::apply_logit_epilogue(logits, policy);
 }
 
 ernie::ReferenceActivation activation(std::string_view name) {
@@ -319,30 +292,18 @@ ernie::ReferenceRows project_oracle_head(const ernie::ReferenceRows& rows, const
                                         const Options& opts, const ernie::ReferenceRead& read,
                                         core::HostLane& lane, strix::cpu::OrderedFma kernel) {
     // Read each head block once for all positions and preserve each dot's accumulation order.
-    constexpr std::size_t kRows = 1024;
-    std::vector<float> block(kRows * shape.hidden);
-    ernie::ReferenceRows logits(rows.size(), std::vector<float>(shape.vocab));
     std::optional<strix::cpu::OrderedLinearBatch> batch;
     if (opts.simd) batch.emplace(rows, kernel);
-    for (std::size_t first = 0; first < shape.vocab; first += kRows) {
-        const auto count = std::min(kRows, shape.vocab - first);
-        const auto matrix = std::span(block).first(count * shape.hidden);
-        read("lm_head.weight", matrix, first * shape.hidden);
-        core::reference_row_ranges(lane, opts.threads, count, [&](auto begin, auto end) {
-            for (auto col = begin; col < end; ++col) {
-                const auto weight = matrix.subspan(col * shape.hidden, shape.hidden);
-                if (batch) {
-                    batch->column(weight, logits, first + col);
-                } else {
-                    for (std::size_t row = 0; row < rows.size(); ++row)
-                        logits[row][first + col] = core::dot_f32(weight, rows[row]);
-                }
+    return core::streamed_head_projection(
+        lane, opts.threads, rows.size(), shape.vocab, shape.hidden, 1024, head_stores_bf16(opts),
+        [&](std::span<float> matrix, std::size_t offset) { read("lm_head.weight", matrix, offset); },
+        [&](std::span<const float> weight, ernie::ReferenceRows& logits, std::size_t col) {
+            if (batch) {
+                batch->column(weight, logits, col);
+            } else {
+                for (std::size_t row = 0; row < rows.size(); ++row) logits[row][col] = core::dot_f32(weight, rows[row]);
             }
         });
-    }
-    if (head_stores_bf16(opts))
-        for (auto& row : logits) core::round_bf16_reference(row);
-    return logits;
 }
 
 void run_oracle(std::vector<std::uint32_t> ids, const Options& opts, const fs::path& folder,
@@ -680,7 +641,7 @@ int main(int argc, char** argv) try {
                      " [--rescore-layers] [--lens-stride N] [--head-store-f32] [--trace-sites]"
                      " [--start-layer N] [--end-layer N] [--threads N] [--cache-mib N] [--profile-host]"
                      " [--ordered-simd] [--table-mxfp4] [--parallel-mla] [--checkpoint-contract|--recovered-contract|--candidate-contract]"
-                     " [--variant NAME] [--multimax checkpoint|identity|hinge|signed-hinge|softplus]\n";
+                     " [--variant NAME] [--multimax checkpoint|identity]\n";
         return 2;
     }
     const fs::path checkpoint = argv[1], folder = argv[3];

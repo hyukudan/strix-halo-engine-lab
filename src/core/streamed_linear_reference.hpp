@@ -1,5 +1,6 @@
 #pragma once
 
+#include "core/bf16_reference.hpp"
 #include "core/host_lane.hpp"
 #include "core/linear_reference.hpp"
 
@@ -103,5 +104,32 @@ private:
     std::set<std::string, std::less<>> observed_;
     std::vector<float> scratch_;
 };
+
+// Logits of `positions` rows against a [vocab x hidden] matrix that is read in
+// slabs of `slab_rows` rows (`read(span, first element offset)`), so a matrix
+// that does not fit in memory is read once for all positions. `store(weight,
+// logits, column)` writes column `column` of every row and owns the dot's
+// accumulation order. Optionally stores every logit rounded to BF16.
+template <class Read, class Store>
+[[nodiscard]] std::vector<std::vector<float>> streamed_head_projection(
+    HostLane& lane, unsigned threads, std::size_t positions, std::size_t vocab, std::size_t hidden,
+    std::size_t slab_rows, bool round_to_bf16, const Read& read, const Store& store) {
+    if (!positions || !vocab || !hidden || !slab_rows)
+        throw std::invalid_argument("streamed head projection: empty dimension");
+    std::vector<float> block(slab_rows * hidden);
+    std::vector<std::vector<float>> logits(positions, std::vector<float>(vocab));
+    for (std::size_t first = 0; first < vocab; first += slab_rows) {
+        const auto count = std::min(slab_rows, vocab - first);
+        const auto matrix = std::span(block).first(count * hidden);
+        read(matrix, first * hidden);
+        reference_row_ranges(lane, threads, count, [&](std::size_t begin, std::size_t finish) {
+            for (auto col = begin; col < finish; ++col)
+                store(std::span<const float>(matrix).subspan(col * hidden, hidden), logits, first + col);
+        });
+    }
+    if (round_to_bf16)
+        for (auto& row : logits) round_bf16_reference(row);
+    return logits;
+}
 
 } // namespace strix::core
