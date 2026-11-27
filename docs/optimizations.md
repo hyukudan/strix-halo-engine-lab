@@ -7422,3 +7422,28 @@ A served cohort pass routes R rows x 8 slots; at C8 the 64 assignments fall on a
 | Inkling 2 Mini | bound: served cohort passes (decode::launch_rows, nvfp4 and mxfp8 experts) |
 | Hy4 Flash | not bound: experts are not microscaled R1 matrices on HIP |
 | Nemotron 3.5 Bolt E4B | not bound: experts are not microscaled R1 matrices on HIP |
+<a id="inkling-hip-served-lanes"></a>
+
+## Inkling 2 Mini HIP: served cohort passes in lane mode
+
+**Engine:** `inkling2`. **Control:** STRIX_INKLING_HIP_LANES. **Default:** on for every HIP cohort pass of 2..16 lanes.
+
+A served cohort pass runs its lane-stateful stages (K/V and post convolutions, position-scaled clips and their rounding, cache store and attention) as one launch over the pass's lanes; each lane reads its slot, position and id from the pass's step block.
+
+- **Shared home:** include/strix/exec/step_lanes.hpp (make_cohort_step), attn_core prepared GQA lane forms; Inkling binds them in MiniResidentDecoder::decode_slots_served
+- **Tier and regime:** EXACT, FAST, TURBO; HIP multi-request decode
+- **Exactness evidence:** EXACT: each lane keeps its one-row step bits. HIP cohort-lanes fixture, served route and incumbent body: logits, K/V rows and histories bitwise against each lane alone at widths 2 3 4 8 9 16 17 (12 steps); served C8 ids equal with the switch on and off.
+- **Off switch:** STRIX_INKLING_HIP_LANES=0
+- **Measured gain:** cluster2 gfx1151, strix-serve EXACT, 8 slots, 8 concurrent requests of 128 tokens, same binary (receipt coh3 t1): 8-row pass 103.5 -> 95.6 ms ((span 128 - span 32) / 96), aggregate with prefill 49.10 -> 51.73 tok/s (x1.054); one request unchanged (26.71 / 26.64 tok/s). Kernel trace (receipt coh3 p1): the lane-stateful stages were about 2,900 launches per 8-row pass.
+- **Preconditions:** HIP, a cohort pass of at least two lanes, no host taps recorded (a recorded drafter tap keeps one launch per lane), at most 32 rows per step block.
+
+| Model | Binding |
+| --- | --- |
+| Qwen3.8 Flash-Next MoE | not bound: its own HIP cohort (one shared scheduler pending) |
+| Qwen3.8 27B dense | not bound: same Qwen route |
+| DeepSeek V4.1 Flash | not bound: pair session, no lane cohort |
+| GLM 5.3 Flash | not bound: pair app, no lane cohort |
+| MiniMax M3.1 Flash | not bound: pair app, no lane cohort |
+| Inkling 2 Mini | bound: HIP served passes and the incumbent cohort body (CUDA: cohort programs already in lane mode) |
+| Hy4 Flash | not bound: own session service |
+| Nemotron 3.5 Bolt E4B | not bound: no served cohort |
