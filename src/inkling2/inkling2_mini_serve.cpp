@@ -118,12 +118,12 @@ ResolvedService resolve(const serve::ServiceSelection& selection, const MiniServ
     // route: the command line's chunk where the backend's prefill is chunk-invariant (CUDA), else 128 rows; the lever:
     // the command line's chunk and tail rule), clamped to the context. Lanes: mini_serve_lane_rows.
     auto schedule = mini_served_prefill_schedule_from_env(hip, out.served_cli_route, out.tier);
-    // Explicit HIP option (STRIX_INK_HIP_SERVED_TALL_CHUNK=1, off by default; mini_served_tall_chunk_admitted: every tier
-    // that runs the BF16 expert tile; not bitwise, so never an EXACT lever): the held-back BF16 route tries
+    // Explicit HIP option (STRIX_INK_HIP_SERVED_TALL_CHUNK=1, off by default; mini_served_tall_chunk_admitted: FAST and TURBO
+    // that run the BF16 expert tile; not bitwise, so never an EXACT lever): the held-back BF16 route tries
     // the command line's chunk although HIP is not declared chunk-invariant (a distinct identity); the shared chunk
     // ladder keeps it only where its whole load keeps the 128-row chunk's slot capacity, else the incumbent 128 rows.
     const bool hip_tall_chunk = mini_served_tall_chunk_admitted(
-        hip, out.served_cli_route, explicit_rows.has_value(), out.context,
+        hip, out.tier, out.served_cli_route, explicit_rows.has_value(), out.context,
         out.moe_w4a4 == moe_core::grouped_w4a4::Activations::bf16, out.experts_nvfp4,
         out.weight_options.qualify != nullptr && out.weight_options.qualify_decode_only,
         env_flag_default_off("STRIX_INK_HIP_SERVED_TALL_CHUNK"));

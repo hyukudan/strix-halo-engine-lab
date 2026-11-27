@@ -165,12 +165,13 @@ inline void mini_serve_speculation_config(serve::CohortConfig& config, bool spec
 // - the BF16 expert tile (no W4A4 class bound) and checkpoint experts: a bound W4A4 class, the NVFP4 narrow image or a
 //   calibrated decode-only image serve every prompt emits-first (mini_served_prompt_emits_first), so there is no
 //   held-back route to widen; the decoder refuses the calibrated image on the held-back route.
-// The tier is NOT part of the rule: FAST and TURBO take it where they run the BF16 tile; the lever changes the decode ids
-// (a different chunk in the HIP prefill), so its catalogue class is fast, never EXACT.
-constexpr bool mini_served_tall_chunk_admitted(bool hip, bool served_cli_route, bool explicit_rows, unsigned context,
-                                               bool bf16_expert_tile, bool experts_nvfp4, bool decode_only_image,
-                                               bool requested) noexcept {
-    return hip && requested && !served_cli_route && !explicit_rows && bf16_expert_tile && !experts_nvfp4 &&
+// - the tier is FAST or TURBO: the lever changes the decode ids (a different chunk in the HIP prefill: ids differ from
+//   token 114 of a 128-token chat decode), so its catalogue class is fast and EXACT never takes it. FAST and TURBO take it
+//   wherever they run the BF16 tile (the tier is no longer a reason to refuse; the old gate admitted EXACT only).
+constexpr bool mini_served_tall_chunk_admitted(bool hip, profile::Name tier, bool served_cli_route, bool explicit_rows,
+                                               unsigned context, bool bf16_expert_tile, bool experts_nvfp4,
+                                               bool decode_only_image, bool requested) noexcept {
+    return hip && tier != profile::Name::standard && requested && !served_cli_route && !explicit_rows && bf16_expert_tile && !experts_nvfp4 &&
            !decode_only_image && context > kMiniServedHeldBackChunk;
 }
 

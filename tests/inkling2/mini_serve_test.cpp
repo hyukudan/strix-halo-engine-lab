@@ -502,27 +502,35 @@ void profile_parity() {
                 "lane speculation off: the context-draft round");
     }
     {
-        // The HIP tall chunk admission: one source for the server and the catalogue (c.md table). Arguments: hip,
-        // served_cli_route, explicit_rows, context, bf16 tile, experts_nvfp4, decode-only image, requested. The tier is
-        // not an argument: EXACT, FAST and TURBO that run the BF16 tile answer alike.
-        using mini::mini_served_tall_chunk_admitted;
-        require(mini_served_tall_chunk_admitted(true, false, false, 8192U, true, false, false, true),
+        // The HIP tall chunk admission: one source for the server and the catalogue (c.md table). Arguments: hip, tier,
+        // served_cli_route, explicit_rows, context, bf16 tile, experts_nvfp4, decode-only image, requested.
+        const auto admitted = [](bool hip, strix::profile::Name tier, bool route, bool rows, unsigned context, bool bf16,
+                                 bool nvfp4, bool decode_only, bool requested) {
+            return mini::mini_served_tall_chunk_admitted(hip, tier, route, rows, context, bf16, nvfp4, decode_only, requested);
+        };
+        using strix::profile::Name;
+        require(!admitted(true, Name::standard, false, false, 8192U, true, false, false, true),
+                "tall chunk: EXACT never (the lever changes ids)");
+        require(admitted(true, Name::fast, false, false, 8192U, true, false, false, true) &&
+                    admitted(true, Name::turbo, false, false, 8192U, true, false, false, true),
+                "tall chunk: FAST and TURBO admitted on the held-back BF16 route");
+        require(admitted(true, Name::fast, false, false, 8192U, true, false, false, true),
                 "tall chunk: held-back BF16 route admitted");
-        require(!mini_served_tall_chunk_admitted(false, false, false, 8192U, true, false, false, true),
+        require(!admitted(false, Name::fast, false, false, 8192U, true, false, false, true),
                 "tall chunk: CUDA is chunk-invariant already");
-        require(!mini_served_tall_chunk_admitted(true, true, false, 8192U, true, false, false, true),
+        require(!admitted(true, Name::fast, true, false, 8192U, true, false, false, true),
                 "tall chunk: the command line's route already runs the command line's chunk");
-        require(!mini_served_tall_chunk_admitted(true, false, true, 8192U, true, false, false, true),
+        require(!admitted(true, Name::fast, false, true, 8192U, true, false, false, true),
                 "tall chunk: explicit --prefill-rows wins");
-        require(!mini_served_tall_chunk_admitted(true, false, false, 128U, true, false, false, true),
+        require(!admitted(true, Name::fast, false, false, 128U, true, false, false, true),
                 "tall chunk: context within the incumbent rows");
-        require(!mini_served_tall_chunk_admitted(true, false, false, 8192U, false, false, false, true),
+        require(!admitted(true, Name::fast, false, false, 8192U, false, false, false, true),
                 "tall chunk: a bound W4A4 class serves prompts emits-first");
-        require(!mini_served_tall_chunk_admitted(true, false, false, 8192U, true, true, false, true),
+        require(!admitted(true, Name::fast, false, false, 8192U, true, true, false, true),
                 "tall chunk: NVFP4 experts");
-        require(!mini_served_tall_chunk_admitted(true, false, false, 8192U, true, false, true, true),
+        require(!admitted(true, Name::fast, false, false, 8192U, true, false, true, true),
                 "tall chunk: calibrated decode-only image");
-        require(!mini_served_tall_chunk_admitted(true, false, false, 8192U, true, false, false, false),
+        require(!admitted(true, Name::fast, false, false, 8192U, true, false, false, false),
                 "tall chunk: not requested");
     }
     const auto previous_arguments = selection.arguments;
@@ -751,10 +759,10 @@ void wiring(const char* root, const char* backend, bool qualify_q8, bool sample_
             const unsigned incumbent = std::min(shape.prefill_rows.value_or(128U), context);
             const auto cli_rows = mini::mini_cli_prefill_rows(
                 hip_backend ? mini::MiniPrefillBackend::hip : mini::MiniPrefillBackend::cuda, options.tier);
-            // The explicit HIP option takes the command line's implicit chunk on the EXACT BF16 route, with the
-            // incumbent 128 rows as its one smaller candidate.
+            // The explicit HIP option takes the command line's implicit chunk on the FAST / TURBO BF16 route (never EXACT:
+            // it changes ids), with the incumbent 128 rows as its one smaller candidate.
             const bool tall = hip_backend && shape.hip_tall && !shape.prefill_rows &&
-                              options.tier == strix::profile::Name::standard && context > 128U;
+                              options.tier != strix::profile::Name::standard && context > 128U;
             const unsigned chunk =
                 hip_backend && !tall ? incumbent : std::min(shape.prefill_rows.value_or(cli_rows), context);
             const unsigned lanes = shape.slots.value_or(0U) != 0U ? *shape.slots : incumbent;
@@ -1230,15 +1238,15 @@ int main(int argc, char** argv) try {
                                         ServedShape{32U, {}, {}}, ServedShape{{}, {}, 9U}})
             wiring(argv[1], backend, false, false, W4a4::bf16, "exact", false, false, false, shape);
     set_cli_route_env(nullptr);
-    // The explicit HIP tall-chunk option: the EXACT BF16 held-back route only (an explicit --prefill-rows, a context of
-    // 128 rows or less, another tier and CUDA keep their incumbent shapes). The held-back route is an explicit 0 of the
+    // The explicit HIP tall-chunk option: the FAST / TURBO BF16 held-back route only (an explicit --prefill-rows, a
+    // context of 128 rows or less, EXACT and CUDA keep their incumbent shapes). The held-back route is an explicit 0 of the
     // served route lever (its default runs the command line's route on every backend).
     set_cli_route_env("0");
     set_env("STRIX_INK_HIP_SERVED_TALL_CHUNK", "1");
     for (const ServedShape shape : {ServedShape{{}, {}, {}, true}, ServedShape{{}, 2048U, 6U, true},
                                     ServedShape{{}, 64U, {}, true}, ServedShape{256U, {}, {}, true}})
-        wiring(argv[1], "hip", false, false, W4a4::bf16, "exact", false, false, false, shape);
-    wiring(argv[1], "hip", false, false, W4a4::bf16, "turbo");
+        for (const auto* tier : {"exact", "fast", "turbo"})
+            wiring(argv[1], "hip", false, false, W4a4::bf16, tier, false, false, false, shape);
     wiring(argv[1], "cuda", false, false, W4a4::bf16, "exact");
     set_env("STRIX_INK_HIP_SERVED_TALL_CHUNK", nullptr);
     set_cli_route_env(nullptr);
