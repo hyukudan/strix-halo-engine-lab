@@ -28,6 +28,7 @@
 #include <numeric>
 #include <deque>
 #include <optional>
+#include <sstream>
 #include <ostream>
 #include <random>
 #include <stdexcept>
@@ -601,6 +602,8 @@ void run_serial_generation(const std::string& checkpoint, SerialGenerationOption
     SerialGreedyRequestResult generated;
     bool device_sampled = false;  // the serial path's sampled rows decided on the device (decode_sampled)
     const auto decode_start = Clock::now();
+    std::deque<std::optional<spec::BlockDrafter>> arm_drafters;  // several drafters under the shared selector
+    std::string selector_receipt;
     if (verify) {
         // The shared block setup (strix/spec/block_setup.hpp); this command line adds its request modes, the frozen
         // prices of its cost table and the diagnostic's equal prices.
@@ -657,7 +660,8 @@ void run_serial_generation(const std::string& checkpoint, SerialGenerationOption
             generated = spec::execute_block_token_continuation(request, options.prompt, *drafter, *verify, max_rows, emit,
                                                                row_rule, round_log ? &*round_log : nullptr);
         } else {
-            std::deque<std::optional<spec::BlockDrafter>> built(arms.size());
+            auto& built = arm_drafters;
+            built.resize(arms.size());
             spec::ArmSelector selector;
             for (std::size_t a = 0; a < arms.size(); ++a) {
                 arm_chain = arms[a].chain;
@@ -667,15 +671,16 @@ void run_serial_generation(const std::string& checkpoint, SerialGenerationOption
             }
             generated = spec::execute_block_token_continuation(request, options.prompt, selector, *verify, max_rows, emit,
                                                                row_rule, round_log ? &*round_log : nullptr);
-            // The selector's receipt beside the shared speculation stats: passes / tokens / probes / wall per arm.
-            out << "strix-speculation-selector/v1 arms " << selector.size();
+            // The selector's receipt (printed after the run's speculation summary): passes / tokens / probes / wall per arm.
+            std::ostringstream receipt;
+            receipt << "strix-speculation-selector/v1 arms " << selector.size();
             for (std::size_t a = 0; a < selector.size(); ++a) {
                 const auto& st = selector.stats(a);
-                out << " | " << st.name << " passes " << st.passes << " tokens " << st.tokens << " probes " << st.probes
-                    << " ms " << static_cast<std::uint64_t>(st.ms);
+                receipt << " | " << st.name << " passes " << st.passes << " tokens " << st.tokens << " probes " << st.probes
+                        << " ms " << static_cast<std::uint64_t>(st.ms);
             }
-            if (selector.active() < selector.size()) out << " | active " << selector.stats(selector.active()).name;
-            out << '\n';
+            if (selector.active() < selector.size()) receipt << " | active " << selector.stats(selector.active()).name;
+            selector_receipt = receipt.str();
         }
     } else {
         // A decoder that samples on the device decides every sampled row there: the same ids for the request's seed,
@@ -704,14 +709,21 @@ void run_serial_generation(const std::string& checkpoint, SerialGenerationOption
         const spec::SpecStats empty;
         const auto& stats = drafter ? drafter->stats() : empty;
         const auto sum = [](const auto& counts) { return std::accumulate(counts.begin(), counts.end(), std::uint64_t{}); };
-        const auto accepted = sum(stats.source_accepted);
-        const auto drafted = sum(stats.source_proposed);
-        const auto draft_passes = stats.passes - stats.source_passes[static_cast<std::size_t>(spec::Source::serial)];
+        std::uint64_t accepted = sum(stats.source_accepted), drafted = sum(stats.source_proposed),
+                      draft_passes = stats.passes - stats.source_passes[static_cast<std::size_t>(spec::Source::serial)];
+        for (const auto& arm : arm_drafters) {  // several drafters: the counts of every arm's own passes
+            const auto& own = arm->stats();
+            accepted += sum(own.source_accepted);
+            drafted += sum(own.source_proposed);
+            draft_passes += own.passes - own.source_passes[static_cast<std::size_t>(spec::Source::serial)];
+        }
         out << "speculation mode " << speculation_name(options.speculation)
             << " acceptance " << accepted << '/' << drafted << " draft_passes " << draft_passes
             << " mean_accepted_length "
             << (draft_passes ? static_cast<double>(accepted) / static_cast<double>(draft_passes) : 0.0) << '\n';
         if (drafter) out << stats.line() << '\n';
+        for (const auto& arm : arm_drafters) out << arm->stats().line() << '\n';
+        if (!selector_receipt.empty()) out << selector_receipt << '\n';
         if (cost_table)
             out << "speculation cost-table " << cost_table_load_name(cost_table->load_status()) << " seeded "
                 << cost_seeded << " recorded " << cost_recorded << " stored " << (cost_stored ? 1 : 0) << " file "
