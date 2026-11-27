@@ -6267,10 +6267,14 @@ BF16 tile; CUDA declines the class.
 
 ## Inkling 2 Mini HIP held-back prefill chunk
 
-`STRIX_INK_HIP_SERVED_TALL_CHUNK=1` tries the CLI's 8,192-row chunk on the HIP HTTP held-back EXACT route.
+`STRIX_INK_HIP_SERVED_TALL_CHUNK=1` tries the CLI's 8,192-row chunk on the HIP HTTP held-back route
+(`STRIX_INK_SERVED_CLI_ROUTE=0`; the default server already runs the command line's chunk). It is a FAST / TURBO
+candidate with its gate v2 pending, never EXACT: an integrated device check found the decode ids of a 128-token
+chat differ from token 114 (HIP prefill is not chunk-invariant). One admission rule serves the server and the
+catalogue (`mini_served_tall_chunk_admitted`).
 The context caps the chunk. The server keeps its lane cap and retries with 128 rows if device allocation fails,
 if no lane fits, or if the trial would cost a requested `--slots` lane. An explicit `--prefill-rows` takes precedence.
-Leave the variable unset or set it to `0` to use the incumbent chunk. The option is off in every tier.
+Leave the variable unset or set it to `0` to use the incumbent chunk. The option is off by default in every tier.
 The server loads it through the shared served chunk ladder (candidates 8,192 then 128 rows; the larger is kept only
 when its whole load keeps the 128-row slot capacity). The HIP held-back route cannot cut a chunk into pieces, so a
 decoding lane beside an admitted prompt waits for one whole chunk.
