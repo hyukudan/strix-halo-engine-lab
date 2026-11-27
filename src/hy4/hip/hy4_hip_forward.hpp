@@ -43,6 +43,9 @@ struct ForwardOptions {
     std::uint32_t verify_rows = 0;             // rows of a verify pass (forward_rows, 1..8); rings sized for them; 0 = none
     bool nextn = false;                        // also load the pack's next-token (MTP) block: nextn_rows() (whole-model rank)
     NextnHead nextn_head = NextnHead::q4;      // the drafts' head (want_top of nextn_rows)
+    // DFly2 block drafter shard (safetensors, model.dfly_layers.*; whole-model rank, verify_rows >= 2): dfly_block()
+    std::filesystem::path dfly;
+    std::string dfly_format = "q8";            // its Linears at load: q8 (Q8_0, the shared ggml rule) | bf16 (the shard's bits)
 };
 
 struct LoadReport {
@@ -183,6 +186,17 @@ public:
     };
     static constexpr std::uint32_t kNextnRows = 32;  // widest nextn_rows call
     [[nodiscard]] bool has_nextn() const noexcept;
+    // ---- DFly2 block drafter (ForwardOptions::dfly; hy4_hip_dfly.inc) ----
+    // dfly_hidden: the target hidden (output_norm rows, rows_hidden() / the prompt hidden) of the anchor's predecessor, a
+    // device row (async copy on the stream). dfly_block: one block of k + 1 rows at positions pos .. pos + k (row 0 =
+    // anchor, the others the mask id) through the draft layers over the target's KV-share latent rows, the head once and
+    // the hidden-correction chain over the 256 best uncorrected ids per slot; writes k proposals; synchronises. Writes the
+    // target latent rows pos .. pos + k of the KV-share layers (the next verify pass rewrites them before any read).
+    [[nodiscard]] bool has_dfly() const noexcept;
+    void dfly_hidden(const float* device_row);
+    void dfly_block(std::uint32_t anchor, std::uint32_t pos, std::uint32_t k, std::uint32_t* proposals);
+    [[nodiscard]] std::uint64_t dfly_blocks() const noexcept;
+    [[nodiscard]] double dfly_ms() const noexcept;  // wall of every block (receipt)
     void set_nextn_row_loop(bool on) noexcept;
     // The drafts' head from the next nextn_rows call on (the device check compares the forms on the same rows).
     void set_nextn_head(NextnHead head);

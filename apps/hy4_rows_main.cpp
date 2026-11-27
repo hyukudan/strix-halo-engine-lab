@@ -13,6 +13,10 @@
 //     step), the target hidden (output_norm) of every fed position written as a taps run of strix-hy4-dfly mtp; then the
 //     oracle's acceptance protocol on the device block (teacher at every position, chains of --depth D at every greedy
 //     anchor): MTPACC P(run >= k) / E(d), and nextn_top.txt / nextn_logits.f32 for strix-hy4-dfly mtp's device check.
+//   --dfly SHARD (with --mtp): the publisher's DFly2 block drafter (model.dfly_layers.*) on the device (Forward::dfly_block)
+//     as the chain arm of the shared BlockDrafter (ParallelBlockDrafter over the Hy4 BlockForward); per content the MTP arm
+//     and the DFly2 arm alternate --dfly-reps times (SPEC / DFLY lines labelled content:mtp / content:dfly). --dfly-format
+//     q8|bf16 (pack Linears), --dfly-block N (rows incl. the anchor, <= 8; default the preset), --dfly-ms S,F (Arbiter seeds).
 // strix-hy4-rows PART.gguf... --ids-file F [--context N] [--prompt-rows N] [--reps K] [--spec N] [--max-rows R]
 //   [--verify-ms a,b,...] [--gbps G] [--mtp [--mtp-head full|q8|q4] [--mtp-copy 0|1] [--chain-ms S,F] [--survival c,...] [--mtp-taps DIR
 //   [--taps-gen N] [--depth D]]]; --content LABEL=PATH (repeatable) instead of --ids-file: one spec run per content
@@ -135,7 +139,7 @@ struct PrimeEnd {
     std::uint32_t anchor = 0;
     double block_ms = 0, tail_ms = 0;
 };
-PrimeEnd prime_end(hb::Forward& f, const std::vector<std::uint32_t>& prompt, hb::rows::MtpSource<hb::Forward>* mtp, std::uint32_t Pw,
+PrimeEnd prime_end(hb::Forward& f, const std::vector<std::uint32_t>& prompt, hb::rows::PromptFeed* mtp, std::uint32_t Pw,
                    std::uint32_t W, const std::vector<strix::pair::layers::Window>& chunks, const std::vector<float>& hidden,
                    std::vector<float>& logits) {
     const double t0 = now_ms();
@@ -171,7 +175,7 @@ PrimeEnd prime_end(hb::Forward& f, const std::vector<std::uint32_t>& prompt, hb:
 // the gather's transport), every layer's caches re-laid out to both ranks (strix/pair/relayout.hpp), the head rank's
 // teacher rows to a drafting peer and replayed into the drafter (the same block calls in the same order as prefill()),
 // the anchor logits from the last window's head (no tail) or the tail as TP steps. Bits = the one-node prime.
-std::uint32_t prime_stages(hb::Forward& f, const std::vector<std::uint32_t>& prompt, hb::rows::MtpSource<hb::Forward>* mtp,
+std::uint32_t prime_stages(hb::Forward& f, const std::vector<std::uint32_t>& prompt, hb::rows::PromptFeed* mtp,
                            const StagePrime& sp) {
     namespace layers = strix::pair::layers;
     namespace relayout = strix::pair::relayout;
@@ -274,7 +278,7 @@ std::uint32_t prime_stages(hb::Forward& f, const std::vector<std::uint32_t>& pro
 // cache row: no relayout. Each window runs the one-node kernels on the one-node inputs: bits = the one-node prime at the
 // same rows. Each rank's own windows' teacher rows go to a drafting peer; the last window's head logits (no tail) to the
 // peer; the tail as TP steps.
-std::uint32_t prime_ring(hb::Forward& f, const std::vector<std::uint32_t>& prompt, hb::rows::MtpSource<hb::Forward>* mtp,
+std::uint32_t prime_ring(hb::Forward& f, const std::vector<std::uint32_t>& prompt, hb::rows::PromptFeed* mtp,
                          const StagePrime& sp) {
     namespace layers = strix::pair::layers;
     namespace ring = strix::pair::ring;
@@ -366,7 +370,7 @@ std::uint32_t prime_ring(hb::Forward& f, const std::vector<std::uint32_t>& promp
 // The prompt into a fresh forward: position by position (class BASE) or the batched prompt windows (--prompt-rows).
 // Returns the anchor = greedy id after the last prompt token. sp (TP pair): --prefill-route (prime_stages).
 std::uint32_t prime(hb::Forward& f, const std::vector<std::uint32_t>& prompt, bool batched,
-                    hb::rows::MtpSource<hb::Forward>* mtp = nullptr, const StagePrime* sp = nullptr) {
+                    hb::rows::PromptFeed* mtp = nullptr, const StagePrime* sp = nullptr) {
     if (batched && sp && sp->route == "ring") return prime_ring(f, prompt, mtp, *sp);
     if (batched && sp && sp->route != "one") {
         std::uint64_t full = 0;
@@ -613,7 +617,8 @@ int main(int argc, char** argv) {
         std::vector<double> verify_ms;
         double gbps = hb::rows::kVerifySeedGbps;
         bool mtp = false, mtp_copy = true;
-        std::vector<double> chain_ms, survival;
+        std::vector<double> chain_ms, survival, dfly_ms;
+        std::uint32_t dfly_block = 0, dfly_reps = 1;
         std::string taps_dir;
         std::uint32_t taps_gen = 128, depth = 6;
         // tensor-parallel pair (Forward::enable_tp on both ranks, each holding the whole pack): rank 0 drafts and decides,
@@ -640,6 +645,11 @@ int main(int argc, char** argv) {
             else if (a == "--gbps" && more) gbps = std::stod(argv[++i]);
             else if (a == "--union-ab") union_ab = true;
             else if (a == "--mtp") mtp = true;
+            else if (a == "--dfly" && more) o.dfly = argv[++i];
+            else if (a == "--dfly-format" && more) o.dfly_format = argv[++i];
+            else if (a == "--dfly-block" && more) dfly_block = static_cast<std::uint32_t>(std::stoul(argv[++i]));
+            else if (a == "--dfly-reps" && more) dfly_reps = static_cast<std::uint32_t>(std::stoul(argv[++i]));
+            else if (a == "--dfly-ms" && more) dfly_ms = read_list(argv[++i]);
             else if (a == "--head-q8" && more) o.head_q8 = std::stoul(argv[++i]) != 0UL;
             else if (a == "--tp-rank" && more) tp_rank = static_cast<int>(std::stoul(argv[++i]));
             else if (a == "--tp-transport" && more) tp_spec = argv[++i];
@@ -668,6 +678,9 @@ int main(int argc, char** argv) {
             throw std::invalid_argument("usage: strix-hy4-rows PART.gguf... --ids-file F | --content L=F ... [...]");
         const auto& prompt = contents.front().second;
         if (mtp && o.prompt_rows == 0U) throw std::invalid_argument("--mtp needs --prompt-rows");
+        if (!o.dfly.empty() && (!mtp || !taps_dir.empty() || dfly_reps == 0U))
+            throw std::invalid_argument("--dfly needs --mtp (the prompt rows' hidden workspace), not --mtp-taps; --dfly-reps >= 1");
+        if (!dfly_ms.empty() && dfly_ms.size() != 2U) throw std::invalid_argument("--dfly-ms STEP,FLUSH");
         if (!taps_dir.empty() && !mtp) throw std::invalid_argument("--mtp-taps needs --mtp");
         if (!chain_ms.empty() && chain_ms.size() != 2U) throw std::invalid_argument("--chain-ms STEP,FLUSH");
         o.nextn = mtp;
@@ -800,8 +813,18 @@ int main(int argc, char** argv) {
         }
         // ---- spec, per content: plain greedy reference, then the speculative decode from the same prompt state
         int rc = 0;
+        // --dfly: per content the MTP arm and the DFly2 arm alternate (dfly_reps pairs, same process, same prompt state)
+        std::vector<bool> arm_list{false};
+        if (!o.dfly.empty()) {
+            arm_list.clear();
+            for (std::uint32_t r = 0; r < dfly_reps; ++r) {
+                arm_list.push_back(false);
+                arm_list.push_back(true);
+            }
+        }
+        const auto arm_label = [&o](const std::string& l, bool dfly_arm) { return o.dfly.empty() ? l : l + (dfly_arm ? ":dfly" : ":mtp"); };
         for (std::size_t ci = 0; ci < contents.size(); ++ci) {
-            const auto& [label, ids] = contents[ci];
+            const auto& [clabel, ids] = contents[ci];
             const std::uint32_t first_id = ci == 0U ? anchor : prime(f, ids, batched, nullptr, sp);
             std::vector<std::uint32_t> plain{first_id};
             const double p0 = now_ms();
@@ -811,14 +834,15 @@ int main(int argc, char** argv) {
             hb::rows::SpecOptions so;
             so.max_rows = max_rows;
             so.verify_ms = verify_ms.empty() ? strix::spec::moe_verify_seed_ms(strix::spec::hy4_verify_bytes(), step_ms, gbps, max_rows) : verify_ms;
-            std::unique_ptr<hb::rows::MtpSource<hb::Forward>> source;
             std::uint64_t plain_fnv = 1469598103934665603ULL;  // the plain ids (compared across one node / pair runs)
             for (const auto id : plain) plain_fnv = (plain_fnv ^ id) * 1099511628211ULL;
             // tensor-parallel drafter (both ranks; STRIX_HY4_TP_DRAFT=0: rank 0 alone, one-node block): both ranks must agree
             so.draft_tp = tp_rank >= 0 && mtp && strix::envcfg::flag("STRIX_HY4_TP_DRAFT", true);
             if (follower) {  // rank 1: the same prompt pass (with the block when the drafter runs on both), then rank 0's rounds
+                for (const bool dfly_arm : arm_list) {  // the leader's arm order (rank 1 follows the verify passes of a DFly2 arm)
+                const std::string label = arm_label(clabel, dfly_arm);
                 std::unique_ptr<hb::rows::MtpSource<hb::Forward>> fsrc;
-                if (so.draft_tp) fsrc = std::make_unique<hb::rows::MtpSource<hb::Forward>>(f);
+                if (so.draft_tp && !dfly_arm) fsrc = std::make_unique<hb::rows::MtpSource<hb::Forward>>(f);
                 const double prime_t1 = now_ms();
                 if (prime(f, ids, batched, fsrc.get(), sp) != first_id) throw std::runtime_error("repeat prompt anchor differs (" + label + ")");
                 std::printf("PRIME %s prompt %zu ids %.1f ms (tp rank 1%s)\n", label.c_str(), ids.size(), now_ms() - prime_t1,
@@ -833,9 +857,21 @@ int main(int argc, char** argv) {
                 std::printf("PLAIN %s tp rank 1 %.2f tok/s (%.2f ms/token) ids_fnv %016llx\n", label.c_str(), 1000.0 / step_ms, step_ms,
                             static_cast<unsigned long long>(plain_fnv));
                 std::fflush(stdout);
+                }
                 continue;
             }
-            if (mtp) {
+            const hb::rows::SpecOptions so_base = so;
+            for (const bool dfly_arm : arm_list) {
+            const std::string label = arm_label(clabel, dfly_arm);
+            so = so_base;
+            std::unique_ptr<hb::rows::MtpSource<hb::Forward>> source;
+            std::unique_ptr<hb::rows::DflySource<hb::Forward>> dsrc;
+            if (dfly_arm) {  // the block drafter as the chain arm: flush = the block pass, step = one chain slot
+                dsrc = std::make_unique<hb::rows::DflySource<hb::Forward>>(f, dfly_block);
+                so.copy = mtp_copy;
+                so.chain_step_ms = dfly_ms.empty() ? hb::rows::kDflySeedStepMs : dfly_ms[0];
+                so.chain_flush_ms = dfly_ms.empty() ? hb::rows::kDflySeedFlushMs : dfly_ms[1];
+            } else if (mtp) {
                 source = std::make_unique<hb::rows::MtpSource<hb::Forward>>(f);
                 so.copy = mtp_copy;
                 if (!chain_ms.empty()) {
@@ -847,11 +883,13 @@ int main(int argc, char** argv) {
                                                      : survival;
             }
             const double prime_t0 = now_ms();  // the spec path's prompt pass (with the block: its teacher flushes when the ring fills)
-            if (prime(f, ids, batched, source.get(), sp) != first_id) throw std::runtime_error("repeat prompt anchor differs (" + label + ")");
+            hb::rows::PromptFeed* const feed = dsrc ? static_cast<hb::rows::PromptFeed*>(dsrc.get()) : source.get();
+            if (prime(f, ids, batched, feed, sp) != first_id) throw std::runtime_error("repeat prompt anchor differs (" + label + ")");
             std::printf("PRIME %s prompt %zu ids %.1f ms%s\n", label.c_str(), ids.size(), now_ms() - prime_t0, source ? " (with the block)" : "");
             const auto* pex = tp_rank == 0 ? &pair_ex : nullptr;
-            const auto res = source ? hb::rows::spec_decode(f, ids, first_id, spec_n, so, *source, pex)
-                                    : hb::rows::spec_decode(f, ids, first_id, spec_n, so, pex);
+            const auto res = dsrc     ? hb::rows::spec_decode(f, ids, first_id, spec_n, so, *dsrc, pex)
+                             : source ? hb::rows::spec_decode(f, ids, first_id, spec_n, so, *source, pex)
+                                      : hb::rows::spec_decode(f, ids, first_id, spec_n, so, pex);
             std::printf("PLAIN %s %s %.2f tok/s (%.2f ms/token) ids_fnv %016llx\n", label.c_str(), tp_rank == 0 ? "tp rank 0" : "one node",
                         1000.0 / step_ms, step_ms, static_cast<unsigned long long>(plain_fnv));
             std::size_t first_bad = std::min(res.ids.size(), plain.size());
@@ -870,13 +908,18 @@ int main(int argc, char** argv) {
                         label.c_str(), equal ? 1 : 0, first_bad, 1000.0 * gen / plain_ms, step_ms, 1000.0 * gen / res.wall_ms, res.steps.size(),
                         res.steps.empty() ? 0.0 : gen / static_cast<double>(res.steps.size()), static_cast<unsigned long long>(res.proposed),
                         static_cast<unsigned long long>(res.accepted));
-            if (mtp)
+            if (dsrc)
+                std::printf("DFLY %s blocks %llu draft wall %.1f ms (%.2f ms/block) block rows %u format %s seeds step %.2f flush %.1f%s\n",
+                            label.c_str(), static_cast<unsigned long long>(res.chain_calls), res.chain_ms,
+                            res.chain_calls ? res.chain_ms / static_cast<double>(res.chain_calls) : 0.0, dsrc->chain().policy().block,
+                            o.dfly_format.c_str(), so.chain_step_ms, so.chain_flush_ms, so.copy ? " +copy+hybrid" : "");
+            if (mtp && !dsrc)
                 std::printf("MTP %s block calls %llu rows %llu drafts %llu id reads %llu draft wall %.1f ms (%.2f ms/draft) chain %s seeds step %.1f flush %.1f%s\n",
                             label.c_str(), static_cast<unsigned long long>(res.chain_calls), static_cast<unsigned long long>(res.chain_rows),
                             static_cast<unsigned long long>(res.chain_drafts), static_cast<unsigned long long>(res.chain_reads), res.chain_ms,
                             res.chain_drafts ? res.chain_ms / static_cast<double>(res.chain_drafts) : 0.0, so.copy ? "+copy+hybrid" : "only",
                             so.chain_step_ms, so.chain_flush_ms, so.draft_tp ? " block tp" : (tp_rank == 0 ? " block rank 0" : ""));
-            if (mtp)  // where a pass's wall goes: verify passes, drafter (flush + chain), the rest (round message, host)
+            if (mtp && !dsrc)  // where a pass's wall goes: verify passes, drafter (flush + chain), the rest (round message, host)
                 std::printf("WALL %s total %.1f ms verify %.1f draft %.1f other %.1f (per pass %.2f / %.2f / %.2f)\n", label.c_str(), res.wall_ms,
                             res.verify_ms, res.chain_ms, res.wall_ms - res.verify_ms - res.chain_ms,
                             res.verify_ms / static_cast<double>(std::max<std::size_t>(res.steps.size(), 1U)),
@@ -884,6 +927,7 @@ int main(int argc, char** argv) {
                             (res.wall_ms - res.verify_ms - res.chain_ms) / static_cast<double>(std::max<std::size_t>(res.steps.size(), 1U)));
             std::fflush(stdout);
             if (!equal) rc = 3;
+            }
         }
         return rc;
     } catch (const std::exception& e) {

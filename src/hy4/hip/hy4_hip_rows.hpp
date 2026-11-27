@@ -40,6 +40,9 @@ inline constexpr std::uint32_t kMaxVerifyRows = 8;
 // and the chain's stated confidence, the host oracle's prose conditionals P(run >= k) .714 .452 .197 .133 .034 .017.
 inline constexpr double kVerifySeedGbps = 207.0;
 inline constexpr std::array<double, 6> kChainSurvival{0.714, 0.633, 0.436, 0.675, 0.256, 0.5};
+// DFly2 block arm seeds (PREDICTION of hy4_df2-STATE section 4, Q8_0 drafter + FAST head; the Arbiter refines both online):
+// flush = one block pass (embedding, 5 draft layers, the head over the rows), step = one hidden-correction slot.
+inline constexpr double kDflySeedStepMs = 0.5, kDflySeedFlushMs = 8.0;
 // Routed experts of a verify window in the shared A8 union rows form (each distinct expert read once, rows bitwise == the
 // per-row loop). Off switch: STRIX_HY4_ROWS_EXPERT_UNION=0.
 inline constexpr bool kExpertUnionDefault = true;  // measured bitwise (ROWS 30/30) and faster at R >= 2
@@ -171,17 +174,26 @@ using MtpDrafter = spec::MtpChain<MtpEngine<Fwd>, spec::EngineChainDev>;
 // f.prefill(prompt) routes every prompt row's hidden into the chain's ring (row i's successor = prompt[i + 1]); the last
 // row waits for the anchor (finish_prompt). Teacher = the target's output_norm hidden, chain = the block's own
 // shared_head_norm output (the numerics the host oracle selected by acceptance: hy4_dfly mtp).
+// The prompt pass's view of a drafter fed by the prompt rows' hidden (MtpSource, DflySource): install(prompt) before the
+// prefill routes the rows' output_norm hidden through Forward::set_prompt_hidden; finish_prompt(anchor) after it.
+class PromptFeed {
+public:
+    virtual ~PromptFeed() = default;
+    virtual void install(std::span<const std::uint32_t> prompt) = 0;
+    virtual void finish_prompt(std::uint32_t anchor) = 0;
+};
+
 template <class Fwd>
-class MtpSource {
+class MtpSource final : public PromptFeed {
 public:
     explicit MtpSource(Fwd& f) : f_(f), eng_(f), chain_(eng_, false, Fwd::kNextnRows) {}
-    ~MtpSource() {
+    ~MtpSource() override {
         f_.set_prompt_hidden({});
         if (last_) f_.free_f32(last_);
     }
     MtpSource(const MtpSource&) = delete;
     MtpSource& operator=(const MtpSource&) = delete;
-    void install(std::span<const std::uint32_t> prompt) {
+    void install(std::span<const std::uint32_t> prompt) override {
         if (prompt.empty()) throw std::invalid_argument("hy4 rows: MTP prompt is empty");
         prompt_.assign(prompt.begin(), prompt.end());
         base_ = f_.position();
@@ -190,7 +202,7 @@ public:
         f_.set_prompt_hidden([this](const float* rows, std::uint32_t p0, std::uint32_t n) { feed(rows, p0, n); });
     }
     // After f.prefill(prompt): anchor = the greedy id after the prompt (the last prompt row's successor).
-    void finish_prompt(std::uint32_t anchor) {
+    void finish_prompt(std::uint32_t anchor) override {
         f_.set_prompt_hidden({});
         if (fed_ != prompt_.size()) throw std::logic_error("hy4 rows: MTP prompt rows not all fed by prefill");
         const typename MtpEngine<Fwd>::Rows o{nullptr, nullptr, last_};
@@ -217,6 +229,71 @@ private:
     std::vector<std::uint32_t> prompt_;
     std::uint32_t base_ = 0, fed_ = 0;
     float* last_ = nullptr;
+};
+
+// ---- DFly2 block drafter: the shared ParallelBlockDrafter (strix/spec/block_parallel.hpp, preset hy4_dfly2) over
+// Forward::dfly_block. Fwd additionally: dfly_block(anchor, pos, k, out) (synchronises), dfly_hidden(device row),
+// rows_hidden(), set_prompt_hidden(sink), position(). The drafter changes which rows are verified, never an emitted id.
+template <class Fwd>
+class DflyForward final : public spec::BlockForward {
+public:
+    explicit DflyForward(Fwd& f) : f_(f) {}
+    void forward(const spec::BlockRequest& req, std::vector<std::uint32_t>& proposals, std::vector<float>&) override {
+        if (req.prefix != 0U || req.ids.size() != std::size_t{req.k} + 1U) throw std::logic_error("hy4 dfly: block rows (no prefix rows)");
+        proposals.resize(req.k);
+        f_.dfly_block(req.ids[0], static_cast<std::uint32_t>(req.anchor_pos), req.k, proposals.data());
+    }
+    // KV share: the new anchor's predecessor is row emitted.size() - 1 of the last verify pass (its output_norm hidden)
+    void accept(std::span<const std::uint32_t> emitted) override {
+        if (emitted.empty()) throw std::logic_error("hy4 dfly: accept without emitted ids");
+        f_.dfly_hidden(f_.rows_hidden() + (emitted.size() - 1U) * std::size_t{f_.config().hidden});
+    }
+
+private:
+    Fwd& f_;
+};
+
+// The DFly2 drafter of one sequence: the prompt pass hands it the last prompt row's hidden (Forward::set_prompt_hidden,
+// rows in prompt order), finish_prompt(anchor) starts the block drafter at the anchor's position.
+template <class Fwd>
+class DflySource final : public PromptFeed {
+public:
+    DflySource(Fwd& f, std::uint32_t block) : f_(f), policy_(policy(block)), fwd_(f), drafter_(policy_, fwd_) {}
+    ~DflySource() override { f_.set_prompt_hidden({}); }
+    DflySource(const DflySource&) = delete;
+    DflySource& operator=(const DflySource&) = delete;
+    // hy4_dfly2() with `block` rows (0: the preset's); the verify rows bound it (block <= kMaxVerifyRows).
+    [[nodiscard]] static spec::BlockPolicy policy(std::uint32_t block) {
+        auto p = spec::hy4_dfly2();
+        if (block != 0U) p.block = block;
+        if (p.block > kMaxVerifyRows) throw std::invalid_argument("hy4 dfly: block rows above the verify rows");
+        spec::validate(p);
+        return p;
+    }
+    void install(std::span<const std::uint32_t> prompt) override {
+        if (prompt.empty()) throw std::invalid_argument("hy4 dfly: prompt is empty");
+        size_ = static_cast<std::uint32_t>(prompt.size());
+        base_ = f_.position();
+        fed_ = 0;
+        f_.set_prompt_hidden([this](const float* rows, std::uint32_t p0, std::uint32_t n) {
+            if (p0 != base_ + fed_ || fed_ + n > size_) throw std::logic_error("hy4 dfly: prompt rows out of order");
+            fed_ += n;
+            if (fed_ == size_) f_.dfly_hidden(rows + std::size_t{n - 1U} * f_.config().hidden);
+        });
+    }
+    void finish_prompt(std::uint32_t anchor) override {
+        f_.set_prompt_hidden({});
+        if (fed_ != size_) throw std::logic_error("hy4 dfly: prompt rows not all fed by prefill");
+        drafter_.start(anchor, std::uint64_t{base_} + size_);
+    }
+    [[nodiscard]] spec::ParallelBlockDrafter& chain() { return drafter_; }
+
+private:
+    Fwd& f_;
+    spec::BlockPolicy policy_;
+    DflyForward<Fwd> fwd_;
+    spec::ParallelBlockDrafter drafter_;
+    std::uint32_t size_ = 0, base_ = 0, fed_ = 0;
 };
 
 // The next-token block tensor-parallel for one decode (Forward::set_nextn_tp), the one-node form again after it.
@@ -432,6 +509,30 @@ SpecResult spec_decode(Fwd& f, std::span<const std::uint32_t> prompt, std::uint3
     res.chain_reads = ch.host_reads();
     res.chain_ms = ch.draft_wall_ms();
     res.verify_ms = target.verify_ms();
+    return res;
+}
+
+// The same with the DFly2 block drafter (`dfly` installed before the prefill and finished with the anchor) as the chain of
+// the shared BlockDrafter: the Arbiter prices copy / block / hybrid rows (a block pass costs one forward for any k: flush =
+// the block wall, step ~ one chain slot). Pair: the drafter runs on rank 0 alone (rank 1 replays the verify passes).
+template <class Fwd>
+SpecResult spec_decode(Fwd& f, std::span<const std::uint32_t> prompt, std::uint32_t anchor, std::uint32_t n, const SpecOptions& o,
+                       DflySource<Fwd>& dfly, const spec::pair_round::Exchange* pair = nullptr) {
+    auto& ch = dfly.chain();
+    VerifyEngine<Fwd> engine(f);
+    spec::EngineVerifyTarget<VerifyEngine<Fwd>> target(engine);
+    const auto blocks0 = f.dfly_blocks();
+    const double ms0 = f.dfly_ms();
+    SpecResult res;
+    if (pair == nullptr) res = detail::spec_run(f, prompt, anchor, n, o, &ch, {}, target);
+    else {
+        spec::pair_round::PairVerifyLeader lead(target, *pair, [&f] { return std::uint64_t{f.position()}; });
+        res = detail::spec_run(f, prompt, anchor, n, o, &ch, {}, lead);
+        lead.finish();
+    }
+    res.chain_calls = f.dfly_blocks() - blocks0;
+    res.chain_drafts = ch.passes();
+    res.chain_ms = f.dfly_ms() - ms0;
     return res;
 }
 

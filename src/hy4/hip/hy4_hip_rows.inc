@@ -233,7 +233,7 @@ void cache_vrows(std::uint32_t l, std::uint32_t R) {  // vr.xn -> latent[l] (+ t
     for (std::uint32_t r = 0; r < R; ++r) norm(vr.ckv + std::size_t{r} * row, kvn, kl, c.rms_eps, vr.ckv + std::size_t{r} * row);
     rp::launch<rp::Round::bf16>({vr.ckv, R, 1U, row, row, kl, rope / 2U, idx ? cos_idx : cos_swa, idx ? sin_idx : sin_swa, positions, false}, s);
     check(dcr::store_rows({vr.ckv, row, positions, 0U, R, latent_rows[l], latent[l], flag}, s), "latent verify rows store");
-    if (idx)
+    if (idx && !dfly_block_id(l))  // a DFly2 block has no indexer: it never writes the KV-share layer's keys
         for (std::uint32_t r = 0; r < R; ++r) {
             const RowBind bind(*this, r);
             index_keys(l, false);  // verify rows: no shared same-input projection ran, project here
