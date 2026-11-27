@@ -56,6 +56,7 @@ struct ModelShape {
     double embed_bytes = 0.0;                // resident on the first stage and on the decoder
     double head_bytes = 0.0;                 // final norm + head: resident on the last stage and the decoder, read per token
     std::vector<double> read_bytes_per_token{}; // per layer: decode bytes read per token (weights + state); empty: none
+    double decode_message_header_bytes = 0.0; // downstream hidden row and upstream token message headers
 };
 // Split toggle (one value for CLI and server, resolved here): auto_plan searches everything; device_only keeps the
 // prefill on one device that also decodes; handoff runs one device and moves the whole state to another decoder;
@@ -83,6 +84,8 @@ struct Request {
     // decode, no device takes the whole model, so the admission checks each stage (weights + its state) and not the
     // decoder's whole-model fit. false keeps the handoff admission (the decoder owns everything after the prefill).
     bool layer_owned_state = false;
+    // Opt-in: predict the serial decode of layer-owned stages with their own rates and both link directions.
+    bool price_layer_owned_decode = false;
 };
 struct Plan {
     bool valid = false;
@@ -96,7 +99,7 @@ struct Plan {
     std::vector<double> stage_block_ms;    // per stage, one full block
     std::vector<double> hop_block_ms;      // per forward hop first..max(last,decoder)-1, one full block
     std::string bottleneck;                // slowest resource of a full block
-    double decode_ms_per_token = 0.0;      // decoder alone after the prefill (0: rate or reads undeclared)
+    double decode_ms_per_token = 0.0;      // single decoder or priced serial stage path (0: unpriced)
     std::string reason;
     std::uint32_t stages() const { return static_cast<std::uint32_t>(cuts.empty() ? 0U : cuts.size() - 1U); }
     double rows_per_s(std::uint64_t rows) const { return wall_ms > 0.0 ? static_cast<double>(rows) * 1000.0 / wall_ms : 0.0; }
@@ -134,7 +137,7 @@ inline std::uint32_t owner(const std::vector<std::uint32_t>& cuts, std::uint32_t
 // Evaluates one fully specified plan (first, decoder, cuts, block); fills timing or the reject reason.
 inline Plan evaluate(const std::vector<Device>& devices, const std::vector<Link>& links, const ModelShape& model,
     std::uint64_t rows, std::uint32_t first, std::uint32_t decoder, std::vector<std::uint32_t> cuts, std::uint32_t block,
-    std::uint64_t state_rows = 0, bool layer_owned_state = false) {
+    std::uint64_t state_rows = 0, bool layer_owned_state = false, bool price_layer_owned_decode = false) {
     Plan plan;
     plan.first = first;
     plan.decoder = decoder;
@@ -147,6 +150,8 @@ inline Plan evaluate(const std::vector<Device>& devices, const std::vector<Link>
         return reject("device or link outside the declaration");
     const auto stages = plan.stages();
     plan.last = first + stages - 1U;
+    if (price_layer_owned_decode && (!layer_owned_state || decoder != plan.last))
+        return reject("priced layer-owned decode needs the head stage as decoder");
     if (plan.cuts.front() != 0U || plan.cuts.back() != model.layers) return reject("cuts do not cover the model");
     for (std::uint32_t s = 0; s < stages; ++s)
         if (plan.cuts[s + 1U] > model.layers || plan.cuts[s] >= plan.cuts[s + 1U])
@@ -187,7 +192,32 @@ inline Plan evaluate(const std::vector<Device>& devices, const std::vector<Link>
             if (whole > owner.capacity_bytes) return reject("decoder " + owner.name + " cannot hold the whole model and state");
         }
     }
-    if (!model.read_bytes_per_token.empty() && devices[decoder].read_bytes_per_ms > 0.0) {
+    if (price_layer_owned_decode) {
+        if (!has(model.read_bytes_per_token) || !std::isfinite(model.head_bytes) || model.head_bytes < 0.0 ||
+            !std::isfinite(model.seam_bytes_per_row) || model.seam_bytes_per_row < 0.0 ||
+            !std::isfinite(model.decode_message_header_bytes) || model.decode_message_header_bytes < 0.0 ||
+            std::any_of(model.read_bytes_per_token.begin(), model.read_bytes_per_token.end(),
+                        [](double bytes) { return !std::isfinite(bytes) || bytes < 0.0; }))
+            return reject("invalid layer-owned decode byte declaration");
+        const auto positive = [](double v) { return std::isfinite(v) && v > 0.0; };
+        for (std::uint32_t s = 0; s < stages; ++s) {
+            const auto& device = devices[first + s];
+            if (!positive(device.read_bytes_per_ms)) return reject("no decode read rate for " + device.name);
+            const auto bytes = detail::range_sum(model.read_bytes_per_token, plan.cuts[s], plan.cuts[s + 1U]) +
+                (s + 1U == stages ? model.head_bytes : 0.0);
+            plan.decode_ms_per_token += bytes / device.read_bytes_per_ms;
+        }
+        for (auto hop = first; hop < plan.last; ++hop) {
+            const auto& link = links[hop];
+            if (!positive(link.forward_bytes_per_ms) || !positive(link.reverse_bytes_per_ms) ||
+                !std::isfinite(link.latency_ms) || link.latency_ms < 0.0)
+                return reject("layer-owned decode needs both link directions");
+            plan.decode_ms_per_token += 2.0 * link.latency_ms +
+                (model.seam_bytes_per_row + model.decode_message_header_bytes) / link.forward_bytes_per_ms +
+                model.decode_message_header_bytes / link.reverse_bytes_per_ms;
+        }
+        if (!std::isfinite(plan.decode_ms_per_token)) return reject("non-finite layer-owned decode cost");
+    } else if (!model.read_bytes_per_token.empty() && devices[decoder].read_bytes_per_ms > 0.0) {
         if (model.read_bytes_per_token.size() != model.layers) return reject("model read shape mismatch");
         plan.decode_ms_per_token = (detail::range_sum(model.read_bytes_per_token, 0U, model.layers) + model.head_bytes) /
                                    devices[decoder].read_bytes_per_ms;
@@ -196,7 +226,7 @@ inline Plan evaluate(const std::vector<Device>& devices, const std::vector<Link>
     const auto end = std::max(plan.last, decoder);
     std::vector<double> forward_state(devices.size(), 0.0), reverse_state(devices.size(), 0.0);
     std::vector<double> forward_fixed(devices.size(), 0.0), reverse_fixed(devices.size(), 0.0);
-    for (std::uint32_t layer = 0; layer < model.layers; ++layer) {
+    for (std::uint32_t layer = 0; !price_layer_owned_decode && layer < model.layers; ++layer) {
         const auto own = detail::owner(plan.cuts, first, layer);
         for (auto hop = own; hop < decoder; ++hop) { forward_state[hop] += model.state_bytes_per_row[layer]; forward_fixed[hop] += model.state_fixed_bytes[layer]; }
         for (auto hop = decoder; hop < own; ++hop) { reverse_state[hop] += model.state_bytes_per_row[layer]; reverse_fixed[hop] += model.state_fixed_bytes[layer]; }
@@ -283,6 +313,8 @@ inline Choice choose(const std::vector<Device>& devices, const std::vector<Link>
     const Request& request) {
     if (devices.empty() || model.layers == 0U || request.rows == 0U || request.blocks.empty() || request.decoders.empty())
         throw std::invalid_argument("chain plan needs devices, a model, rows, blocks and a decoder");
+    if (request.price_layer_owned_decode && (!request.layer_owned_state || !std::isfinite(request.decode_tokens) ||
+        request.decode_tokens < 0.0)) throw std::invalid_argument("invalid priced layer-owned decode request");
     auto blocks = request.blocks;
     std::sort(blocks.begin(), blocks.end());
     const auto legal = [&](std::uint32_t cut) { return !request.legal_cut || request.legal_cut(cut); };
@@ -304,8 +336,9 @@ inline Choice choose(const std::vector<Device>& devices, const std::vector<Link>
     // any one stage resource (done[r][j] >= done[r][j-1] + t_r(j) and the last resource finishes last). Placed stages
     // give that bound directly; the layers not yet placed cost at least their cheapest remaining device each, and the
     // remaining stages share them, so the slowest of them carries at least the mean. Within one run (fixed decoder) the
-    // decode term is a constant, so a cut prefix whose bound exceeds the run's best wall cannot win and is skipped;
-    // evaluation order and tie rules are unchanged, so the chosen plan and every candidate are those of the full search.
+    // single-device decode term is constant, so a cut prefix above the run's best wall cannot win. With priced stages,
+    // the decode term depends on cuts; instead bound by the best combined objective (the decode term is nonnegative).
+    // Evaluation order and tie rules are unchanged, so the chosen plan and every candidate are those of the full search.
     std::vector<std::vector<double>> prefix(devices.size());
     for (std::size_t d = 0; d < devices.size(); ++d)
         if (devices[d].layer_ms_per_row.size() == model.layers) {
@@ -327,6 +360,7 @@ inline Choice choose(const std::vector<Device>& devices, const std::vector<Link>
     for (const auto cut : request.cuts)
         if (cut >= model.layers || (cut != 0U && !legal(cut))) throw std::invalid_argument("forced cut is not a legal layer cut");
     const auto wanted = [&](std::uint32_t count, std::uint32_t first, std::uint32_t decoder) {
+        if (request.price_layer_owned_decode && decoder != first + count - 1U) return false;
         switch (request.split) {
         case Split::device_only: return count == 1U && decoder == first;
         case Split::handoff: return count == 1U && decoder != first;
@@ -407,7 +441,7 @@ inline Choice choose(const std::vector<Device>& devices, const std::vector<Link>
                         for (const auto block : blocks) {
                             charge(1U);
                             auto plan = evaluate(devices, links, model, request.rows, first, decoder, cuts, block, request.state_rows,
-                                                 request.layer_owned_state);
+                                                 request.layer_owned_state, request.price_layer_owned_decode);
                             if (!plan.stage_block_ms.empty()) charge(plan.blocks * (plan.stage_block_ms.size() + plan.hop_block_ms.size() +
                                 (plan.last > decoder ? plan.last - decoder : 0U)));
                             if (better(plan, run_best) || (!run_best.valid && !plan.valid && run_best.reason == "no legal cut set"))
@@ -423,7 +457,7 @@ inline Choice choose(const std::vector<Device>& devices, const std::vector<Link>
                         if (run_best.valid) {
                             double placed = 0.0, whole = 0.0;
                             bounds(index, placed, whole);
-                            const auto limit = run_best.wall_ms * (1.0 + 1e-8);
+                            const auto limit = (request.price_layer_owned_decode ? objective(run_best) : run_best.wall_ms) * (1.0 + 1e-8);
                             if (placed > limit) break;      // stage index-1 only grows with the cut
                             if (whole > limit) continue;
                         }

@@ -73,12 +73,53 @@ void planning_work_limits() {
     catch (const std::invalid_argument& error) { exhausted = std::string(error.what()) == "chain search work limit exceeded"; }
     require(exhausted, "search exhaustion refuses a partial winner");
 }
+
+void priced_layer_owned_decode() {
+    const std::vector<chain::Device> devices{{"a", {1, 1, 1, 1}, 0, 0, 0, {}, 1},
+        {"b", {1, 1, 1, 1}, 0, 0, 0, {}, 10}};
+    const std::vector<chain::Link> wire{{64, 32, 2}};
+    const chain::ModelShape model{4U, 32, {20, 20, 20, 20}, {4, 4, 4, 4}, {}, 0, 10, {10, 10, 10, 10}, 32};
+    const auto eval = [&](std::uint32_t cut, bool price) {
+        return chain::evaluate(devices, wire, model, 16, 0, 1, {0, cut, 4}, 4, 16, true, price);
+    };
+    const auto legacy = eval(2, false);
+    const auto balanced = eval(2, true);
+    require(legacy.valid && legacy.fixed_state_ms > 0 && legacy.decode_ms_per_token == 5,
+        "unpriced layer-owned requests preserve existing costs");
+    require(balanced.valid && balanced.fixed_state_ms == 0 && balanced.wall_ms == balanced.makespan_ms &&
+        balanced.wall_ms < legacy.wall_ms && balanced.decode_ms_per_token == 29,
+        "layer state stays local, decode charges 20+3 ms for reads and 6 ms for the bidirectional hop");
+    require(!chain::evaluate(devices, wire, model, 16, 0, 0, {0, 2, 4}, 4, 16, true, true).valid,
+        "the token comes from the head stage");
+    const auto one_way = chain::evaluate(devices, {{64, 0, 2}}, model, 16, 0, 1, {0, 2, 4}, 4, 16, true, true);
+    require(!one_way.valid && one_way.reason == "layer-owned decode needs both link directions", "missing return link refuses");
+    auto undeclared = devices;
+    undeclared[0].read_bytes_per_ms = 0;
+    const auto unpriced = chain::evaluate(undeclared, wire, model, 16, 0, 1, {0, 2, 4}, 4, 16, true, true);
+    require(!unpriced.valid && unpriced.reason == "no decode read rate for a", "unknown decode rate is never free");
+
+    chain::Request request;
+    request.split = chain::Split::layer_cut;
+    request.cuts = {0};
+    request.rows = 16;
+    request.blocks = {4};
+    request.decoders = {0, 1};
+    request.layer_owned_state = true;
+    request.price_layer_owned_decode = true;
+    const auto prefill = chain::choose(devices, wire, model, request).best;
+    require(prefill.valid && prefill.cuts[1] == 2, "without decode demand best cut balances prefill");
+    request.decode_tokens = 10;
+    const auto combined = chain::choose(devices, wire, model, request).best;
+    require(combined.valid && combined.cuts[1] == 1 && combined.decoder == 1 && combined.decode_ms_per_token == 20,
+        "decode demand shifts work to the faster decoder");
+}
 } // namespace
 
 int main() try {
     malformed_plan_inputs();
     reverse_block_schedule();
     planning_work_limits();
+    priced_layer_owned_decode();
     const auto shape = strix::qwen_pp::chain_shape();
     {   // Qwen state layout: 29,952 B/row and ~116.4 MB fixed, as the CUDA export sends
         double row = 0.0, fixed = 0.0;

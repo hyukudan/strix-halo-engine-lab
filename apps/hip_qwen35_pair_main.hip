@@ -264,6 +264,11 @@ int main(int argc, char** argv) try {
     const bool relay = decode_reason.empty() && plan.stages() > 1U;
     if (!decode_reason.empty()) {
         request.layer_owned_state = true;
+        request.price_layer_owned_decode = strix::envcfg::flag("STRIX_PAIR_PRICE_LAYER_DECODE", false);
+        if (request.price_layer_owned_decode) {
+            shape.decode_message_header_bytes = double(layers::decode_header_bytes);
+            std::puts("placement pricing: serial layer-owned decode");
+        }
         plan = chain::choose(devices, chain::links(hops), shape, request).best;
     }
     std::printf("%s\n", pp::describe(plan, devices, prompt.size()).c_str());
