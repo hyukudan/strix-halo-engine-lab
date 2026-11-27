@@ -190,9 +190,9 @@ Options parse(std::vector<std::string> args) {
     auto options = parse_options(static_cast<int>(argv.size()), argv.data());
     if (options.product_profile_requested == qwen::profile::Name::fast)
         options.product_profile = qwen::profile::resolve(qwen::profile::Name::fast, measured_profile(options.product_profile_inputs));
-    // The route fixtures of this file cover the automatic FP16 WMMA prefill organization. The default column is EXACT
-    // (it resolves the dense-a8 reference prefill, covered by exact_tier_runs_the_reference_prefill below), so a
-    // fixture that names no profile runs the incumbent route with an empty lever resolution.
+    // The route fixtures of this file cover the automatic FP16 WMMA prefill organization with an empty lever resolution
+    // when they name no profile (no --profile resolves the FAST preset; EXACT, the dense-a8 reference prefill, and the
+    // implicit preset are covered by the tier block of the prompt route below).
     else if (!options.product_profile_requested) options.product_profile.entries.clear();
     return options;
 }
@@ -4280,13 +4280,16 @@ int main(int argc, char** arguments) {
             }
             {   // EXACT keeps the tiled organization and runs the dense-a8 reference prefill; FAST and TURBO run FP16 WMMA
                 // (TIER-02): one rule for the single-request route and the server.
-                for (const auto tier : {qwen::profile::Name::standard, qwen::profile::Name::quality,
-                                        qwen::profile::Name::fast}) {
+                // No --profile (nullopt) resolves the implicit FAST preset through the same reader as a named tier.
+                for (const auto tier : {std::optional{qwen::profile::Name::standard},
+                                        std::optional{qwen::profile::Name::quality},
+                                        std::optional{qwen::profile::Name::fast},
+                                        std::optional<qwen::profile::Name>{}}) {
                     qwen::profile::Inputs inputs;
                     inputs.env = [](const char*) -> const char* { return nullptr; };
-                    const bool exact = tier != qwen::profile::Name::fast;
+                    const bool exact = tier && *tier != qwen::profile::Name::fast;
                     auto cli=request; cli.options.tokens.assign(8192,request.options.tokens.front());
-                    cli.options.product_profile = qwen::profile::resolve(tier, measured_profile(inputs));
+                    cli.options.product_profile = qwen::profile::resolve_requested(tier, measured_profile(inputs));
                     auto shaped=http; shaped.options.context_tokens=resolve(cli,memory).options.context_tokens;
                     shaped.options.product_profile = cli.options.product_profile;
                     shaped.environment=cli.environment;

@@ -1195,7 +1195,7 @@ static int run_decode_entry(
         std::cout << "Usage: strix-hip-decode-token MODEL.gguf TOKEN_ID ... [options]\n"
             "  --context N --generate N --eos-token ID --residency register|copy\n"
             "  --deploy FILE|auto --deploy-check (host-only deployment JSON; includes effective config)\n"
-            "  --profile exact|fast|turbo (also accepts default and quality)\n"
+            "  --profile exact|fast|turbo (none: the FAST preset; exact: the bit-exact reference; also accepts quality)\n"
             "  --allow-pending (benchmark runnable pending profile rows; unqualified)\n"
             "  --optimization-profile auto|manual (default auto, qualified checkpoint only)\n"
             "  --baseline / STRIX_BASELINE=1 (historical resolution, controlled defaults off)\n"

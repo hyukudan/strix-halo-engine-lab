@@ -2174,11 +2174,10 @@ inline strix::qwen::profile::Resolution resolve_request_product_profile(Options&
     const std::string execution = qwen_ladder_execution(o, prompt_tokens);
     auto inputs = o.product_profile_inputs;
     inputs.regime = strix::profile::Regime{strix::profile::Phase::prefill, prompt_tokens, 1, o.profile_device_class, execution};
-    return strix::qwen::profile::resolve(
-        o.product_profile_requested.value_or(strix::qwen::profile::Name::standard), inputs);
+    return strix::qwen::profile::resolve_requested(o.product_profile_requested, inputs);
 }
 
-// EXACT (the default column) runs the dense-a8 reference prefill: the product profile's prefill_f16wmma row resolved
+// EXACT (--profile exact) runs the dense-a8 reference prefill: the product profile's prefill_f16wmma row resolved
 // to its off value. The one reading of that row, shared by the CLI prompt route, the HTTP route and the YaRN route.
 inline bool product_profile_prefill_f16_off(const Options& o) {
     const auto* row = o.product_profile.find("prefill_f16wmma");
@@ -3986,8 +3985,8 @@ inline Options parse_options(
     // global; a per-request resolution needs request-scoped levers first.
     if (options.http_serve) {
         options.product_profile_inputs.regime = strix::profile::startup_prefill_regime(device_class);
-        options.product_profile = strix::qwen::profile::resolve(
-            options.product_profile_requested.value_or(strix::qwen::profile::Name::standard), options.product_profile_inputs);
+        options.product_profile = strix::qwen::profile::resolve_requested(
+            options.product_profile_requested, options.product_profile_inputs);
     } else {
         options.product_profile = resolve_request_product_profile(options, options.tokens.size());
     }

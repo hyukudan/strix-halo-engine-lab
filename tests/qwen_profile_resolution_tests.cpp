@@ -1,4 +1,5 @@
 #include "../apps/qwen_effective_config.hpp"
+#include "strix/model_description.hpp"
 #include <iostream>
 #include <map>
 #include <type_traits>
@@ -390,6 +391,54 @@ void exact_resolves_no_bit_changing_prefill_lever() {
               "the route reads the prefill_f16wmma row: off in EXACT only");
     }
 }
+// No --profile = the model preset: the tier presets.default of the model data names, admitted as `strix run` admits it
+// (the launcher passes --profile <tier> with the preset marker), at every context and with or without --allow-pending.
+std::string cells(const pr::Resolution& r) {
+    std::string out;
+    for (const auto& entry : r.entries)
+        out += std::string(entry.lever->name) + "=" + entry.value + ":" + std::string(pr::status_name(entry.status)) + ";";
+    return out;
+}
+void implicit_preset_is_the_model_preset() {
+    const auto description = strix::model_description::load(std::string(STRIX_SOURCE_DIR) + "/models/qwen3.8-flash-next.toml");
+    const auto* declared = description.find("presets.default");
+    const auto* word = declared ? std::get_if<std::string>(&declared->data) : nullptr;
+    check(word && *word == pr::name(pr::kImplicit), "kImplicit is the tier models/qwen3.8-flash-next.toml presets.default names");
+    const Env env;
+    for (const std::uint64_t context : {0U, 2048U, 8192U, 8193U, 32768U, 262144U}) {
+        for (const bool allow : {false, true}) {
+            pr::Inputs input{{}, lookup(env), allow};
+            input.regime = {strix::profile::Phase::prefill, context, 1, "gfx1151"};
+            input.max_prompt_tokens = context;
+            input.regimes = pr::fast_regimes;
+            const auto implicit = pr::resolve_requested(std::nullopt, input);
+            std::string previous;
+            if (const char* prior = strix::profile::environment({}, strix::profile::kPresetEnv)) previous = prior;
+            check(strix::profile::export_environment(strix::profile::kPresetEnv, "1"), "set the preset marker");
+            const auto launcher = pr::resolve(pr::kImplicit, input);
+            check(strix::profile::export_environment(strix::profile::kPresetEnv, previous.c_str()), "restore the preset marker");
+            check(implicit.profile == pr::Name::fast && cells(implicit) == cells(launcher),
+                  "no --profile resolves the cells of `strix run` without --profile (FAST, preset admission)");
+            check(cells(pr::resolve_requested(pr::Name::fast, input)) == cells(pr::resolve(pr::Name::fast, input)) &&
+                      cells(pr::resolve_requested(pr::Name::standard, input)) == cells(pr::resolve(pr::Name::standard, input)),
+                  "a named --profile resolves as named");
+            // The previous default arithmetic of the FP16 WMMA prefill rows (their builtin value) stays the default.
+            for (const char* key : {"prefill_f16wmma", "hc_output_wmma"}) {
+                const auto* entry = implicit.find(key);
+                check(entry && entry->value == entry->lever->builtin,
+                      "no --profile keeps the FP16 WMMA prefill rows at their builtin value");
+            }
+            // Provisional cells (outside the FAST bundle's qualified prompts) wait for --allow-pending, as under the preset.
+            for (const auto& entry : implicit.entries)
+                check(entry.status != pr::Status::provisional || allow, "no --profile applies no provisional cell by itself");
+        }
+    }
+    dc::Options options;
+    pr::Inputs input{{}, lookup(env), false};
+    input.regime = {strix::profile::Phase::prefill, 32768, 1, "gfx1151"};
+    options.product_profile = pr::resolve_requested(std::nullopt, input);
+    check(!dc::product_profile_prefill_f16_off(options), "no --profile runs the FP16 WMMA prefill route");
+}
 }
 int main(int argc,char** argv) try {
     emit=argc==2 && std::string_view(argv[1])=="--fixtures";
@@ -398,6 +447,7 @@ int main(int argc,char** argv) try {
     prefill_startup_binding();
     registered_controls_resolve_builtin();
     exact_resolves_no_bit_changing_prefill_lever();
+    implicit_preset_is_the_model_preset();
     product_matrix(); admission_matrix(); defaults_matrix(); config_matrix(); identities();
 #ifndef STRIX_STEP1_ORIGINAL
     common_adapters();

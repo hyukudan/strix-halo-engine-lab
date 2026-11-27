@@ -262,7 +262,7 @@ These controls are server-level only; changing a shared prefill plan or prefix-s
 cache identity requires a server restart. See the
 [option catalog](docs/optimizations.md#bit-changing-prefill-options).
 
-Qwen `hc_output_wmma` is ON under `--profile fast` and `--profile turbo`; `--profile exact` (the word used when no profile is given) resolves it off together with the FP16 WMMA prefill. `hc_output_wmma` passed a pre-declared confirmation held-out set; its NLL endpoint is measured against a rounding-equivalent control whose per-case movement is capped at +-0.02 nats/token (a bounded control allowance, not an unbiased estimate of the uncapped difference); the absolute NLL change vs the exact reference also passed (-0.37 % NLL/token, upper bound +0.38 %). The off switch restores the exact output path.
+Qwen `hc_output_wmma` is ON under `--profile fast` and `--profile turbo`; `--profile exact`, the bit-exact reference, resolves it off together with the FP16 WMMA prefill; a run with no `--profile` resolves the FAST preset (the model's `presets.default`, as `strix run` does), so the default keeps it on. `hc_output_wmma` passed a pre-declared confirmation held-out set; its NLL endpoint is measured against a rounding-equivalent control whose per-case movement is capped at +-0.02 nats/token (a bounded control allowance, not an unbiased estimate of the uncapped difference); the absolute NLL change vs the exact reference also passed (-0.37 % NLL/token, upper bound +0.38 %). The off switch restores the exact output path.
 Controls are server-level only: `STRIX_PREFILL_HC_OUTPUT_WMMA=0`,
 `--prefill-disable hc_output_wmma`, or config `prefill_disable = ["hc_output_wmma"]`;
 master `STRIX_PREFILL_EXACT_FP16=1`, `--prefill-exact-fp16`, or config

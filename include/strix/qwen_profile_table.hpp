@@ -63,8 +63,9 @@ inline constexpr Lever table[] = {
      .value = {"", "", "", ""}, .builtin = "0", .kind = Kind::pack,
      .ready = {true, false, true, false}, .runnable = {true, false, true, true},
      .target = "admit GSQ-RCO expert storage", .off = "0", .source = "requires a supplied GSQ pack; loader admission and model identity are independent of the tier", .identity = {{{"0", "v1"}, {"1", "gsq-rco-v1"}}}},
-    // EXACT (the default column) keeps the reference prefill: both FP16 WMMA prefill rows below change bits, so
-    // the default and quality columns switch them off and the FAST cell (TURBO takes it) runs them, as the build always did.
+    // EXACT (--profile exact) keeps the reference prefill: both FP16 WMMA prefill rows below change bits, so the
+    // standard and quality columns switch them off and the FAST cell (TURBO takes it; no --profile resolves FAST) runs
+    // them, as the build always did.
     {.name = "prefill_f16wmma", .env = "", .option = "",
      .value = {"0", "1", "0", ""}, .builtin = "1", .kind = Kind::bit_changing,
      .ready = {true, true, true, true}, .runnable = {true, true, true, true},

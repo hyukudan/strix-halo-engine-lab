@@ -28,8 +28,8 @@ Add `--print-effective-config` to inspect before HIP initialization. See [Defaul
 
 Eligible plain CLI prompts automatically select known-prefix tiled prefill (T8192 for long prompts,
 T4096 at 4K), expert union, router rows and the tier's prefill arithmetic: `--profile fast` and `--profile turbo` run
-`fast-prefill-f16wmma-v1` with `hc_output_wmma`; `--profile exact` (the default word) runs the bit-exact dense-A8 reference
-prefill with `hc_output_wmma` off, so an EXACT run is slower in prefill. Audit-measured EXACT prefill cost (the audit verification, not a new measurement): about +4.4 s at 32K and +66.9 s at 262K. Context is sized automatically;
+`fast-prefill-f16wmma-v1` with `hc_output_wmma`; `--profile exact` runs the bit-exact dense-A8 reference
+prefill with `hc_output_wmma` off; a run without `--profile` resolves the FAST preset (the model's `presets.default`, as `strix run` does). EXACT is the reference and costs about +4.4 s at 32K and +66.9 s at 262K against the default (audit verification, not a new measurement). Context is sized automatically;
 beyond 8192 the resolver adds `--unqualified-context`. Registered residency (`--residency register`)
 is the default on UMA; automatic page locking warns and continues unlocked on failure, as before.
 An explicit `STRIX_MODEL_REGISTER_MLOCK=1` refuses startup if locking fails; `STRIX_MODEL_REGISTER_MLOCK=0` disables locking, see [Registered page lock](../../operations/model-weight-residency.md#registered-page-lock). FP16 prefill has its own exact reference and is not bit-identical to dense-A8 serial prefill.

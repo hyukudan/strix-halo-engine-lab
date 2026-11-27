@@ -27,7 +27,12 @@ using ::strix::profile::kind_name;
 using ::strix::profile::status_name;
 #include "strix/qwen_profile_table.hpp"
 inline std::span<const Lever> levers() { return table; }
-using ::strix::profile::parse;  // shared tier words: exact (= default)|fast|quality|turbo
+using ::strix::profile::parse;  // shared tier words: exact|fast|quality|turbo
+// The implicit preset of this engine (the model data: models/qwen3.8-flash-next.toml presets.default; the host test
+// strix-qwen-profile-resolution-tests holds the two equal). A run that names no --profile resolves this tier with the
+// model preset's admission, the cells `strix run` resolves without --profile: qualified cells apply, provisional cells
+// wait for --allow-pending. `--profile exact` names the bit-exact reference.
+inline constexpr Name kImplicit = Name::fast;
 inline constexpr std::string_view kTurboVersion = "qwen-turbo-v1";
 // KV precision (--kv, strix/session/kv_precision.hpp): native BF16; the HIP 8-bit form is int8 (kv-int8-tok-v1, admitted
 // routes in validate_resolved_attention_kv_storage). gfx1151 has no FP8, so --kv fp8 is refused and turbo keeps BF16.
@@ -149,6 +154,8 @@ struct Inputs {
     std::span<const ::strix::profile::RegimeGate> regimes{};
     ::strix::profile::Regime regime{};
     std::span<const ::strix::profile::LadderRow> ladder{};
+    // Model preset admission (as under `strix run`): set for a run that names no --profile (resolve_requested).
+    bool preset = false;
 };
 // CUDA engine (sm_120): onfly 4-bit = NVFP4 images of the dense Q8_0 roles (src/cuda/qwen_prefill_driver.cu
 // convert_onfly, shared core strix/cuda/core/nvfp4_a8.hpp); converted packs need the owner's OK (pending).
@@ -172,7 +179,7 @@ inline Resolution resolve(Name profile, const Inputs& inputs = {}, std::span<con
     Resolution out{profile, {}, {}, {}};
     const char* allow = environment(inputs.env, "STRIX_QWEN_PROFILE_ALLOW_PENDING");
     const bool allow_pending = inputs.allow_pending || (allow && std::string_view(allow) == "1");
-    const bool preset = ::strix::profile::model_preset();
+    const bool preset = inputs.preset || ::strix::profile::model_preset();
     out.weights = ::strix::profile::turbo::resolve_weights(out.is_turbo(), inputs.weights,
         [&inputs](const char* key) { return environment(inputs.env, key); }, inputs.caps ? *inputs.caps : kWeightCaps);
     const auto admit_of = [&](const Lever& lever, unsigned c) {
@@ -202,6 +209,12 @@ inline Resolution resolve(Name profile, const Inputs& inputs = {}, std::span<con
         }, {.omit_unselected = true, .keep_cli_provenance = true, .refuse_unrunnable_explicit = true,
             .admit_builtin_column = true});
     return out;
+}
+// The one reading of the requested tier (the CLI prompt route, the HTTP server and the YaRN route): a named --profile
+// resolves as named; no --profile resolves the implicit preset (kImplicit) with the model preset's admission.
+inline Resolution resolve_requested(const std::optional<Name>& requested, Inputs inputs) {
+    if (!requested) inputs.preset = true;
+    return resolve(requested.value_or(kImplicit), inputs);
 }
 using ::strix::profile::Export;
 using ::strix::profile::export_environment;
