@@ -108,9 +108,51 @@ bool check_row_admission() {
     return true;
 }
 
+// Staged union inputs (union_stage_slot / union_stage_bytes, HIP gate_up_union): every lane quad of a chunk takes 4
+// slots no other value takes (inside the row's slots), 8-byte aligned (one Bf16Quad load) and contiguous; the 32 lanes'
+// quads at one step of the streamed body hit 32 distinct LDS bank pairs; the CTA's bytes hold 4 rows under
+// kUnionStageMaxBytes, 0 when the row is not whole chunks.
+using MatrixFormat = strix::weight::microscaled::MatrixFormat;
+template <MatrixFormat F>
+bool check_union_stage_format(unsigned chunk) {
+    for (unsigned width = chunk; width <= 4096U; width += chunk) {
+        const unsigned slots = r1::union_stage_slot(width, chunk);
+        std::vector<bool> used(slots, false);
+        for (unsigned at = 0; at < width; at += 4U) {
+            const unsigned slot = r1::union_stage_slot(at, chunk);
+            if (slot % 4U != 0U || slot + 3U >= slots) return false;
+            for (unsigned v = 0; v < 4U; ++v) {
+                if (r1::union_stage_slot(at + v, chunk) != slot + v || used[slot + v]) return false;
+                used[slot + v] = true;
+            }
+        }
+        if (width >= 32U * chunk) {
+            for (unsigned quad = 0; quad < chunk / 4U; ++quad) {
+                std::vector<bool> banks(64U, false);
+                for (unsigned lane = 0; lane < 32U; ++lane) {
+                    const unsigned bank = (2U * r1::union_stage_slot(lane * chunk + 4U * quad, chunk) / 4U) % 64U;
+                    if (banks[bank] || banks[(bank + 1U) % 64U]) return false;
+                    banks[bank] = banks[(bank + 1U) % 64U] = true;
+                }
+            }
+        }
+        const unsigned want = 4U * slots * 2U;
+        if (r1::union_stage_bytes<F, 4U>(width) != (want <= r1::kUnionStageMaxBytes ? want : 0U)) return false;
+    }
+    return r1::union_stage_bytes<F, 4U>(chunk + 1U) == 0U && r1::union_stage_bytes<F, 4U>(0U) == 0U;
+}
+
 }  // namespace
 
 int main() {
+    if (!check_union_stage_format<MatrixFormat::nvfp4>(32U) || !check_union_stage_format<MatrixFormat::mxfp8>(16U)) {
+        std::printf("FAIL union staged input layout\n");
+        return 1;
+    }
+    // Inkling 2 Mini gate rows (hidden 2304): 4 staged inputs = 20 736 bytes of LDS per CTA.
+    static_assert(r1::union_stage_bytes<MatrixFormat::nvfp4, 4U>(2304U) == 20736U);
+    // Host / CUDA plans never run the union (kUnionMinRows); the host keeps every input of a union pass.
+    static_assert(r1::kUnionMinRows > r1::kMaxLaunchRows && r1::kUnionInputs<8U> == 8U);
     static_assert(r1::kGeometry.gate_columns == r1::kCudaGeometry.gate_columns &&
                       r1::kGeometry.down_columns == r1::kCudaGeometry.down_columns,
                   "host / CUDA builds keep one row per wave");

@@ -10,6 +10,9 @@
 #include "moe_core/r1_tail.hpp"
 
 #include "moe_core/microscaled_r1_geometry.hpp"
+#if defined(__HIPCC__)
+#include "strix/env_flags.hpp"
+#endif
 #include "strix/exec/descriptor.hpp"
 #include "strix/r1_rows_tiles.hpp"
 
@@ -193,9 +196,47 @@ inline constexpr Geometry kGeometry = kCudaGeometry;
 
 // Expert-union launches (CUDA): one pass carries up to MaxRows inputs per weight row, so the per-input accumulators
 // grow with MaxRows; wide passes take fewer columns per warp to stay in registers (the columns change no bit).
+// HIP (stream_inputs): every input loads its activation quads per weight quad, so a wave keeps the rows launch's
+// columns (each activation load feeds 4 weight rows) and takes at most kUnionInputs inputs per pass.
 template <unsigned MaxRows>
 inline constexpr Geometry kUnionGeometry =
+#if defined(__HIPCC__)
+    kHipGeometry;
+#else
     MaxRows <= 4U ? kCudaGeometry : (MaxRows <= 8U ? Geometry{1U, 2U} : Geometry{1U, 1U});
+#endif
+// Inputs of one union pass (dot_inputs) per wave: an expert routed by more assignments streams its columns again for
+// the next pass (from cache). HIP: 4 (8 inputs held 32 accumulators: 197-233 VGPRs on gfx1151, one CTA per CU, and
+// spills under the rows kernels' occupancy bound); real cohort windows route ~1.5 assignments per distinct expert.
+// Fewest routed rows the decode plan (launch) runs as an expert union. HIP: 8 (gfx1151 union bench, served-like routes:
+// R = 4 shares too few experts, 26 distinct of 32, and the union ran 6-12 % slower than the rows launch; R = 8 / 16
+// faster). CUDA: never (its union forms measured slower than the rows launch: coh_rtx).
+inline constexpr unsigned kUnionMinRows =
+#if defined(__HIPCC__)
+    8U;
+#else
+    std::numeric_limits<unsigned>::max();
+#endif
+
+// Formats whose decode plan also runs down_combine as a union (launch). HIP: MXFP8 only (gfx1151 union bench, served-like
+// routes, R = 8: MXFP8 down union 704 vs rows 800 us; the NVFP4 down union, half the bytes per FMA and global
+// activation rows, ran 460-498 vs rows 390 us at either column count, so NVFP4 keeps the rows down after the union
+// gate). CUDA: no union plan (kUnionMinRows).
+template <packed::MatrixFormat Format>
+inline constexpr bool kUnionDown =
+#if defined(__HIPCC__)
+    Format == packed::MatrixFormat::mxfp8;
+#else
+    false;
+#endif
+
+template <unsigned MaxRows>
+inline constexpr unsigned kUnionInputs =
+#if defined(__HIPCC__)
+    MaxRows < 4U ? MaxRows : 4U;
+#else
+    MaxRows;
+#endif
 
 // Launch-grid limits are backend data. The shared geometry is computed in 64 bits; every launch checks the grid(s) it
 // submits against the limits of the backend that submits them before anything is enqueued (a call no form can
@@ -298,6 +339,23 @@ STRIX_R1_HD constexpr unsigned staged_input_bytes(unsigned hidden) {
     if (hidden == 0U || hidden % chunk != 0U || hidden > kStagedInputMaxBytes / sizeof(float)) return 0U;
     const unsigned bytes = staged_input_slot(hidden, chunk) * static_cast<unsigned>(sizeof(float));
     return bytes <= kStagedInputMaxBytes ? bytes : 0U;
+}
+// Expert-union gate_up passes on HIP (gate_up_union): the pass's inputs (at most Inputs routed rows) are rounded once
+// per CTA into dynamic LDS as BF16 codes, the bits input_bf16 gives (bf16_round is the code shifted back), so the
+// multi-entry body reads each rounded activation from LDS instead of loading and rounding it per wave and per quad.
+// kUnionStagePad codes follow every chunk: lane l's quads sit 72 (NVFP4) / 40 (MXFP8) bytes apart, one bank pair per
+// lane. 0 = not staged (the pass reads the global rows).
+inline constexpr unsigned kUnionStagePad = 4U;
+inline constexpr unsigned kUnionStageMaxBytes = 32768U;
+STRIX_R1_HD constexpr unsigned union_stage_slot(unsigned value, unsigned chunk) {
+    return value + kUnionStagePad * (value / chunk);
+}
+template <packed::MatrixFormat Format, unsigned Inputs>
+STRIX_R1_HD constexpr unsigned union_stage_bytes(unsigned hidden) {
+    constexpr unsigned chunk = staged_input_chunk(Format);
+    if (hidden == 0U || hidden % chunk != 0U || hidden > kUnionStageMaxBytes) return 0U;
+    const unsigned bytes = Inputs * union_stage_slot(hidden, chunk) * static_cast<unsigned>(sizeof(std::uint16_t));
+    return bytes <= kUnionStageMaxBytes ? bytes : 0U;
 }
 // Start order of the HIP gate_up rows kernel (gate_up_rows; one-dimensional grid of units x blocks CTAs, unit =
 // routed assignment). CTAs start in linear order. The column blocks are cut into tiles of `tile` blocks; a tile runs
@@ -478,6 +536,17 @@ struct StagedInput {
 template <unsigned Chunk>
 __device__ __forceinline__ InputQuad load_inputs(StagedInput<Chunk> input, unsigned at) {
     return *reinterpret_cast<const InputQuad*>(input.values + staged_input_slot(at, Chunk));
+}
+
+// One staged union input (union_stage_bytes comment): the BF16 codes of a routed row in LDS.
+template <unsigned Chunk>
+struct StagedUnionInput {
+    const std::uint16_t* codes;
+};
+
+template <unsigned Chunk>
+__device__ __forceinline__ InputQuad load_inputs(StagedUnionInput<Chunk> input, unsigned at) {
+    return load_inputs(input.codes + union_stage_slot(at, Chunk));
 }
 
 // One lane chunk of each row: the 16 code bytes and the chunk's block scale codes, loaded together before any decode.
@@ -671,6 +740,154 @@ __device__ __forceinline__ void stream_rows(const Operand& weights, const WaveRo
         }
     }
 }
+
+// decode_chunk for `count` <= Inputs inputs against the same loaded chunk (the expert union): each block scale, table
+// and weight quad is decoded once and widened once, then every input n < count accumulates it into out[n] with the
+// FMAs decode_chunk issues for that input (same decoded value, same rounded activation, same order per accumulator).
+template <class Operand, unsigned Outputs, unsigned Inputs, class Input>
+__device__ __forceinline__ void decode_chunk_inputs(const Operand& weights, LaneChunk<Operand, Outputs>& chunk,
+                                                    const Input (&inputs)[Inputs], unsigned count, unsigned k,
+                                                    float (&out)[Inputs][Outputs]) {
+    constexpr unsigned codes_per_pair = Operand::kNvfp4 ? 1U : 2U;
+    constexpr unsigned values_per_word = 8U / codes_per_pair;
+    constexpr unsigned scale_count = LaneChunk<Operand, Outputs>::kScales;
+    constexpr unsigned words_per_scale = 4U / scale_count;
+    auto& codes = chunk.codes;
+#pragma unroll 1
+    for (unsigned block = 0; block < scale_count; ++block) {
+        float scales[Outputs];
+#pragma unroll
+        for (unsigned i = 0; i < Outputs; ++i) {
+            scales[i] = Operand::decode_scale(static_cast<std::uint8_t>(chunk.scales[i] >> (8U * block)));
+        }
+        const auto stream_words = [&](const auto& tables) {
+#pragma unroll 1
+            for (unsigned w = 0; w < words_per_scale; ++w) {
+                const unsigned word = block * words_per_scale + w;
+#pragma unroll
+                for (unsigned quad = 0; quad < values_per_word / 4U; ++quad) {
+                    float values[Outputs][4];
+#pragma unroll
+                    for (unsigned i = 0; i < Outputs; ++i) {
+                        const std::uint32_t code = codes[i][0];
+                        if constexpr (Operand::kNvfp4) {
+                            const auto decoded = tables[i].decode_quad(code >> (quad * 16U));
+                            values[i][0] = decoded.template widen<0U>();
+                            values[i][1] = decoded.template widen<1U>();
+                            values[i][2] = decoded.template widen<2U>();
+                            values[i][3] = decoded.template widen<3U>();
+                        } else {
+                            const auto* bytes = reinterpret_cast<const std::uint8_t*>(&code);
+#pragma unroll
+                            for (unsigned p = 0; p < 2U; ++p) {
+                                const auto pair = weights.decode_pair(bytes + (quad * 2U + p) * codes_per_pair, tables[i]);
+                                values[i][2U * p] = widen(static_cast<std::uint16_t>(pair));
+                                values[i][2U * p + 1U] = widen(static_cast<std::uint16_t>(pair >> 16U));
+                            }
+                        }
+                    }
+#pragma unroll
+                    for (unsigned n = 0; n < Inputs; ++n) {
+                        if (n >= count) break;
+                        const auto x = load_inputs(inputs[n], k + word * values_per_word + quad * 4U);
+#pragma unroll
+                        for (unsigned i = 0; i < Outputs; ++i) {
+                            out[n][i] = __fmaf_rn(values[i][0], x[0], out[n][i]);
+                            out[n][i] = __fmaf_rn(values[i][1], x[1], out[n][i]);
+                            out[n][i] = __fmaf_rn(values[i][2], x[2], out[n][i]);
+                            out[n][i] = __fmaf_rn(values[i][3], x[3], out[n][i]);
+                        }
+                    }
+                }
+#pragma unroll
+                for (unsigned i = 0; i < Outputs; ++i) codes[i] = codes[i].yzww;
+            }
+        };
+        if constexpr (Operand::kNvfp4) {
+            bool sign_symmetric = true;
+#pragma unroll
+            for (unsigned i = 0; i < Outputs; ++i) {
+                sign_symmetric &= core::Nvfp4Bf16Table::sign_symmetric(scales[i], weights.matrix.outer_scale);
+            }
+            const auto build_and_stream = [&]<class Table>() {
+                Table tables[Outputs];
+#pragma unroll
+                for (unsigned i = 0; i < Outputs; ++i) tables[i] = Table::build(weights, scales[i]);
+                stream_words(tables);
+            };
+            if (sign_symmetric) {
+                build_and_stream.template operator()<core::Nvfp4Bf16Table>();
+            } else {
+                build_and_stream.template operator()<core::Nvfp4Bf16SignedTable>();
+            }
+        } else {
+            stream_words(scales);
+        }
+    }
+}
+
+// stream_rows for `count` <= Inputs inputs (the expert union, multi-entry body): every lane loads each of its weight
+// chunks once (one chunk ahead; the first tail chunk with the first full chunk) and decodes it once for all inputs
+// (decode_chunk_inputs). Lane chunk partition, tail passes, shuffles and per-accumulator FMA order are stream_rows'
+// applied per input, so out[n] is bitwise stream_rows on inputs[n].
+template <class Operand, unsigned Columns, unsigned Outputs, unsigned Inputs, class Input>
+__device__ __forceinline__ void stream_inputs(const Operand& weights, const WaveRows<Operand, Columns>& row_of,
+                                              const typename Operand::Tile16Address (&rows)[Outputs],
+                                              const Input (&inputs)[Inputs], unsigned count, unsigned width,
+                                              unsigned lane, float (&out)[Inputs][Outputs]) {
+    constexpr unsigned chunk_values = Operand::kNvfp4 ? 32U : 16U;
+    constexpr unsigned span = chunk_values * kWarp;
+    const unsigned full = width / span * span;
+    const unsigned rem = (width - full) / chunk_values;
+    const unsigned divisor = rem == 0U ? 1U : rem;
+    const unsigned rows_per_pass = kWarp / divisor;
+    const unsigned sub = lane / divisor, owner = lane % divisor;
+    const unsigned tail_k = full + chunk_values * owner;
+    LaneChunk<Operand, 1U> tail{};
+    const bool ahead = rem != 0U && sub < rows_per_pass && sub < Outputs;
+    LaneChunk<Operand, Outputs> chunk, next;
+    unsigned k = chunk_values * lane;
+    if (k < full) load_chunk<Operand>(rows, k, chunk);
+    if (ahead) load_tail_chunk<Operand>(row_of, sub, tail_k, tail);
+    if (k + span < full) load_chunk<Operand>(rows, k + span, next);
+    while (k < full) {
+        decode_chunk_inputs(weights, chunk, inputs, count, k, out);
+        k += span;
+        if (k < full) {
+            chunk = next;
+            if (k + span < full) load_chunk<Operand>(rows, k + span, next);
+        }
+    }
+    if (rem == 0U) return;
+    for (unsigned first = 0; first < Outputs; first += rows_per_pass) {
+        const unsigned row = first + sub;
+        float acc[Inputs][1];
+#pragma unroll
+        for (unsigned n = 0; n < Inputs; ++n) {
+            acc[n][0] = 0.0F;
+            if (n >= count) continue;
+#pragma unroll
+            for (unsigned i = 0; i < Outputs; ++i) {
+                const float moved = __shfl(out[n][i], static_cast<int>(owner), static_cast<int>(kWarp));
+                if (row == i) acc[n][0] = moved;
+            }
+        }
+        if (sub < rows_per_pass && row < Outputs) {
+            if (first != 0U) load_tail_chunk<Operand>(row_of, row, tail_k, tail);
+            decode_chunk_inputs(weights, tail, inputs, count, tail_k, acc);
+        }
+#pragma unroll
+        for (unsigned n = 0; n < Inputs; ++n) {
+            if (n >= count) break;
+#pragma unroll
+            for (unsigned i = 0; i < Outputs; ++i) {
+                const unsigned source = (i - first) * rem + owner;
+                const float moved = __shfl(acc[n][0], static_cast<int>(source % kWarp), static_cast<int>(kWarp));
+                if (i >= first && i < first + rows_per_pass && lane < rem) out[n][i] = moved;
+            }
+        }
+    }
+}
 #endif
 
 #if defined(__HIPCC__)
@@ -760,9 +977,45 @@ __device__ __forceinline__ void dot_rows(const packed::PackedMatrix& matrix, uns
     dot_rows_with<Format, Columns, false>(matrix, col, stride, live, input, width, lane, out, nullptr);
 }
 
+#if defined(__HIPCC__)
+// The HIP multi-entry body (stream_inputs + the butterfly) for `count` <= Inputs input views (global rows or staged
+// union inputs); the caller admitted the streamed body (streams / streams_weights).
+template <packed::MatrixFormat Format, unsigned Columns, unsigned Inputs, unsigned Outputs, class View>
+__device__ __forceinline__ void dot_inputs_streamed(const packed::PackedMatrix& matrix, unsigned col, unsigned stride,
+                                                    unsigned live, const View (&inputs)[Inputs], unsigned count,
+                                                    unsigned width, unsigned lane, float (&out)[Inputs][Outputs]) {
+    using Operand = packed::PackedOperand<Format>;
+    const Operand weights{matrix};
+    const WaveRows<Operand, Columns> row_of{weights, col, stride, live};
+    typename Operand::Tile16Address rows[Outputs];
+#pragma unroll
+    for (unsigned i = 0; i < Outputs; ++i) rows[i] = row_of(i);
+#pragma unroll
+    for (unsigned n = 0; n < Inputs; ++n) {
+#pragma unroll
+        for (unsigned i = 0; i < Outputs; ++i) out[n][i] = 0.0F;
+    }
+    stream_inputs(weights, row_of, rows, inputs, count, width, lane, out);
+#pragma unroll
+    for (unsigned n = 0; n < Inputs; ++n) {
+        if (n >= count) break;
+#pragma unroll
+        for (unsigned i = 0; i < Outputs; ++i) out[n][i] = gemv::butterfly_sum(out[n][i]);
+    }
+}
+
+// The weight half of streams (whole chunks, 16-byte code loads): what a staged union input (always aligned) needs.
+template <class Operand>
+__device__ __forceinline__ bool streams_weights(const packed::PackedMatrix& matrix, unsigned width) {
+    constexpr unsigned chunk = Operand::kNvfp4 ? 32U : 16U;
+    return matrix.columns % chunk == 0U && width % chunk == 0U &&
+           reinterpret_cast<std::uintptr_t>(matrix.codes) % alignof(CodeChunk) == 0U;
+}
+#endif
+
 // dot_rows for `count` <= Inputs inputs against the same weight rows; out[n] is bitwise dot_rows on inputs[n]. The
-// CUDA packed body reads and decodes each weight word once for all inputs (the expert union); the other bodies run
-// dot_rows per input (same bits, no read sharing).
+// CUDA packed body and the HIP streamed body (stream_inputs) read and decode each weight word once for all inputs (the
+// expert union); the other bodies run dot_rows per input (same bits, no read sharing).
 template <packed::MatrixFormat Format, unsigned Columns, unsigned Inputs, unsigned Outputs, class Input>
 __device__ __forceinline__ void dot_inputs(const packed::PackedMatrix& matrix, unsigned col, unsigned stride,
                                            unsigned live, const Input* const (&inputs)[Inputs], unsigned count,
@@ -770,6 +1023,16 @@ __device__ __forceinline__ void dot_inputs(const packed::PackedMatrix& matrix, u
 #if defined(STRIX_MOE_R1_CUDA_PACKED_DOT)
     cuda_body::dot_inputs<Format, Columns>(matrix, col, stride, live, inputs, count, width, lane, out);
 #else
+#if defined(__HIPCC__)
+    using Operand = packed::PackedOperand<Format>;
+    bool streamed = true;
+#pragma unroll
+    for (unsigned n = 0; n < Inputs; ++n) streamed &= n >= count || streams<Operand>(matrix, inputs[n], width);
+    if (streamed) {
+        dot_inputs_streamed<Format, Columns>(matrix, col, stride, live, inputs, count, width, lane, out);
+        return;
+    }
+#endif
 #pragma unroll
     for (unsigned n = 0; n < Inputs; ++n) {
         if (n < count) dot_rows<Format, Columns>(matrix, col, stride, live, inputs[n], width, lane, out[n]);
@@ -1002,8 +1265,18 @@ __device__ __forceinline__ void down_combine_row(Args args, Tail... tail) {
 }
 
 
-#if defined(__CUDACC__) && !defined(__HIPCC__)
-// ---- Expert union of a routed rows launch (r1_route.hpp; CUDA bodies) ----
+// ---- Expert union of a routed rows launch (r1_route.hpp; CUDA and HIP bodies) ----
+// Both backends are wave32 (kWarp == 32: 32-bit masks of one wave); wave_ballot is the only backend intrinsic. On HIP
+// dot_inputs runs dot_rows per input (same bits; the weights of an expert are read again from cache per input).
+__device__ __forceinline__ unsigned wave_ballot(bool predicate) {
+    static_assert(kWarp == 32U, "the union masks are one 32-bit word per wave");
+#if defined(__HIPCC__)
+    return static_cast<unsigned>(__ballot(predicate));
+#else
+    return __ballot_sync(0xffffffffU, predicate);
+#endif
+}
+
 // Shared plan: the route of every row, the live rows (valid step row, zero status) and the presence mask of the
 // distinct experts. Group g of the union is the g-th distinct expert in ascending id (r1_route::expert_union).
 template <unsigned TopK, unsigned MaxRows>
@@ -1044,7 +1317,7 @@ __device__ __forceinline__ void union_live(UnionPlan<TopK, MaxRows>& plan, unsig
     if (threadIdx.x >= kWarp) return;
     const unsigned r = threadIdx.x;
     const bool live = r < rows && (step == nullptr || exec::step_row_valid(*step, r)) && plan.status[r] == 0U;
-    const unsigned mask = __ballot_sync(0xffffffffU, live);
+    const unsigned mask = wave_ballot(live);
     if (r == 0U) plan.live = mask;
 }
 
@@ -1152,29 +1425,76 @@ __global__ __launch_bounds__(kThreads) void gate_up_union(Args args, unsigned ro
     __syncthreads();
     const unsigned expert = plan.expert;
     const unsigned col = gate_first_column(blockIdx.x, threadIdx.x / kWarp, GateColumns);
-    if (expert >= args.experts || col >= args.intermediate) return;
+    if (expert >= args.experts) return;
+    constexpr unsigned kInputs = kUnionInputs<MaxRows>;
+#if defined(__HIPCC__)
+    // Staged passes (union_stage_bytes; the launcher sized the dynamic LDS with the same rule): every wave of the CTA
+    // stages, so a wave past the columns stays for the barriers and skips its dot.
+    constexpr unsigned kChunk = staged_input_chunk(Format);
+    const bool staged = union_stage_bytes<Format, kInputs>(args.hidden) != 0U &&
+                        reinterpret_cast<std::uintptr_t>(args.input) % alignof(InputQuad) == 0U;
+#else
+    constexpr bool staged = false;
+#endif
+    const bool active = col < args.intermediate;
+    if (!staged && !active) return;
     const unsigned lane = threadIdx.x % kWarp;
-    const unsigned live = args.intermediate - col;
+    const unsigned live = active ? args.intermediate - col : 0U;
     unsigned mask[Plan::kAssignmentWords];
 #pragma unroll
     for (unsigned w = 0; w < Plan::kAssignmentWords; ++w) mask[w] = plan.group[w];
     const moe::SoftcappedSwiglu<activation::DeviceMath> swiglu{args.gate_cap, args.up_cap};
     for (;;) {
-        unsigned taken[MaxRows];
+        unsigned taken[kInputs];
         const unsigned count = union_take(mask, taken);
         if (count == 0U) break;
-        const float* inputs[MaxRows];
+        const float* inputs[kInputs];
 #pragma unroll
-        for (unsigned n = 0; n < MaxRows; ++n) {
+        for (unsigned n = 0; n < kInputs; ++n) {
             inputs[n] = args.input + row_offsets<TopK>(n < count ? taken[n] / TopK : 0U, args.hidden,
                                                        args.intermediate).input;
         }
-        float pair[MaxRows][2U * GateColumns];
-        dot_inputs<Format, GateColumns>(args.matrices[expert].gate_up, col, args.intermediate, live, inputs, count,
-                                        args.hidden, lane, pair);
+        float pair[kInputs][2U * GateColumns];
+#if defined(__HIPCC__)
+        if (staged) {
+            // Round the pass's rows once into LDS as BF16 codes (input_bf16's bits), then stream from LDS.
+            extern __shared__ InputQuad staged_input_quads[];
+            auto* codes = reinterpret_cast<std::uint16_t*>(staged_input_quads);
+            const unsigned slots = union_stage_slot(args.hidden, kChunk);
+            __syncthreads();  // the previous pass's reads are done
+#pragma unroll
+            for (unsigned n = 0; n < kInputs; ++n) {
+                if (n >= count) break;
+                for (unsigned at = 4U * threadIdx.x; at < args.hidden; at += 4U * kThreads) {
+                    const auto x = *reinterpret_cast<const InputQuad*>(inputs[n] + at);
+                    const Bf16Quad quad = {
+                        std::uint32_t{scalar::bf16_encode(x[0])} | (std::uint32_t{scalar::bf16_encode(x[1])} << 16U),
+                        std::uint32_t{scalar::bf16_encode(x[2])} | (std::uint32_t{scalar::bf16_encode(x[3])} << 16U)};
+                    *reinterpret_cast<Bf16Quad*>(codes + n * slots + union_stage_slot(at, kChunk)) = quad;
+                }
+            }
+            __syncthreads();
+            if (!active) continue;
+            const auto& matrix = args.matrices[expert].gate_up;
+            if (streams_weights<packed::PackedOperand<Format>>(matrix, args.hidden)) {
+                StagedUnionInput<kChunk> views[kInputs];
+#pragma unroll
+                for (unsigned n = 0; n < kInputs; ++n) views[n] = {codes + n * slots};
+                dot_inputs_streamed<Format, GateColumns>(matrix, col, args.intermediate, live, views, count,
+                                                         args.hidden, lane, pair);
+            } else {
+                dot_inputs<Format, GateColumns>(matrix, col, args.intermediate, live, inputs, count, args.hidden, lane,
+                                                pair);
+            }
+        } else
+#endif
+        {
+            dot_inputs<Format, GateColumns>(args.matrices[expert].gate_up, col, args.intermediate, live, inputs, count,
+                                            args.hidden, lane, pair);
+        }
         if (lane == 0U) {
 #pragma unroll
-            for (unsigned n = 0; n < MaxRows; ++n) {
+            for (unsigned n = 0; n < kInputs; ++n) {
                 if (n >= count) break;
                 auto* activation_row = args.activation + std::size_t{taken[n]} * args.intermediate;
 #pragma unroll
@@ -1217,24 +1537,23 @@ __global__ __launch_bounds__(kThreads) void down_union(Args args, unsigned rows,
 #pragma unroll
         for (unsigned w = 0; w < Plan::kAssignmentWords; ++w) {
             const unsigned a = w * kWarp + lane;
-            mask[w] = __ballot_sync(0xffffffffU,
-                                    a < rows * TopK && union_member(plan, a, args.experts) && plan.ids[a] == expert);
+            mask[w] = wave_ballot(a < rows * TopK && union_member(plan, a, args.experts) && plan.ids[a] == expert);
         }
         for (;;) {
-            unsigned taken[MaxRows];
+            unsigned taken[kUnionInputs<MaxRows>];
             const unsigned count = union_take(mask, taken);
             if (count == 0U) break;
-            const std::uint16_t* inputs[MaxRows];
+            const std::uint16_t* inputs[kUnionInputs<MaxRows>];
 #pragma unroll
-            for (unsigned n = 0; n < MaxRows; ++n) {
+            for (unsigned n = 0; n < kUnionInputs<MaxRows>; ++n) {
                 inputs[n] = args.activation + std::size_t{n < count ? taken[n] : 0U} * args.intermediate;
             }
-            float projected[MaxRows][DownColumns];
+            float projected[kUnionInputs<MaxRows>][DownColumns];
             dot_inputs<Format, DownColumns>(args.matrices[expert].down, col, 0U, live, inputs, count,
                                             args.intermediate, lane, projected);
             if (lane == 0U) {
 #pragma unroll
-                for (unsigned n = 0; n < MaxRows; ++n) {
+                for (unsigned n = 0; n < kUnionInputs<MaxRows>; ++n) {
                     if (n >= count) break;
                     const unsigned row = taken[n] / TopK, slot = taken[n] % TopK;
                     const auto* ids = plan.ids + row * TopK;
@@ -1266,7 +1585,6 @@ __global__ __launch_bounds__(kThreads) void down_union(Args args, unsigned rows,
         output[col + i] = combine::rounded_bf16<false>(result);
     }
 }
-#endif
 
 template <packed::MatrixFormat Format, unsigned TopK, unsigned DownColumns = kDownColumns, class Entry = EntryComplete,
           class... Tail>
@@ -1468,14 +1786,70 @@ inline cudaError_t enqueue_step(const StepArgs& args, cudaStream_t stream) {
 #endif
 #endif
 
+#if defined(__HIPCC__)
+// Expert-union rows launches on HIP (the CUDA forms above): gate_up / down_combine of `rows` <= MaxRows routed rows
+// (row_offsets layout, checked route) with one CTA group per distinct expert; every output equals the rows launch bit
+// for bit. Opt-in forms, not the served default: the HIP dot_inputs re-reads each expert per input from cache.
+template <packed::MatrixFormat Format, unsigned TopK, unsigned MaxRows>
+inline hipError_t launch_gate_up_union(const Args& args, unsigned rows, hipStream_t stream,
+                                       const exec::StepBlock* step = nullptr) {
+    if (!fits_union<Format, TopK, MaxRows>(args, rows, kBackendGridLimits, Grids::gate)) return hipErrorInvalidValue;
+    constexpr auto geometry = kUnionGeometry<MaxRows>;
+    const auto columns = gate_blocks(args.intermediate, geometry.gate_columns);
+    const auto groups = r1_route::union_groups(rows, TopK, args.experts);
+    const unsigned staged = union_stage_bytes<Format, kUnionInputs<MaxRows>>(args.hidden);
+    detail::gate_up_union<Format, TopK, MaxRows, geometry.gate_columns>
+        <<<dim3(columns, groups), detail::kThreads, staged, stream>>>(args, rows, step);
+    return hipGetLastError();
+}
+
+template <packed::MatrixFormat Format, unsigned TopK, unsigned MaxRows>
+inline hipError_t launch_down_union(const Args& args, unsigned rows, hipStream_t stream,
+                                    const exec::StepBlock* step = nullptr) {
+    if (!fits_union<Format, TopK, MaxRows>(args, rows, kBackendGridLimits, Grids::down)) return hipErrorInvalidValue;
+    constexpr auto geometry = kUnionGeometry<MaxRows>;
+    const auto blocks = down_blocks(args.hidden, geometry.down_columns);
+    detail::down_union<Format, TopK, MaxRows, geometry.down_columns>
+        <<<blocks, detail::kThreads, 0, stream>>>(args, rows, step);
+    return hipGetLastError();
+}
+#endif
+
+#if defined(__HIPCC__)
+// Off switch of the HIP decode plan's expert union (kUnionMinRows): STRIX_MOE_R1_UNION=0 keeps the rows launch at every
+// row count. Read once (recorded for the effective-config receipt); default on (exact: same bits either way).
+inline bool expert_union_selected() {
+    static const bool on = strix::envcfg::flag("STRIX_MOE_R1_UNION", true, strix::EnvFlagMatch::exact);
+    return on;
+}
+#endif
+
 // Decode plan for 1 .. kMaxLaunchRows routed rows (one gate_up and one down_combine launch). The caller admits a wave32
 // HIP device or CUDA sm_80+, supplies prevalidated weights and a checked route for every row, and an activation scratch
 // of rows * TopK * intermediate elements.
 template <packed::MatrixFormat Format, unsigned TopK>
 #if defined(__HIPCC__)
-inline hipError_t launch(const Args& args, hipStream_t stream, unsigned rows = 1U) {
+inline hipError_t launch(const Args& args, hipStream_t stream, unsigned rows = 1U,
+                         bool expert_union = expert_union_selected()) {
     if (!fits_rows<Format, TopK>(args, rows, kBackendGridLimits, Grids::both, kMaxLaunchRows))
         return hipErrorInvalidValue;
+    // Expert union (expert_union, kUnionMinRows): rows that share routed experts read each of them once in gate_up and,
+    // where kUnionDown admits the format, in down_combine; the union gate writes every activation row where the rows
+    // gate writes it, so either down reads it. Every output equals the rows launch bit for bit (union bench ID lines).
+    bool union_gate = false;
+    if (expert_union && rows >= kUnionMinRows) {
+        if (rows <= 8U && fits_union<Format, TopK, 8U>(args, rows, kBackendGridLimits)) {
+            if (const auto status = launch_gate_up_union<Format, TopK, 8U>(args, rows, stream); status != hipSuccess)
+                return status;
+            if constexpr (kUnionDown<Format>) return launch_down_union<Format, TopK, 8U>(args, rows, stream);
+            union_gate = true;
+        } else if (fits_union<Format, TopK, 16U>(args, rows, kBackendGridLimits)) {
+            if (const auto status = launch_gate_up_union<Format, TopK, 16U>(args, rows, stream); status != hipSuccess)
+                return status;
+            if constexpr (kUnionDown<Format>) return launch_down_union<Format, TopK, 16U>(args, rows, stream);
+            union_gate = true;
+        }
+    }
 #else
 inline cudaError_t launch(const Args& args, cudaStream_t stream, unsigned rows = 1U) {
     if (!fits_rows<Format, TopK>(args, rows, kBackendGridLimits, Grids::both, kMaxLaunchRows))
@@ -1487,7 +1861,10 @@ inline cudaError_t launch(const Args& args, cudaStream_t stream, unsigned rows =
 #if defined(__HIPCC__)
     // One row: the plain kernels (fewer VGPRs); several rows: the tail-ahead kernels. Same bits either way.
     (void)columns;
-    if (const auto status = detail::enqueue_gate_up<Format, TopK>(args, stream, rows); status != hipSuccess) return status;
+    if (!union_gate) {
+        if (const auto status = detail::enqueue_gate_up<Format, TopK>(args, stream, rows); status != hipSuccess)
+            return status;
+    }
     if (rows == 1U) {
         detail::down_combine<Format, TopK><<<dim3(down_grid, 1U), threads, 0, stream>>>(args);
     } else {
@@ -1537,11 +1914,12 @@ inline cudaError_t launch_tail(const Args& args, const Tail& tail, cudaStream_t 
 // incumbent chunks); a caller whose scratch holds kMaxLaunchRows rows runs up to 16 rows as one launch.
 template <packed::MatrixFormat Format, unsigned TopK>
 #if defined(__HIPCC__)
-inline hipError_t launch_rows(const Args& args, hipStream_t stream, unsigned rows, unsigned scratch_rows = kMaxRows) {
+inline hipError_t launch_rows(const Args& args, hipStream_t stream, unsigned rows, unsigned scratch_rows = kMaxRows,
+                             bool expert_union = expert_union_selected()) {
     const unsigned cap = rows_chunk_cap(scratch_rows);
     if (rows == 0U || cap == 0U) return hipErrorInvalidValue;
     return for_each_rows_chunk(rows, hipSuccess, [&](unsigned first, unsigned count) {
-        return launch<Format, TopK>(rows_chunk<TopK>(args, first), stream, count);
+        return launch<Format, TopK>(rows_chunk<TopK>(args, first), stream, count, expert_union);
     }, cap);
 }
 #else
