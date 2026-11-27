@@ -83,8 +83,8 @@ private:
 
 using FixtureCohort = sv::FixedKvCohort<FixtureDecoder>;
 
-// The served prompt group policy: on by default for whole prompts of up to one chunk, the group at most two chunks of
-// rows, the shared switch turns it off, the shared limits tighten it.
+// The served prompt group policy: on by default for whole prompts of up to one chunk, the group at most eight chunks of
+// rows (one pass per chunk), the shared switch turns it off, the shared limits tighten it.
 void prompt_group_policy() {
     const auto env = [](std::map<std::string, std::string> values) {
         return [values = std::move(values)](const char* name) {

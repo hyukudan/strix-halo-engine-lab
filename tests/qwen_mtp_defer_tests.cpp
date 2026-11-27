@@ -167,6 +167,7 @@ int main() {
     static_assert(qmd::prompt_ring_rows(8001, 5120, 1ULL << 30, 512, 32) == 8032, "rounded up to the grid");
     static_assert(qmd::prompt_ring_rows(32500, 5120, 1ULL << 30, 512, 32) == 32512, "32K prompt: 666 MB of rows");
     static_assert(qmd::prompt_ring_rows(65536, 5120, 1ULL << 30, 512, 32) == 512, "does not fit: incumbent");
+    static_assert(qmd::prompt_ring_rows(4294967264ULL, 4294967295U, ~0ULL, 512, 32) == 512, "rows x hidden x 4 past 64 bits: incumbent");
     static_assert(qmd::prompt_ring_rows(100, 5120, 1ULL << 30, 512, 32) == 512, "short prompt: incumbent");
     static_assert(qmd::prompt_ring_rows(8192, 0, 1ULL << 30, 512, 32) == 512, "no width: incumbent");
     if (failures) return EXIT_FAILURE;

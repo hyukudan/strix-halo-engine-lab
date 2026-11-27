@@ -74,7 +74,7 @@ constexpr std::uint32_t prompt_ring_rows(std::uint64_t prompt_rows, std::uint32_
                                          std::uint32_t incumbent, std::uint32_t grid) noexcept {
     if (grid == 0 || hidden == 0) return incumbent;
     const std::uint64_t need = (prompt_rows + grid - 1U) / grid * grid;
-    return need > incumbent && need <= UINT32_MAX && need * hidden * 4U <= max_bytes ? static_cast<std::uint32_t>(need) : incumbent;
+    return need > incumbent && need <= UINT32_MAX && need <= max_bytes / 4U / hidden ? static_cast<std::uint32_t>(need) : incumbent;
 }
 
 // An earlier prompt block (first + rows < position) is deferred through the stash: its tap rows and next tokens are copied

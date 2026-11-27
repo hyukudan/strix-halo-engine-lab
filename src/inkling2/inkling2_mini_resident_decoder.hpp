@@ -392,7 +392,13 @@ public:
     //  - Refused (capacity members 0) wherever a prompt row is not the EXACT BF16 row of the solo call: a per-chunk low-bit
     //    arithmetic choice, compact prompt weights, the integer prefill class, a narrow expert image, DSpark taps, the
     //    held-back route; and always off the HIP backend (the CUDA prefill keeps its own route).
-    [[nodiscard]] std::uint32_t prefill_route_class(std::uint64_t rows) const noexcept { return mini_group_route_class(rows); }
+    // Route class 2: a whole prompt of `rows` rows whose served prompt policy selects the integer prefill class (TURBO
+    // inside its band). Its solo call runs that class, so it is never grouped (rejected_class_mask): a group member is
+    // always an EXACT BF16 row, and the policy each member applies before the group call cannot turn the class on.
+    void set_prompt_integer_rows(std::function<bool(std::uint64_t rows)> rule) { prompt_integer_rows_ = std::move(rule); }
+    [[nodiscard]] std::uint32_t prefill_route_class(std::uint64_t rows) const {
+        return mini_group_route_class(rows) | (prompt_integer_rows_ && prompt_integer_rows_(rows) ? 2U : 0U);
+    }
     [[nodiscard]] serve::PrefillGroupCapacity prefill_group_capacity() const noexcept {
         serve::PrefillGroupCapacity capacity;
         if (const char* why = group_refusal()) {
@@ -403,7 +409,7 @@ public:
         capacity.members = decode_rows_;
         capacity.rows = std::uint64_t{kMiniGroupPasses} * prefill_rows_;
         capacity.member_rows = prefill_rows_;
-        capacity.rejected_class_mask = 1U;  // mini_group_route_class: alone only
+        capacity.rejected_class_mask = 1U | 2U;  // mini_group_route_class: alone only; 2: the integer prefill class
         capacity.passes = kMiniGroupPasses;
         capacity.reason = "bf16-tile-rows";
         return capacity;
@@ -1772,6 +1778,7 @@ private:
     std::vector<unsigned> pass_picks_;  // decode_slots picks, published after the last pass
     std::optional<mini_gpu::Buffer<float>> group_heads_;  // the last row of each member of the last prompt group
     bool served_cli_route_;             // served route lever, fixed at construction (admits_served_route)
+    std::function<bool(std::uint64_t)> prompt_integer_rows_;  // set_prompt_integer_rows (empty: no integer class)
     bool calibrated_decode_;            // calibrated decode-only image bound (BF16 prefill rows, compact decode rows)
     core::ResidentGreedy greedy_;
     std::optional<mini_gpu::Buffer<float>> verify_logits_;

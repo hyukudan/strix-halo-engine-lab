@@ -733,7 +733,8 @@ public:
         strix::hip_check(hipMemcpy(held_,block_hidden_+static_cast<std::size_t>(rows-1U)*width_,static_cast<std::size_t>(width_),hipMemcpyDeviceToDevice),
             "tiled MTP held copy");
         }
-        prime_sync_ms_+=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-prime_t0).count();prime_sync_rows_+=rows;
+        prime_sync_ms_+=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-prime_t0).count();
+        if(!defer_prime) prime_sync_rows_+=rows;  // deferred rows are counted once, in prime_deferred_rows
         pos_+=rows;
         const bool complete=!block.owner->completion_pending() && !runtime_.prime_hidden_rows_pending() &&
             runtime_.next_source_position()+1U==pos_;
