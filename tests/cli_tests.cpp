@@ -685,8 +685,8 @@ void hy4_launcher_resolves_documented_drafter(const fs::path& data) {
         require(decision.enabled && decision.source == "default", "hy4 strix run resolves the MTP drafter");
     }
     // The rank's own spelling of a per-step or opted-out route still wins.
-    auto classify = [](std::vector<std::string> args) {
-        auto run = strix::hy4::speculation_run_from_arguments(args, nullptr);
+    auto classify = [](std::vector<std::string> args, strix::hy4::SpeculationRouteFiles files = {}) {
+        auto run = strix::hy4::speculation_run_from_arguments(args, nullptr, files);
         run.block_in_pack = true;
         return std::string(strix::hy4::speculation(run).source);
     };
@@ -701,6 +701,13 @@ void hy4_launcher_resolves_documented_drafter(const fs::path& data) {
     require(classify({"--ids-file", "--no-mtp"}) == "default", "an option value is not an MTP opt-out");
     require(classify({"--ids-file", "--timing", "--no-mtp"}) == "cli-opt-out", "real flags after values are read");
     require(classify({"--dump-logits", "--no-mtp"}) == "explicit-route", "output filename is not an opt-out");
+    require(classify({"--teacher", "empty.ids"}, {false, false}) == "default", "empty teacher IDs preserve the production route");
+    require(classify({"--dump-logits", ""}, {false, false}) == "default", "empty dump path preserves the production route");
+    require(classify({"--dump-logits", "trace", "--dump-logits", ""}, {false, false}) == "default", "final empty dump path wins");
+    require(classify({"--teacher", "ids", "--teacher", "empty.ids"}, {false, false}) == "default", "final empty teacher wins");
+    require(classify({"--teacher", "ids"}, {true, false}) == "explicit-route", "nonempty teacher IDs keep forced steps");
+    require(classify({"--dump-logits", "trace"}, {false, true}) == "explicit-route", "nonempty dump path keeps plain steps");
+    require(classify({"--teacher", "empty.ids", "--timing"}, {false, false}) == "explicit-route", "independent timing route still wins");
     require(classify({"--timing"}) == "explicit-route", "--timing keeps the plain steps");
     require(classify({"--no-mtp"}) == "cli-opt-out", "--no-mtp opts out");
     require(classify({"--mtp", "--timing"}) == "explicit", "--mtp wins over the per-step route");

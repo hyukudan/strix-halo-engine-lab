@@ -29,10 +29,15 @@ struct SpeculationRun {
 // The decode-route facts the rank's argument list spells. Only the options named here own a route; the tier, the KV
 // storage, the prompt, the generation budget and the context are route-neutral (a launcher adds them to every command).
 // `--top 0` (any spelling of the number zero) is the plain production form (device greedy row); any other --top asks for
-// every step's logits. `--teacher F` asks for the per-step route (the rank refuses a teacher file without ids).
+// every step's logits. Dry-run callers only know the command spelling; the rank supplies the final parsed file state.
 // `environment` is the caller's STRIX_MTP value (read through the shared environment home, never here).
+struct SpeculationRouteFiles {
+    bool teacher_has_ids = true;
+    bool dump_has_path = true;
+};
 [[nodiscard]] inline SpeculationRun speculation_run_from_arguments(const std::vector<std::string>& args,
-                                                                   const char* environment) {
+                                                                   const char* environment,
+                                                                   SpeculationRouteFiles files = {}) {
     SpeculationRun run;
     run.environment = environment;
     bool top_route = false;
@@ -46,7 +51,8 @@ struct SpeculationRun {
             // Match the rank parser: numeric zero is zero, and the last --top wins.
             top_route = static_cast<std::uint32_t>(std::stoul(args[++i])) != 0U;
         } else if ((arg == "--teacher" || arg == "--dump-logits") && more) {
-            run.per_step_route = true;
+            run.per_step_route = run.per_step_route ||
+                (arg == "--teacher" ? files.teacher_has_ids : files.dump_has_path);
             ++i;
         } else if (more && (::strix::session::speculation_neutral_value_option(arg) ||
                    arg == "--ids-file" || arg == "--gen" || arg == "--layers" || arg == "--context" ||
