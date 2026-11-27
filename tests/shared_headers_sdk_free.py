@@ -73,6 +73,7 @@ NATIVE_HEADERS = {
     "src/attn_core/wmma_types.hpp",
     "src/core/a4_tiles.hpp",
     "src/core/backend_hip.hpp",
+    "src/core/controller_block_rows.hpp",  # HIP launch of the block-per-row residual controller.
     "src/core/dense_linear.hpp",
     "src/core/dense_linear_iu4.hpp",
     "src/core/f16_dense_iu4.hpp",
