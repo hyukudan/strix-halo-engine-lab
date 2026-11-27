@@ -14,7 +14,8 @@ struct ServeOptions {
 };
 struct ServePreparation final : strix::serve::ServicePreparation {
     ServeOptions opt;
-    std::string transport_spec = "usb4gpu", bind = "127.0.0.1", model_id = "minimax-m3.1-flash";
+    // The host route by default (defaults::parse_cli): GPU-direct is an explicit --transport usb4gpu.
+    std::string transport_spec = "usb4-auto", bind = "127.0.0.1", model_id = "minimax-m3.1-flash";
     std::string dspark_dir, dspark_exl3, check, check_nested;
     std::uint16_t port = 8080;
     std::uint32_t max_tokens = 4096, check_tokens = 256, check_child_layers = ~0U;
