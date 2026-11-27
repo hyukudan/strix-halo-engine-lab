@@ -97,6 +97,14 @@ strix-hy4-rank PART1.gguf PART2.gguf --ids-file prompt.ids --gen 128 --context 4
 de R filas. Sin esa opción, con la palabra de nivel por defecto, el prompt va posición a posición. `--top 0` imprime
 solo el id voraz.
 
+La decodificación especulativa propone con el bloque de siguiente token del pack. El drafter de bloques DFly2 es
+opcional: `--dfly-arm sel` lo ejecuta junto al bloque de siguiente token bajo el selector compartido por régimen
+(`--dfly-arm only`: solo), con el shard de `--dfly FICHERO` o el que está junto al pack; el servidor acepta
+`--dfly FICHERO|beside`. Un shard junto al pack nunca se activa solo por encontrarse. El selector sigue siendo opcional
+hasta que entre el arreglo de su política (barra medida tras el calentamiento, nuevo sondeo) y un ABAB por régimen
+muestre que nunca es más lento: como valor por defecto midió 44,90 frente a 45,67 tok/s en el régimen de récord y
+45,10 frente a 48,55 tok/s (−7,1 %) en el agéntico, con IDs iguales.
+
 Dos nodos (el rango 0 tiene el embedding y las capas [0, K); el rango 1, las capas [K, 42) y la cabeza; K vale 21 por
 defecto):
 

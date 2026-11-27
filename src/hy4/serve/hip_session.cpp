@@ -13,6 +13,9 @@
 #include <algorithm>
 #include <chrono>
 #include <limits>
+#include <stdexcept>
+#include <string>
+#include <string_view>
 #include <utility>
 
 namespace strix::hy4::serve {
@@ -155,9 +158,19 @@ SessionAssets load_hip_service(const Options& options, const PackFacts& pack) {
     run.no_mtp = options.no_mtp;
     run.environment = envcfg::text(::strix::session::speculation_environment);
     native.nextn = speculation(run).enabled;
-    // The DFly2 shard beside the pack when the decode speculates: the same shared resolver and file as strix-hy4-rank.
-    if (native.nextn && !native.parts.empty())
-        native.dfly = ::strix::spec::resolve_drafter_file({{}, false, true}, native.parts.front(), kDflySidecar).path;
+    // DFly2 under the shared per-regime selector: opt-in only (--dfly FILE | beside; the same shared resolver and file as
+    // strix-hy4-rank). It measured slower than the next-token block alone (record 44.90 vs 45.67 tok/s, agentic 45.10 vs
+    // 48.55) and its served route is unmeasured, so a shard found beside the pack is never bound by discovery alone.
+    if (!options.dfly.empty()) {
+        if (!native.nextn || native.parts.empty())
+            throw std::invalid_argument("--dfly needs the speculative decode (the pack's next-token block, MTP on)");
+        const bool beside = options.dfly == "beside";
+        const auto drafter = ::strix::spec::resolve_drafter_file(
+            {beside ? std::string_view{} : std::string_view{options.dfly}, false, true}, native.parts.front(), kDflySidecar);
+        if (!drafter.enabled())
+            throw std::invalid_argument("--dfly beside: no DFly2 shard " + std::string(kDflySidecar) + " beside the pack");
+        native.dfly = drafter.path;
+    }
     ::strix::profile::apply(resolved->resolution);
     auto tokenizer = std::make_shared<sv::BpeApiTokenizer>(sv::BpeTokenizer::load_gguf(options.gguf));
     return {std::move(tokenizer), std::make_unique<Engine>(std::move(native))};

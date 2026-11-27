@@ -268,6 +268,54 @@ void test_speculator_two_arms() {
                 (unsigned long long)sel.switches());
 }
 
+// Constant passes (no noise): arm 0 emits 3 tokens in 100 ms; arm 1 (wins_ties) the same tokens at 100 / ratio ms.
+PolicyRun run_constant(double ratio, std::uint32_t passes) {
+    sp::BlockConfig bc;
+    bc.clock_ms = [] { return g_clock; };
+    sp::BlockDrafter a0(bc), a1(bc);
+    sp::ArmSelectorConfig cfg;
+    cfg.clock_ms = [] { return g_clock; };
+    sp::ArmSelector sel(cfg);
+    sel.add(a0, "bundled");
+    sel.add(a1, "block", 0.0, {}, true);
+    const std::vector<std::uint32_t> emitted(3U, 5U);
+    PolicyRun r;
+    for (std::uint32_t i = 0; i < passes; ++i) {
+        const auto arm = sel.begin_pass();
+        const double ms = arm == 0 ? 100.0 : 100.0 / ratio;
+        sel.end_pass(arm, emitted, ms);
+        r.tokens += 3.0;
+        r.ms += ms;
+    }
+    r.switches = sel.switches();
+    r.probes1 = sel.stats(1).probes;
+    r.passes1 = sel.stats(1).passes;
+    r.final_active = sel.active();
+    return r;
+}
+
+void test_wins_ties_lower_edge() {
+    // an arm 5 % slower sits inside the inconclusive band (0.909..1.01 x the active rate) for its whole episode; wins_ties
+    // must not hand it the decode (it keeps losing its probes); an equal arm still takes the tie
+    const auto slower = run_constant(0.95, 400);
+    AS_CHECK(slower.probes1 >= 1, "the slower wins_ties arm was never probed");
+    AS_CHECK(slower.final_active == 0 && slower.switches == 0, "a 5 %% slower wins_ties arm took over (switches %llu)",
+             (unsigned long long)slower.switches);
+    const auto equal = run_constant(1.0, 400);
+    AS_CHECK(equal.final_active == 1 && equal.switches >= 1, "an equal wins_ties arm did not take the tie");
+    bool threw = false;
+    try {
+        sp::ArmSelectorConfig c;
+        c.tie_band = 1.0;
+        sp::ArmSelector s(c);
+    } catch (const std::invalid_argument&) {
+        threw = true;
+    }
+    AS_CHECK(threw, "tie_band 1 accepted");
+    std::printf("wins_ties edge: 0.95x arm kept off (probes %llu), equal arm switches %llu\n",
+                (unsigned long long)slower.probes1, (unsigned long long)equal.switches);
+}
+
 void test_config_refused() {
     bool threw = false;
     try {
@@ -288,6 +336,7 @@ int main() {
     test_code_switch();
     test_regime_change();
     test_equal_arms_bounded();
+    test_wins_ties_lower_edge();
     test_context_limit();
     test_speculator_two_arms();
     std::printf("strix-spec-arm-selector-tests PASS\n");

@@ -78,6 +78,13 @@ void option_tests() {
     check(refused({"--ctx"}), "missing value refused");
     check(refused({"--max-tokens", "0"}), "zero max tokens refused");
     check(refused({"--ctx", "-1"}), "negative ctx refused");
+    // The DFly2 arm under the shared selector is opt-in: no option, no second drafter (a shard beside the pack is not
+    // bound by discovery); --dfly FILE | beside names the request.
+    check(o.dfly.empty(), "no DFly2 arm without --dfly");
+    check(h::parse_options(std::vector<std::string>{"--dfly", "beside"}).dfly == "beside", "--dfly beside parsed");
+    check(h::parse_options(std::vector<std::string>{"--dfly", "d.safetensors"}).dfly == "d.safetensors", "--dfly FILE parsed");
+    check(refused({"--dfly"}), "--dfly without a value refused");
+    check(refused({"--dfly", ""}), "--dfly with an empty value refused");
     check(refused({"--ctx", "12k"}), "malformed number refused");
 }
 

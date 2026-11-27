@@ -35,6 +35,7 @@ struct Options {
     bool print_effective_config = false;    // --print-effective-config: print effective_config and exit
     bool help = false;                      // --help
     bool no_mtp = false;                    // --no-mtp: the shared speculation opt-out (as the native rank)
+    std::string dfly;                       // --dfly FILE|beside: opt-in DFly2 arm under the shared selector (empty: none)
 };
 
 // The family argument parser (argument 0 is NOT a program name). Throws std::invalid_argument on an unknown option,

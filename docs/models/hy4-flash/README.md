@@ -94,6 +94,13 @@ strix-hy4-rank PART1.gguf PART2.gguf --ids-file prompt.ids --gen 128 --context 4
 `--ids-file` holds token ids (comma or space separated). `--prompt-rows R` runs the prompt in batched windows of R rows.
 Without it the prompt runs position by position under the default tier word. `--top 0` prints only the greedy id.
 
+The speculative decode drafts with the pack's next-token block. The DFly2 block drafter is opt-in:
+`--dfly-arm sel` runs it beside the next-token block under the shared per-regime selector (`--dfly-arm only`: alone),
+its shard from `--dfly FILE` or beside the pack; the server takes `--dfly FILE|beside`. A shard beside the pack is never
+bound by discovery alone. The selector stays opt-in until its policy fix (bar measured after warm-up, re-probe) lands
+and an ABAB per regime shows it never slower: measured as the default it ran 44.90 vs 45.67 tok/s in the record regime
+and 45.10 vs 48.55 tok/s (-7.1 %) in the agentic regime, with equal ids.
+
 Two nodes (rank 0 holds the embedding and layers [0, K); rank 1 holds layers [K, 42) and the head; K defaults to 21):
 
 ```

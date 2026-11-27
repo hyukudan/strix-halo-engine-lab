@@ -107,7 +107,10 @@ Options parse_options(std::span<const std::string> arguments) {
             o.model_id_given = true;
         } else if (a == "--print-effective-config") o.print_effective_config = true;
         else if (::strix::session::speculation_opt_out_argument(a)) o.no_mtp = true;
-        else if (a == "--help" || a == "-h") o.help = true;
+        else if (a == "--dfly") {
+            o.dfly = value();
+            if (o.dfly.empty()) throw std::invalid_argument("--dfly takes FILE or beside");
+        } else if (a == "--help" || a == "-h") o.help = true;
         else throw std::invalid_argument("unknown hy4_flash option: " + a + " (see --help)");
     }
     return o;
@@ -241,6 +244,7 @@ const char* usage() {
            "  --profile exact|fast|turbo  execution tier\n"
            "  --prompt-rows N --head-q8 0|1  explicit profile overrides\n"
            "  --no-mtp                  plain decode instead of the exact speculative default (also STRIX_MTP=0)\n"
+           "  --dfly FILE|beside        opt-in DFly2 drafter beside the next-token block under the shared selector\n"
            "  --print-effective-config  print the effective values and the serve-only levers, then exit\n";
 }
 

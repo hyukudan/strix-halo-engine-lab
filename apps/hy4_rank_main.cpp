@@ -634,11 +634,12 @@ int run(int argc, char** argv) {
     bool print_config = false;
     // Exact speculative decode (src/hy4/hy4_speculation.hpp): --mtp forces it, --no-mtp / STRIX_MTP=0 opt out; the
     // EXACT prompt runs as verify rows of --prompt-vrows R (1..8, 0 = one step per position; each row bitwise the step).
-    // DFly2 block drafter (default when its shard is beside the pack and the decode speculates; --dfly FILE | off) beside
-    // the next-token block, both under the shared per-regime selector (spec::ArmSelector) or alone (--dfly-arm only);
-    // --dfly-format q8|bf16, --dfly-block N.
+    // DFly2 block drafter, opt-in: --dfly-arm sel (beside the next-token block under the shared per-regime selector,
+    // spec::ArmSelector) or --dfly-arm only (alone), its shard from --dfly FILE or beside the pack; --dfly FILE alone
+    // means --dfly-arm sel. Without either the next-token block drafts alone (the selector measured slower: record
+    // 44.90 vs 45.67 tok/s, agentic 45.10 vs 48.55). --dfly-format q8|bf16, --dfly-block N.
     std::uint32_t dfly_block = 0;
-    std::string dfly_arm = "sel", dfly_text;  // dfly_text: --dfly FILE | off (empty: beside the pack when speculating)
+    std::string dfly_arm, dfly_text;  // dfly_arm empty: no DFly2 arm; dfly_text: --dfly FILE | off
     std::uint32_t prompt_vrows = strix::hy4::hipbind::rows::kMaxVerifyRows;
     std::string dump_path;  // --dump-logits F: every host logits row (FP32, vocab floats per step) appended to F
     std::vector<strix::hy4::hipbind::PairWindowCost> window_costs;  // --window-costs ROWS:MS,... (pair calibration)
@@ -817,17 +818,18 @@ int run(int argc, char** argv) {
         if (!e.reason.empty()) std::cerr << e.lever->name << ": " << e.reason << '\n';
     if (o.parts.empty() || prompt.empty())
         throw std::invalid_argument("usage: strix-hy4-rank PART1.gguf [PART2.gguf] --ids-file F [--gen N] [--teacher F] [--layers D] "
-                                    "[--context C] [--top K] [--timing] [--prompt-rows R] [--dump-logits F] [--profile exact|fast|turbo] [--dfly FILE|off [--dfly-arm sel|only]] "
+                                    "[--context C] [--top K] [--timing] [--prompt-rows R] [--dump-logits F] [--profile exact|fast|turbo] [--dfly-arm sel|only [--dfly FILE|off]] "
                                     "[--rank 0|1 --cut K | --stage-map C0,C1,..,L|off --repeat K --port P --pipe-guess copy|off --window-costs ROWS:MS,...]");
     // Decode route, every tier: exact speculative decode where the pack ships its next-token block and this rank holds the
     // whole model (one node, or a tensor-parallel rank); the shared resolver words the decision (hy4_speculation.hpp).
     spec_run.whole_model = !layer_pair && spec_run.whole_model;
     const auto spec_decision = strix::hy4::speculation(spec_run);
     const bool spec_on = spec_decision.enabled && gen > 1U && spec_room;
-    if (dfly_arm != "sel" && dfly_arm != "only") throw std::invalid_argument("--dfly-arm sel|only");
-    // The DFly2 shard (shared drafter resolver: explicit file, off, or beside the pack when the decode speculates) loads
-    // only where this rank drafts (one node, TP rank 0; rank 1 follows) on the whole model.
-    const bool dfly_drafts = spec_on && tp_rank != 1 && !o.parts.empty();
+    if (dfly_arm.empty() && !dfly_text.empty() && dfly_text != "off") dfly_arm = "sel";  // a named DFly2 file opts in
+    if (!dfly_arm.empty() && dfly_arm != "sel" && dfly_arm != "only") throw std::invalid_argument("--dfly-arm sel|only");
+    // The DFly2 shard (shared drafter resolver: explicit file, off, or beside the pack once the arm is requested) loads
+    // only where this rank drafts (one node, TP rank 0; rank 1 follows) on the whole model, and only on request.
+    const bool dfly_drafts = spec_on && tp_rank != 1 && !o.parts.empty() && !dfly_arm.empty();
     const auto dfly_file = strix::spec::resolve_drafter_file(
         {dfly_text == "off" ? std::string_view{} : std::string_view{dfly_text}, dfly_text == "off", dfly_drafts},
         dfly_drafts ? std::filesystem::path(o.parts.front()) : std::filesystem::path{}, strix::hy4::kDflySidecar);

@@ -17,8 +17,8 @@
 //     as the chain arm of the shared BlockDrafter (ParallelBlockDrafter over the Hy4 BlockForward); per content the MTP arm
 //     and the DFly2 arm alternate --dfly-reps times (SPEC / DFLY lines labelled content:mtp / content:dfly). --dfly-format
 //     q8|bf16 (pack Linears), --dfly-block N (rows incl. the anchor, <= 8; default the preset), --dfly-ms S,F (Arbiter seeds).
-//     --arms LIST (with --dfly; default mtp,dfly,sel): the arms of each rep in order; sel = both drafters under the shared
-//     per-regime selector (spec::ArmSelector; SEL line: passes / tokens / wall per arm, probes, switches).
+//     --arms LIST (with --dfly; default mtp,dfly): the arms of each rep in order; sel (opt-in) = both drafters under the
+//     shared per-regime selector (spec::ArmSelector; SEL line: passes / tokens / wall per arm, probes, switches).
 // strix-hy4-rows PART.gguf... --ids-file F [--context N] [--prompt-rows N] [--reps K] [--spec N] [--max-rows R]
 //   [--verify-ms a,b,...] [--gbps G] [--mtp [--mtp-head full|q8|q4] [--mtp-copy 0|1] [--chain-ms S,F] [--survival c,...] [--mtp-taps DIR
 //   [--taps-gen N] [--depth D]]]; --content LABEL=PATH (repeatable) instead of --ids-file: one spec run per content
@@ -623,7 +623,7 @@ int main(int argc, char** argv) {
         bool mtp = false, mtp_copy = true;
         std::vector<double> chain_ms, survival, dfly_ms;
         std::uint32_t dfly_block = 0, dfly_reps = 1;
-        std::string arms_text = "mtp,dfly,sel";
+        std::string arms_text = "mtp,dfly";  // sel only when named (the selector is opt-in)
         std::string taps_dir;
         std::uint32_t taps_gen = 128, depth = 6;
         // tensor-parallel pair (Forward::enable_tp on both ranks, each holding the whole pack): rank 0 drafts and decides,

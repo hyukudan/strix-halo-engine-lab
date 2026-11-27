@@ -15,6 +15,7 @@ ArmSelector::ArmSelector(ArmSelectorConfig config) : cfg_(std::move(config)) {
         throw std::invalid_argument("ArmSelector: probe passes / interval");
     if (!(cfg_.probe_stop > 0.0) || !(cfg_.probe_loss >= 0.0) || !(cfg_.drop > 0.0 && cfg_.drop <= 1.0))
         throw std::invalid_argument("ArmSelector: probe_stop / probe_loss / drop");
+    if (!(cfg_.tie_band >= 0.0 && cfg_.tie_band < 1.0)) throw std::invalid_argument("ArmSelector: tie_band outside [0, 1)");
     if (!cfg_.clock_ms)
         cfg_.clock_ms = [] {
             return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count();
@@ -130,7 +131,10 @@ void ArmSelector::end_pass(std::size_t arm, std::span<const std::uint32_t> emitt
     // inconclusive (only an arm that wins ties measures on: for the others a tie keeps the incumbent anyway)
     const bool open = x.wins_ties && !lost && rb <= cfg_.switch_in * ra && rb >= (1.0 - cfg_.probe_band) * cfg_.switch_in * ra;
     if (open && ep_n_ < cfg_.probe_passes_max) return;  // inconclusive: measure on
-    if (!lost && (rb > cfg_.switch_in * ra || (open && x.wins_ties))) {
+    // wins_ties takes an inconclusive episode only as a genuine tie: not measurably slower than the active arm (rate at
+    // least (1 - tie_band) x the active rate); an arm a few % slower keeps losing however long its episode measured.
+    const bool tie = open && rb >= (1.0 - cfg_.tie_band) * ra;
+    if (!lost && (rb > cfg_.switch_in * ra || tie)) {
         arms_[active_].interval = cfg_.probe_every;
         x.interval = cfg_.probe_every;
         active_ = arm;

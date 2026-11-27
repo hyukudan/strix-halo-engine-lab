@@ -19,8 +19,10 @@
 // - probe_min_tokens (per arm): probe it only while the active arm emits at least this many tokens per pass. A block
 //   drafter whose forward costs ~B chain steps can only pay where ~B drafts are accepted; the adapter declares it;
 // - wins_ties (per arm): at the end of an inconclusive episode (rate within probe_band of the bar after probe_passes_max)
-//   the probed arm takes over when it declares wins_ties: the adapter states, from device receipts, that wherever its gate
-//   opens this arm wins by a margin the probe cannot resolve (default false: the incumbent keeps a tie);
+//   the probed arm takes over when it declares wins_ties and its rate is at least (1 - tie_band) x the active rate (a
+//   genuine tie; an arm measured a few % slower never takes over by the tie rule): the adapter states, from device
+//   receipts, that wherever its gate opens this arm wins by a margin the probe cannot resolve (default false: the
+//   incumbent keeps a tie);
 // - available (per arm, optional): whether the arm can draft a pass at (context, rows) (a drafter with a context limit).
 //   An unavailable arm is neither run nor probed; when the active one becomes unavailable the first available arm in
 //   preference order takes over (a fallback, counted apart from switches).
@@ -45,6 +47,7 @@ struct ArmSelectorConfig {
     std::uint32_t probe_passes = 6;  // probe episode length before its first decision
     std::uint32_t probe_passes_max = 18;  // an inconclusive episode (rate within probe_band of the bar) runs on to this
     double probe_band = 0.10;
+    double tie_band = 0.02;          // a wins_ties arm takes an inconclusive episode only at >= (1 - tie_band) x the active rate
     double probe_stop = 1.5;         // early end: realised net loss above this many active passes
     double probe_loss = 0.01;        // periodic probes wait while the probe ledger > probe_loss x decode wall
     double drop = 0.80;              // active rate < drop x an arm's last rate: probe that arm now
