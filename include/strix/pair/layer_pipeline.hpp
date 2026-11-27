@@ -16,6 +16,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <functional>
 #include <span>
@@ -297,9 +298,8 @@ inline DecodeStats decode(const Placement& p, std::uint32_t first_token, std::ui
 }
 
 // A bulk payload crosses a link in pieces of at most `chunk` bytes (the byte stream is the same; only the transport
-// calls are bounded). A multi-cable host transport corrupted single writes of 32 MiB (the KV of one attention layer at
-// 8K positions) while 10 MiB pipe frames were intact, so the layer-state and tail-row messages never ask a transport for
-// more than the pipe frames already prove (8 MiB).
+// calls are bounded). The chunk keeps every call of the layer-state and tail-row messages within what the pipe frames
+// already exercise (8 MiB); it is not a proven fix: a checksum mismatch also occurred with 8 MiB calls.
 inline constexpr std::size_t link_chunk_bytes = std::size_t{8} << 20;
 inline void send_chunked(const Link& link, std::span<const std::byte> bytes, std::size_t chunk = link_chunk_bytes) {
     if (chunk == 0) throw std::invalid_argument("link chunk must be positive");
@@ -308,6 +308,54 @@ inline void send_chunked(const Link& link, std::span<const std::byte> bytes, std
 inline void receive_chunked(const Link& link, std::span<std::byte> bytes, std::size_t chunk = link_chunk_bytes) {
     if (chunk == 0) throw std::invalid_argument("link chunk must be positive");
     for (std::size_t at = 0; at < bytes.size(); at += chunk) link.receive(bytes.subspan(at, std::min(chunk, bytes.size() - at)));
+}
+
+// One bulk message with end-to-end integrity: {magic, id, bytes, checksum, extra} + payload. The receiver answers every
+// attempt with one word (1 accepted, 0 resend); a payload that fails its checksum is requested again, at most
+// `message_attempts` times, and the two copies are compared on stderr (differing bytes, first offset, 4 KiB pages) so a
+// transport that corrupts intermittently is measured instead of guessed. Measured on the two-cable host transport (8K
+// prompt, KV of one attention layer = 32 MiB): a single run of the hand-off failed its checksum without any fault in the
+// sender, in sizes the 10 MiB pipe frames never showed.
+inline constexpr unsigned message_attempts = 3;
+inline unsigned send_verified(const Link& to, const std::uint64_t (&words)[5], std::span<const std::byte> bytes, std::size_t chunk) {
+    for (unsigned attempt = 0; attempt < message_attempts; ++attempt) {
+        to.send(std::as_bytes(std::span(words)));
+        send_chunked(to, bytes, chunk);
+        std::uint64_t ack = 0;
+        to.receive(std::as_writable_bytes(std::span(&ack, 1)));
+        if (ack == 1U) return attempt;
+        if (ack != 0U) throw std::runtime_error("bulk message: bad acknowledgement word (protocol error)");
+    }
+    throw std::runtime_error("bulk message refused " + std::to_string(message_attempts) + " times by the receiver (checksum)");
+}
+inline unsigned receive_verified(const Link& from, std::uint64_t (&words)[5], std::vector<std::byte>& bytes, std::uint64_t magic,
+                                 const std::function<std::uint32_t(std::span<const std::byte>)>& check, std::size_t chunk,
+                                 const std::string& what) {
+    std::vector<std::byte> bad;
+    for (unsigned attempt = 0; attempt < message_attempts; ++attempt) {
+        from.receive(std::as_writable_bytes(std::span(words)));
+        if (words[0] != magic) throw std::runtime_error(what + ": bad message header");
+        bytes.resize(static_cast<std::size_t>(words[2]));
+        receive_chunked(from, bytes, chunk);
+        const bool ok = check(bytes) == words[3];
+        const std::uint64_t ack = ok ? 1U : 0U;
+        from.send(std::as_bytes(std::span(&ack, 1)));
+        if (ok) {
+            if (!bad.empty() && bad.size() == bytes.size()) {
+                std::size_t differing = 0, first = bytes.size(), pages = 0;
+                for (std::size_t i = 0; i < bytes.size(); ++i)
+                    if (bad[i] != bytes[i]) { ++differing; if (first == bytes.size()) first = i; }
+                for (std::size_t i = 0; i < bytes.size(); i += 4096U)
+                    if (std::memcmp(bad.data() + i, bytes.data() + i, std::min<std::size_t>(4096U, bytes.size() - i)) != 0) ++pages;
+                std::fprintf(stderr, "%s: checksum mismatch repaired by resend (message %llu, %zu bytes): %zu differing bytes in %zu pages, first at %zu\n",
+                             what.c_str(), static_cast<unsigned long long>(words[1]), bytes.size(), differing, pages, first);
+            }
+            return attempt;
+        }
+        if (bad.empty()) bad = bytes;
+    }
+    throw std::runtime_error(what + ": checksum mismatch (message " + std::to_string(words[1]) + ", " + std::to_string(bytes.size()) +
+                             " bytes) after " + std::to_string(message_attempts) + " attempts");
 }
 
 // End-of-prefill relay of every stage's layer state to ONE decoder stage (the planner's handoff plan: the decoder owns
@@ -324,7 +372,7 @@ struct RelayOps {
     std::function<std::uint32_t(std::span<const std::byte>)> checksum;
     std::size_t chunk_bytes = link_chunk_bytes;   // largest single transport call of a message's payload
 };
-struct RelayStats { std::uint32_t token = 0; std::uint64_t bytes = 0, messages = 0; double ms = 0; };
+struct RelayStats { std::uint32_t token = 0; std::uint64_t bytes = 0, messages = 0, resends = 0; double ms = 0; };
 inline RelayStats relay_state(const Placement& p, std::uint32_t decoder, std::uint32_t first_token, const Link* up,
                               const Link* down, const RelayOps& ops) {
     using Clock = std::chrono::steady_clock;
@@ -343,15 +391,10 @@ inline RelayStats relay_state(const Placement& p, std::uint32_t decoder, std::ui
     struct Message { std::uint64_t words[5]{}; std::vector<std::byte> bytes; };
     const auto get_msg = [&](const Link* from) {
         Message m;
-        from->receive(std::as_writable_bytes(std::span(m.words)));
-        if (m.words[0] != state_magic) throw std::runtime_error("state relay: bad message header");
-        m.bytes.resize(static_cast<std::size_t>(m.words[2]));
-        receive_chunked(*from, m.bytes, ops.chunk_bytes);
-        if (check_sum(m.bytes) != m.words[3])
-            throw std::runtime_error("state relay: checksum mismatch (layer " + std::to_string(m.words[1]) + ", " + std::to_string(m.bytes.size()) + " bytes)");
+        out.resends += receive_verified(*from, m.words, m.bytes, state_magic, check_sum, ops.chunk_bytes, "state relay");
         return m;
     };
-    const auto put_msg = [&](const Link* to, const Message& m) { to->send(std::as_bytes(std::span(m.words))); send_chunked(*to, m.bytes, ops.chunk_bytes); };
+    const auto put_msg = [&](const Link* to, const Message& m) { out.resends += send_verified(*to, m.words, m.bytes, ops.chunk_bytes); };
     const auto own = [&](std::uint32_t layer) {
         Message m;
         m.bytes = ops.save(layer);
@@ -408,8 +451,8 @@ inline RelayStats relay_state(const Placement& p, std::uint32_t decoder, std::ui
 // Line barrier of a stage chain over its links: returns on a stage only after every stage has entered it. The head stage
 // speaks first (up), each stage forwards to the next one down the line only after hearing from below; so no rank sends or
 // reads anything but these words until all stages are here. Run it after the prefill pipes are gone (a stage that finished
-// first must not start the state hand-off while another stage's pipe progress thread still reads the shared transport:
-// that corrupts the stream and shows as a checksum mismatch) and before the first timed phase.
+// first must not start the state hand-off while another stage's pipe progress thread still reads the shared transport;
+// the barrier only orders the hand-off after the pipes: intermittent corruption was seen with it in place) and before the first timed phase.
 inline void line_barrier(const Link* up, const Link* down) {
     std::uint64_t word = 0x52524142ULL;
     const auto out = [](const Link* l, std::uint64_t& w) { l->send(std::as_bytes(std::span(&w, 1))); };
@@ -424,7 +467,8 @@ inline void line_barrier(const Link* up, const Link* down) {
 // per-layer messages as relay_state(): afterwards every rank holds the state of every layer, bit for bit what a whole
 // prefill on that rank leaves (the layer ranges run the same launches as the whole range, so the state bytes are equal).
 // The caller runs a line barrier after the prefill pipes are gone (a stage that finished first must not send while the
-// other stage's pipe progress thread still reads the shared transport: the corruption shows as a checksum mismatch).
+// other stage's pipe progress thread still reads the shared transport; the barrier orders the phases, it does not explain the
+// intermittent corruption seen on the host transport with it in place, whose cause is not established).
 // The first token (known on the head stage) reaches the other stages with the relay to them. One round per stage, so the
 // two directions of a link do not overlap: the wall is the sum of the rounds.
 inline RelayStats share_state(const Placement& p, std::uint32_t first_token, const Link* up, const Link* down,
@@ -435,6 +479,7 @@ inline RelayStats share_state(const Placement& p, std::uint32_t first_token, con
         const auto round = relay_state(p, decoder, first_token, up, down, ops);
         total.bytes += round.bytes;
         total.messages += round.messages;
+        total.resends += round.resends;
         total.ms += round.ms;
         if (p.stage == decoder) total.token = round.token;
     }
@@ -466,21 +511,18 @@ inline std::uint64_t return_rows(const Placement& p, std::size_t prompt_tokens, 
     std::uint64_t moved = 0;
     std::vector<std::byte> bytes;
     for (std::uint32_t w = 0; w < ws.size(); ++w) {
-        bytes.resize(std::size_t(ws[w].rows) * ops.row_bytes);
         std::uint64_t words[5]{};
         if (p.head()) {
             if (!up) throw std::invalid_argument("tail rows: the head stage needs its upstream link");
+            bytes.resize(std::size_t(ws[w].rows) * ops.row_bytes);
             ops.save(w, bytes);
-            words[0] = tail_magic; words[1] = w; words[2] = ws[w].rows; words[3] = bytes.size(); words[4] = check_sum(bytes);
-            up->send(std::as_bytes(std::span(words)));
-            send_chunked(*up, bytes, ops.chunk_bytes);
+            words[0] = tail_magic; words[1] = w; words[2] = bytes.size(); words[3] = check_sum(bytes); words[4] = ws[w].rows;
+            (void)send_verified(*up, words, bytes, ops.chunk_bytes);
         } else {
             if (!down) throw std::invalid_argument("tail rows: the first stage needs its downstream link");
-            down->receive(std::as_writable_bytes(std::span(words)));
-            if (words[0] != tail_magic || words[1] != w || words[2] != ws[w].rows || words[3] != bytes.size())
+            (void)receive_verified(*down, words, bytes, tail_magic, check_sum, ops.chunk_bytes, "tail rows");
+            if (words[1] != w || words[4] != ws[w].rows || bytes.size() != std::size_t(ws[w].rows) * ops.row_bytes)
                 throw std::runtime_error("tail rows: message does not match the window");
-            receive_chunked(*down, bytes, ops.chunk_bytes);
-            if (check_sum(bytes) != words[4]) throw std::runtime_error("tail rows: checksum mismatch (window " + std::to_string(w) + ", " + std::to_string(bytes.size()) + " bytes)");
             ops.load(w, ws[w], bytes);
         }
         moved += bytes.size();

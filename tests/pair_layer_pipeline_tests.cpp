@@ -248,7 +248,8 @@ struct Shared {
     std::vector<float> head_rows, first_rows;   // the final rows of every window: computed on the head, received on stage 0
     std::uint64_t state_bytes[2]{}, tail_bytes[2]{};
 };
-Shared run_share(const Weights& m, const std::vector<std::uint32_t>& prompt, unsigned width, unsigned gen, std::uint32_t cut) {
+Shared run_share(const Weights& m, const std::vector<std::uint32_t>& prompt, unsigned width, unsigned gen, std::uint32_t cut,
+                 int corrupt = 0) {
     Shared out;
     const std::vector<std::uint32_t> cuts{0, cut, m.layers};
     Channel link;
@@ -256,7 +257,8 @@ Shared run_share(const Weights& m, const std::vector<std::uint32_t>& prompt, uns
     const auto count = wins.size();
     const std::size_t row_bytes = H * 4U;
     std::atomic<bool> head_done{false};
-    const std::size_t chunk = 40;   // = the message header: every payload (64 B per layer, 96+ B per window) needs several calls
+    const std::size_t chunk = 48;   // not the 40 B message header: every payload (64 B per layer, 96+ B per window) needs several calls
+    std::atomic<int> corrupt_left{corrupt};   // payload pieces to damage in flight (fault injection)
     std::vector<std::thread> threads;
     for (unsigned s = 0; s < 2U; ++s)
         threads.emplace_back([&, s] {
@@ -289,6 +291,12 @@ Shared run_share(const Weights& m, const std::vector<std::uint32_t>& prompt, uns
                 // after the pipes no single transport call may exceed the chunk (a transport that corrupts big writes)
                 const auto capped = [&](int dir) { return [&, dir](std::span<const std::byte> b) {
                     if (b.size() > chunk) throw std::runtime_error("a single write above the chunk size");
+                    if (b.size() == chunk && corrupt_left.fetch_sub(1) > 0) {
+                        std::vector<std::byte> bad(b.begin(), b.end());
+                        bad[7] ^= std::byte{0x10};
+                        link.send(dir, bad);
+                        return;
+                    }
                     link.send(dir, b); }; };
                 if (s == 1U) { up.send = capped(1); up.receive = [&](std::span<std::byte> b) { link.receive(0, b); }; }
                 else { down.send = capped(0); down.receive = [&](std::span<std::byte> b) { link.receive(1, b); }; }
@@ -402,6 +410,19 @@ int main() {
         expect(r.head_rows.size() == prompt.size() * H && r.first_rows == r.head_rows, tag + " returned rows differ from the head's");
         expect(r.tail_bytes[0] == prompt.size() * H * 4U && r.tail_bytes[1] == r.tail_bytes[0], tag + " tail bytes");
         ++shared;
+    }
+    // a payload damaged in flight once is detected by its checksum and sent again: same ids, one resend counted by the
+    // receiver; damaged on every attempt it is refused by name (and nothing hangs)
+    {
+        const auto r = run_share(m, prompt, width, gen, 3, 1);
+        for (unsigned s = 0; s < 2U; ++s) {
+            expect(r.res[s].error.empty(), "damaged once, stage " + std::to_string(s) + " error: " + r.res[s].error);
+            expect(r.res[s].ids == ref.ids, "damaged once, stage " + std::to_string(s) + " ids differ from one rank");
+        }
+        const auto bad = run_share(m, prompt, width, gen, 3, 1 << 30);
+        expect((bad.res[0].error + bad.res[1].error).find("checksum mismatch") != std::string::npos &&
+                   (bad.res[0].error + bad.res[1].error).find("3 attempts") != std::string::npos,
+               "damaged on every attempt refused: got '" + bad.res[0].error + "' / '" + bad.res[1].error + "'");
     }
     // pipelined speculation on the first stage: every guess policy gives the one-rank ids and decode logits bytes;
     // the stage-0 counters match the policy; a rewind that keeps the guessed state is detected.
