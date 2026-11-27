@@ -131,3 +131,7 @@ STRIX_QWEN_PAIR_HALF_CUT = "forms.layers.cut"
 STRIX_PAIR_STAGE_MAP = "forms.layers.cut"
 STRIX_QWEN_PF_PIPE_CHUNK = "forms.layers.window_rows"
 STRIX_QWEN_PAIR_CHUNK_POLICY = "forms.layers.window_rows"
+
+# Catalogue engines whose levers --all-on may turn on for this model (docs/optimizations.json "all_on" rows).
+[catalogue]
+engines = ["qwen", "qwen3.8-flash-next", "qwen-rtx-moe"]

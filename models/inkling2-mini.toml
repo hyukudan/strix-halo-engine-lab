@@ -98,3 +98,7 @@ fallback = "single"
 [multi_device.forms.replica]
 ranks = 2
 objective = "throughput"
+
+# Catalogue engines whose levers --all-on may turn on for this model (docs/optimizations.json "all_on" rows).
+[catalogue]
+engines = ["inkling2-mini"]

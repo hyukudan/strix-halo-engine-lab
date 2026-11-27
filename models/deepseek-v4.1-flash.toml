@@ -110,3 +110,7 @@ levers = "fast"
 STRIX_DS41_EXPERT_TP = "forms.tensor.expert_partition"
 STRIX_DS41_EXPERT_TP_LAYOUT = "forms.tensor.expert_partition"
 STRIX_DS41_EXPERT_SLOTS = "forms.tensor.expert_partition"
+
+# Catalogue engines whose levers --all-on may turn on for this model (docs/optimizations.json "all_on" rows).
+[catalogue]
+engines = ["deepseek", "deepseek-rtx", "deepseek41", "deepseek-v4.1-flash"]

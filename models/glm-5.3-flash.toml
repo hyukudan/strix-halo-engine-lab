@@ -131,3 +131,7 @@ state = [
     { name = "dsa_igate", kind = 4, owner = "shared", extent = "rows", bytes = 256, layers = 12, layer0 = 0, layer_stride = 1, row_div = 1, rows_less = 0, source = "src/glm/kernels/glm_dsa.hip:120-153" },
     { name = "dsa_pool", kind = 5, owner = "shared", extent = "rows", bytes = 512, layers = 12, layer0 = 0, layer_stride = 1, row_div = 4, rows_less = 0, source = "src/glm/kernels/glm_dsa.hip:167-180" },
 ]
+
+# Catalogue engines whose levers --all-on may turn on for this model (docs/optimizations.json "all_on" rows).
+[catalogue]
+engines = ["glm", "glm-5.3-flash"]

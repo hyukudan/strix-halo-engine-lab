@@ -13,6 +13,9 @@ namespace strix::model_data::minimax_m3_1_flash {
 namespace attention {
 inline constexpr std::string_view kind = "msa";
 } // namespace attention
+namespace catalogue {
+inline constexpr std::string_view engines[] = {"minimax", "minimax-m3.1-flash"};
+} // namespace catalogue
 namespace dims {
 inline constexpr std::int64_t head_dim = 128;
 inline constexpr std::int64_t hidden = 6144;

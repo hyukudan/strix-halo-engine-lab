@@ -64,6 +64,9 @@ inline constexpr bool use_vha = true;
 inline constexpr std::int64_t v_head_dim = 512;
 inline constexpr std::int64_t vha_rank = 16;
 } // namespace attention
+namespace catalogue {
+// engines: empty array (no constant)
+} // namespace catalogue
 namespace dims {
 inline constexpr std::int64_t head_dim = 512;
 inline constexpr std::int64_t hidden = 4096;

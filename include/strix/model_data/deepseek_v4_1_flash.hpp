@@ -37,6 +37,9 @@ inline constexpr std::string_view type = "yarn";
 inline constexpr double rope_theta = 0x1.388p+13 /* 10000 */;
 inline constexpr std::int64_t sliding_window = 128;
 } // namespace attention
+namespace catalogue {
+inline constexpr std::string_view engines[] = {"deepseek", "deepseek-rtx", "deepseek41", "deepseek-v4.1-flash"};
+} // namespace catalogue
 namespace dims {
 inline constexpr std::int64_t head_dim = 512;
 inline constexpr std::int64_t hidden = 5120;

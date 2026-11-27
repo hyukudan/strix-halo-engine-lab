@@ -15,6 +15,9 @@ inline constexpr std::int64_t gdn_layers = 36;
 inline constexpr std::string_view pattern[] = {"gdn", "gdn", "gdn", "qsa"};
 inline constexpr std::int64_t qsa_layers = 12;
 } // namespace attention
+namespace catalogue {
+inline constexpr std::string_view engines[] = {"qwen", "qwen3.8-flash-next", "qwen-rtx-moe"};
+} // namespace catalogue
 namespace dims {
 inline constexpr std::int64_t head_dim = 256;
 inline constexpr std::int64_t hidden = 2560;

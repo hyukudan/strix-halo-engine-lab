@@ -9,6 +9,9 @@
 
 namespace strix::model_data::hy4_flash {
 
+namespace catalogue {
+inline constexpr std::string_view engines[] = {"hy4", "hy4-flash"};
+} // namespace catalogue
 namespace multi_device {
 namespace forms {
 namespace layers {

@@ -96,3 +96,7 @@ state = [
     { name = "v", kind = 1, owner = "per_rank", extent = "rows", bytes = 512, layers = 60, layer0 = 0, layer_stride = 1, row_div = 1, rows_less = 0, source = "src/minimax/engine/engine.hip:3193-3207" },
     { name = "ik", kind = 2, owner = "shared", extent = "rows", bytes = 256, layers = 60, layer0 = 0, layer_stride = 1, row_div = 1, rows_less = 0, source = "src/minimax/rtxpf/cuda/mm_rtx_kernels.cu:639" },
 ]
+
+# Catalogue engines whose levers --all-on may turn on for this model (docs/optimizations.json "all_on" rows).
+[catalogue]
+engines = ["minimax", "minimax-m3.1-flash"]

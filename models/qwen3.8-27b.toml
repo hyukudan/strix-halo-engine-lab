@@ -99,3 +99,7 @@ identity = "chain-window-15-v1"
 [multi_device.legacy_env]
 STRIX_TP_F16_GATHER = "forms.tensor.wire"
 STRIX_TP_SPLIT_DRAFT = "forms.tensor.draft_placement"
+
+# Catalogue engines whose levers --all-on may turn on for this model (docs/optimizations.json "all_on" rows).
+[catalogue]
+engines = ["qwen-rtx-dense"]

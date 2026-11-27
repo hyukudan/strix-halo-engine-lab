@@ -135,3 +135,7 @@ default = "exact"
 
 [presets.exact]
 levers = "exact"
+
+# Catalogue engines whose levers --all-on may turn on for this model (docs/optimizations.json "all_on" rows).
+[catalogue]
+engines = []

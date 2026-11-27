@@ -88,3 +88,7 @@ levers = "turbo"
 [multi_device.legacy_env]
 STRIX_G4_PAIR = "forms.layers"
 STRIX_G4_PAIR_CUT = "forms.layers.cut"
+
+# Catalogue engines whose levers --all-on may turn on for this model (docs/optimizations.json "all_on" rows).
+[catalogue]
+engines = ["gemma4", "nemotron-3.5-bolt-e4b"]

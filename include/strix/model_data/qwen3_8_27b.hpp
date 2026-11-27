@@ -32,6 +32,9 @@ inline constexpr std::int64_t value_heads = 48;
 } // namespace gdn
 inline constexpr std::string_view kind = "gdn+gated-attn";
 } // namespace attention
+namespace catalogue {
+inline constexpr std::string_view engines[] = {"qwen-rtx-dense"};
+} // namespace catalogue
 namespace dims {
 inline constexpr std::int64_t context = 262144;
 inline constexpr std::int64_t hidden = 5120;

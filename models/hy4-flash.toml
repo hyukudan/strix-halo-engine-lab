@@ -59,3 +59,7 @@ prefer = ["layers"]
 [multi_device.legacy_env]
 STRIX_HY4_TP_JOIN_BF16 = "forms.tensor.wire"
 STRIX_HY4_TP_DRAFT = "forms.tensor.draft_placement"
+
+# Catalogue engines whose levers --all-on may turn on for this model (docs/optimizations.json "all_on" rows).
+[catalogue]
+engines = ["hy4", "hy4-flash"]

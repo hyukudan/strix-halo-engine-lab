@@ -46,6 +46,9 @@ inline constexpr double scale = 0x1p+0 /* 1 */;
 inline constexpr std::int64_t shared_kv_layers = 18;
 inline constexpr std::int64_t window = 512;
 } // namespace attention
+namespace catalogue {
+inline constexpr std::string_view engines[] = {"gemma4", "nemotron-3.5-bolt-e4b"};
+} // namespace catalogue
 namespace contract {
 inline constexpr std::string_view arithmetic = "g4-v1";
 inline constexpr double logit_cap = 0x1.ep+4 /* 30 */;

@@ -46,6 +46,9 @@ inline constexpr std::int64_t pools = 512;
 inline constexpr std::int64_t top_k = 2048;
 } // namespace select
 } // namespace attention
+namespace catalogue {
+inline constexpr std::string_view engines[] = {"glm", "glm-5.3-flash"};
+} // namespace catalogue
 namespace dims {
 inline constexpr std::int64_t hidden = 4096;
 inline constexpr std::int64_t intermediate = 12288;
