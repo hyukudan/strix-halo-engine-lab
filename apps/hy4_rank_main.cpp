@@ -723,7 +723,7 @@ int run(int argc, char** argv) {
 
     const bool stage_route = stage_map.empty() && cut == 0U && !pipe_guess && window_costs.empty();
     // The route the argument list spells (hy4_speculation.hpp); the pack and the topology complete it.
-    auto spec_run = strix::hy4::speculation_run_from_arguments(args);
+    auto spec_run = strix::hy4::speculation_run_from_arguments(args, {!teacher.empty(), !dump_path.empty()});
     if (!o.parts.empty() && (!print_config || (layer_pair && !pair_receipt.empty())))
         spec_run.block_in_pack = strix::hy4::Config::from_gguf(o.parts.front()).nextn > 0U;
     spec_run.whole_model = o.depth == 0U;
