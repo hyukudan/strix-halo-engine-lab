@@ -7637,7 +7637,6 @@ if(STRIX_FAMILY_MINIMAX)
         strix_minimax_model_description strix_minimax_defaults strix_engine_deploy strix_session_runtime)
     target_include_directories(strix_minimax_session_service PUBLIC src include)
     target_compile_features(strix_minimax_session_service PUBLIC cxx_std_20)
-    target_compile_definitions(strix_minimax_session_service PRIVATE STRIX_SERVE_REGISTRY_ROOT="${CMAKE_CURRENT_SOURCE_DIR}")
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/minimax/serve/session_engine.cpp")
         target_sources(strix_minimax_session_service PRIVATE src/minimax/serve/session_engine.cpp)
         if(TARGET strix-minimax-lead-tests)
@@ -7846,7 +7845,7 @@ if(STRIX_FAMILY_MINIMAX)
                 add_executable(strix-minimax-serve apps/minimax_serve_main.cpp)
                 target_link_libraries(strix-minimax-serve PRIVATE strix_session_shell strix_minimax_session_service strix_cli
                     strix_cli_inspection_bindings)
-                # The registry root falls back to the shipped data directory the launcher uses (strix::cli::data_directory).
+                # Use the same installed or build-tree data as the shared launcher.
                 target_compile_definitions(strix-minimax-serve PRIVATE STRIX_MINIMAX_SERVE_SHIPPED_DATA=1)
                 target_compile_features(strix-minimax-serve PRIVATE cxx_std_20)
                 strix_target_warnings(strix-minimax-serve)

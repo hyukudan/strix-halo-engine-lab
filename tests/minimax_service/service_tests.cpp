@@ -136,8 +136,18 @@ int main(int argc,char** argv) {
             auto a=base(root);a.insert(a.end(),bad.begin(),bad.end());CHECK(invoke(a,factories).code==2);
         }
         CHECK(c.loaded==0);
-        const auto fixture=std::filesystem::current_path()/"service-model";
+        const auto working_dir=std::filesystem::current_path();
+        const auto fixture=working_dir/"service-model";
         std::filesystem::create_directories(fixture);
+        const auto shipped_root=std::filesystem::absolute(root);
+        char legacy_program[] = "strix-minimax-serve";
+        char print_effective[] = "--print-effective-config";
+        char* legacy_args[] = {legacy_program, print_effective, nullptr};
+        std::filesystem::current_path(fixture);
+        const int shipped_result=ms::legacy_serve(2, legacy_args, shipped_root);
+        const int missing_result=ms::legacy_serve(2, legacy_args, fixture/"missing-registry");
+        std::filesystem::current_path(working_dir);
+        CHECK(shipped_result==0 && missing_result==2);
         std::filesystem::copy_file(std::filesystem::path(root)/"models/minimax-m3.1-flash.toml",fixture/"minimax-m3.1-flash.toml",std::filesystem::copy_options::overwrite_existing);
         for(const auto& option:{"--print-model-graph","--print-plan"}) {
             auto a=base(root);a[6]=fixture.string();a.push_back(option);CHECK(invoke(a,factories).code==0);
