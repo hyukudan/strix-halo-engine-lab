@@ -6666,3 +6666,28 @@ In a drafting run the speculator's one-row steps run on the CUDA step program ov
 | Inkling 2 Mini | bound: CUDA CLI (this row) |
 | Hy4 Flash | not bound: no CUDA step program with drafter taps next to a verifying route |
 | Nemotron 3.5 Bolt E4B | not bound: no CUDA step program with drafter taps next to a verifying route |
+
+<a id="row-share-attention-rows-past-the-table"></a>
+## Row-share attention: windows past the table (the 64-row EXACT prefill windows)
+
+**Engine:** `shared`. **Control:** STRIX_DECODE_ATTN_ROW_SHARE=0 (main schedule for every window). **Default:** ON in every tier (HIP devices with a measured row-share table: gfx1151)
+
+The exact decode attention walks the K/V prefix once per block for `pairs` (row, q head) pairs. Its device table holds rows 1-16; a longer window (the 64-row EXACT prefill windows) used to fall back to one pair per block, so every one of the 64 x 6 pairs of a kv head re-read the whole prefix: the quadratic term of EXACT prefill at long context. Windows past the table now take the table's last row form (3 pairs per block on gfx1151), the row the CUDA walk cap already reads.
+
+- **Shared home:** include/strix/attn_row_share.hpp (plan_table); HIP kernel bodies src/attn_core/dense_decode.hpp
+- **Tier and regime:** EXACT, FAST, TURBO (every window of 17+ rows on the exact decode attention)
+- **Exactness evidence:** Bitwise: per (row, q head) pair the one-pair arithmetic in the same order, the form only shares K/V loads. gfx1151 rows test: every form BITWISE to v0 at 17 and 64 rows (1K, 33K). Qwen 27B EXACT-64: 2,048-token tail dump == qwen_night EXACT reference (7f299303814221f5); a whole 32,768-token EXACT-64 prefill == the segmented main-schedule reference bit for bit (1,024 rows, f6e1a51d016d54c2).
+- **Off switch:** STRIX_DECODE_ATTN_ROW_SHARE=0
+- **Measured gain:** gfx1151 no-model bench, 64 rows x 16 layers (ms per window): 512 7.8 -> 6.8, 2K 72 -> 27, 8K 487 -> 115, 32K 4,528 -> 604, 64K 10,561 -> 2,317. Qwen 27B EXACT TTFT (one node, cold): 8,192 68.07 -> 46.74 s (same binary, off switch), 24,576 534.4 -> 197.6 s, 32,768 996.5 (segmented) -> 299.5-302.4 s; decode unchanged (1-row windows already in the table: 12.86 / 13.21 tok/s at 8K).
+- **Preconditions:** HIP build; a measured row-share table for the device and head shape (gfx1151, 20 WGP, GQA 6 x 4 kv, head dim 256); windows of 17 or more rows on the exact decode attention (EXACT prefill windows; FAST outside its window bands).
+
+| Model | Binding |
+| --- | --- |
+| Qwen3.8 Flash-Next MoE | not bound: its HIP attention does not walk windows through attn_core::dense_decode (only the Qwen 27B dense HIP engine does) |
+| Qwen3.8 27B dense | bound: HIP decode, tensor-parallel and speculative apps (64-row EXACT prefill windows) |
+| DeepSeek V4.1 Flash | not bound: its HIP attention does not walk windows through attn_core::dense_decode (only the Qwen 27B dense HIP engine does) |
+| GLM 5.3 Flash | not bound: its HIP attention does not walk windows through attn_core::dense_decode (only the Qwen 27B dense HIP engine does) |
+| MiniMax M3.1 Flash | not bound: its HIP attention does not walk windows through attn_core::dense_decode (only the Qwen 27B dense HIP engine does) |
+| Inkling 2 Mini | not bound: its HIP attention does not walk windows through attn_core::dense_decode (only the Qwen 27B dense HIP engine does) |
+| Hy4 Flash | not bound: its HIP attention does not walk windows through attn_core::dense_decode (only the Qwen 27B dense HIP engine does) |
+| Nemotron 3.5 Bolt E4B | not bound: its HIP attention does not walk windows through attn_core::dense_decode (only the Qwen 27B dense HIP engine does) |
