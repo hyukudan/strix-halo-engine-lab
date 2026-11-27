@@ -111,12 +111,12 @@ void collapse(const Spec& spec, std::span<const float> streams, std::span<const 
 
 void collapse_rms_bf16(const Spec& spec, std::span<const float> streams, std::span<const float> pre,
                        std::span<const float> gain, float epsilon, CollapseVariance variance,
-                       std::span<float> out) {
+                       std::span<float> out, attn::ReferenceOrder order) {
     const bool delayed_store = spec.store == Store::bf16 && variance == CollapseVariance::before_store;
     auto collapse_spec = spec;
     if (delayed_store) collapse_spec.store = Store::f32;
     collapse(collapse_spec, streams, pre, out);
-    core::rms_norm_bf16_reference(out, gain, epsilon, delayed_store);
+    core::rms_norm_bf16_reference(out, gain, epsilon, delayed_store, order);
 }
 
 void expand(const Spec& spec, std::span<const float> sub, std::span<const float> residual, const Mix& mix,

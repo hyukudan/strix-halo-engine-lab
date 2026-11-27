@@ -29,6 +29,25 @@ inline void parallel_ordered_matvec(const OrderedFma& kernel, core::HostLane& la
 
 // A reusable input image for a streamed vocabulary matrix. Pack once, apply
 // to successive blocks of output rows. Each lane preserves the scalar order.
+// The row-sweep declared order (core/dense_linear.hpp): per output the Chunk16Dot sum (lane l owns the 16-element
+// chunks l, l+32, ...; products rounded before each add, no FMA; xor butterfly 16, 8, 4, 2, 1). Same geometry
+// contract as parallel_ordered_matvec; one input row per group.
+inline void parallel_row_sweep_matvec(const Chunk16Dot& dot, core::HostLane& lane, unsigned threads,
+                                      std::span<const float> matrix, std::span<const float> input,
+                                      std::span<float> output, unsigned groups = 1) {
+    if (groups == 0 || input.empty() || output.empty() || input.size() % groups || output.size() % groups)
+        throw std::invalid_argument("row sweep matvec: invalid projection groups");
+    const auto width = input.size() / groups;
+    const auto group_rows = output.size() / groups;
+    if (matrix.size() % width || matrix.size() / width != output.size())
+        throw std::invalid_argument("row sweep matvec: invalid matrix geometry");
+    core::reference_row_ranges(lane, threads, output.size(), [&](std::size_t first, std::size_t last) {
+        for (auto o = first; o < last; ++o)
+            output[o] = dot.run(matrix.data() + o * width, input.data() + (o / group_rows) * width,
+                                static_cast<std::uint32_t>(width));
+    });
+}
+
 class OrderedLinearBatch {
 public:
     OrderedLinearBatch(const std::vector<std::vector<float>>& rows, const OrderedFma& kernel)

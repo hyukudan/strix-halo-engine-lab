@@ -33,7 +33,8 @@ struct CompressedMqaInputs {
 // pooled values to the local frame, retaining one common softmax.
 inline std::vector<float> compressed_mqa_reference(const CompressedMqaStep& step, const CompressedMqaInputs& in,
     const RotaryReferenceRow& window_rope, const RotaryReferenceRow& compressed_rope,
-    const attn::CompressedReferenceHistory& state, const attn::ReferenceHeadExecutor& execute = {}) {
+    const attn::CompressedReferenceHistory& state, const attn::ReferenceHeadExecutor& execute = {},
+    attn::ReferenceOrder order = attn::ReferenceOrder::sequential) {
     std::vector<float> compressed_query(in.query.begin(), in.query.end());
     window_rope.apply(in.query, step.width);
     window_rope.apply(in.key, step.width);
@@ -60,6 +61,8 @@ inline std::vector<float> compressed_mqa_reference(const CompressedMqaStep& step
 
     std::vector<float> heads(in.query.size());
     if (!step.record_history) {
+        if (order == attn::ReferenceOrder::declared)
+            throw std::invalid_argument("compressed attention: the declared order needs the recorded history");
         std::vector<float> keys(step.width), values(step.width);
         const auto heads_count = static_cast<unsigned>(in.sinks.size());
         causal_gqa_reference({heads_count, 1, step.width},
@@ -87,7 +90,7 @@ inline std::vector<float> compressed_mqa_reference(const CompressedMqaStep& step
     };
     hybrid_mqa_reference({step.width, in.query, compressed_query, in.sinks},
         mask::window_count(step.position, step.window), compressed_count, window_at, window_value, pooled_key,
-        pooled_value, heads, execute);
+        pooled_value, heads, execute, order);
     return heads;
 }
 

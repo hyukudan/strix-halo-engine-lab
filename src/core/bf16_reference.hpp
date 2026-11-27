@@ -1,10 +1,14 @@
 #pragma once
 
 #include "core/linear_reference.hpp"
+#include "ops/norm/reference.hpp"
+#include "strix/attn/reference_order.hpp"
+#include "strix/numeric/declared.hpp"
 #include "strix/attn/group_indexer.hpp"
 #include "strix/attn/group_pool.hpp"
 
 #include <algorithm>
+#include <array>
 #include <numeric>
 #include <vector>
 
@@ -40,11 +44,26 @@ inline void softmax_bf16_reference(std::span<float> row) {
     round_bf16_reference(row);
 }
 
-// Shared float storage with explicit BF16 rounding boundaries.
+// 1 / sqrt(sum of squares / n + eps) with the sum in the device row norm's order: 256 lane-strided fused chains and the
+// halving tree (ops::norm::lane_strided_square_sum), the declared square root. The factor of a device norm that runs the
+// parallel row form with a declared-root trait (ops/norm rms_bf16_rows.hpp Bf16DeclaredSqrt*Traits).
+inline float rms_inv_lane_tree(std::span<const float> row, float epsilon) {
+    constexpr unsigned lanes = 256U;
+    std::array<float, lanes> scratch{};
+    const auto n = static_cast<unsigned>(row.size());
+    const float ss = ops::norm::lane_strided_square_sum<ops::norm::SquareForm::fma>(row.data(), n, lanes, scratch.data());
+    return 1.0F / numeric::declared_sqrt(ss / static_cast<float>(n) + epsilon);
+}
+
+// Shared float storage with explicit BF16 rounding boundaries. order: sequential = the serial FMA chain (default);
+// declared = rms_inv_lane_tree.
 inline void rms_norm_bf16_reference(std::span<float> row, std::span<const float> gain, float epsilon,
-                                   bool round_numerator = false) {
+                                   bool round_numerator = false,
+                                   attn::ReferenceOrder order = attn::ReferenceOrder::sequential) {
     if (row.empty() || gain.size() != row.size()) throw std::invalid_argument("BF16 RMSNorm: invalid row shape");
-    const float inv = attn::group_pool::rms_inv(row.data(), static_cast<unsigned>(row.size()), epsilon);
+    const float inv = order == attn::ReferenceOrder::declared
+        ? rms_inv_lane_tree(row, epsilon)
+        : attn::group_pool::rms_inv(row.data(), static_cast<unsigned>(row.size()), epsilon);
     if (round_numerator) round_bf16_reference(row);
     for (std::size_t i = 0; i < row.size(); ++i) row[i] = (row[i] * inv) * gain[i];
     round_bf16_reference(row);

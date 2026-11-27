@@ -3,10 +3,12 @@
 #include "strix/attn/reference_executor.hpp"
 
 #include "attn_core/causal_gqa_reference.hpp"
+#include "attn_core/declared_order_reference.hpp"
 #include "attn_core/reference_cache.hpp"
 #include "core/linear_reference.hpp"
 #include "strix/attn/group_pool.hpp"
 #include "strix/attn/reference_history.hpp"
+#include "strix/attn/reference_order.hpp"
 
 #include <functional>
 
@@ -103,7 +105,8 @@ inline void latent_key_inverse_rms_reference(SelectedLatentShape s, SelectedLate
 template<class RowAt>
 void selected_latent_attention_reference(SelectedLatentShape s, SelectedLatentProjection kv,
     std::span<const float> query, std::span<const float> sinks, std::span<const std::uint32_t> selected,
-    RowAt row_at, std::span<float> output, const LatentHeadExecutor& execute = {}) {
+    RowAt row_at, std::span<float> output, const LatentHeadExecutor& execute = {},
+    attn::ReferenceOrder order = attn::ReferenceOrder::sequential, unsigned key_align = 0) {
     if (s.qk() == 0 || s.latent == 0 || s.heads == 0 || query.size() != std::size_t{s.heads} * s.qk() ||
         output.size() != std::size_t{s.heads} * s.value || sinks.size() != s.heads || selected.empty())
         throw std::invalid_argument("latent attention: invalid selected attention geometry");
@@ -113,21 +116,49 @@ void selected_latent_attention_reference(SelectedLatentShape s, SelectedLatentPr
         for (auto h = first; h < last; ++h) {
             const auto q = query.subspan(h * s.qk(), s.qk());
             const auto w = kv.key(h);
-            for (std::size_t d = 0; d < s.latent; ++d) {
-                float sum = 0.0F;
-                for (std::size_t i = 0; i < s.nope; ++i) sum = std::fma(q[i], w[i * s.latent + d], sum);
-                q_latent[d] = sum;
+            if (order == attn::ReferenceOrder::declared) {
+                // Declared order: the device absorbs head h's plain-key rows into one row-sweep row of `padded` inputs,
+                // the rows starting at their offset `pad` inside the key_align block (zeros elsewhere).
+                const std::size_t align = key_align == 0U ? 16U : key_align;
+                const std::size_t pad = key_align == 0U ? 0U : (h * (s.nope + s.value)) % key_align;
+                const std::size_t padded = (pad + s.nope + align - 1U) / align * align;
+                std::vector<float> wrow(padded), xrow(padded, 0.0F);
+                std::copy(q.begin(), q.begin() + static_cast<std::ptrdiff_t>(s.nope), xrow.begin() + static_cast<std::ptrdiff_t>(pad));
+                for (std::size_t d = 0; d < s.latent; ++d) {
+                    std::ranges::fill(wrow, 0.0F);
+                    for (std::size_t i = 0; i < s.nope; ++i) wrow[pad + i] = w[i * s.latent + d];
+                    q_latent[d] = declared_order::row_sweep_dot(wrow.data(), xrow.data(), static_cast<std::uint32_t>(padded));
+                }
+            } else {
+                for (std::size_t d = 0; d < s.latent; ++d) {
+                    float sum = 0.0F;
+                    for (std::size_t i = 0; i < s.nope; ++i) sum = std::fma(q[i], w[i * s.latent + d], sum);
+                    q_latent[d] = sum;
+                }
             }
             const auto value_at = [&](std::size_t i) { return row_at(selected[i]).latent; };
             const auto score_at = [&](std::size_t i) {
                 const auto row = row_at(selected[i]);
+                if (order == attn::ReferenceOrder::declared)  // the latent and rotary columns are one lane-tree row
+                    return declared_order::lane_tree_dot(q_latent, row.latent, q.last(s.rotary), row.rotary_key,
+                                                         ((s.latent + s.rotary + 255U) / 256U) * 256U) * row.inverse_rms[h];
                 const float plain = core::dot_f32(q_latent, row.latent);
                 const float rotated = core::dot_f32(q.last(s.rotary), row.rotary_key);
                 return (plain + rotated) * row.inverse_rms[h] * scale;
             };
             std::ranges::fill(o_latent, 0.0F);
-            detail::causal_fp32_head(o_latent, selected.size(), sinks[h], score_at, value_at);
-            core::linear_reference(kv.value(h), o_latent, output.subspan(h * s.value, s.value));
+            if (order == attn::ReferenceOrder::declared)
+                declared_order::sink_head(o_latent, selected.size(), sinks[h], scale, score_at, value_at);
+            else
+                detail::causal_fp32_head(o_latent, selected.size(), sinks[h], score_at, value_at);
+            if (order == attn::ReferenceOrder::declared) {
+                const auto values = kv.value(h);
+                for (std::size_t e = 0; e < s.value; ++e)
+                    output[h * s.value + e] = declared_order::row_sweep_dot(values.data() + e * s.latent, o_latent.data(),
+                                                                           static_cast<std::uint32_t>(s.latent));
+            } else {
+                core::linear_reference(kv.value(h), o_latent, output.subspan(h * s.value, s.value));
+            }
         }
     };
     if (execute) execute(s.heads, work);

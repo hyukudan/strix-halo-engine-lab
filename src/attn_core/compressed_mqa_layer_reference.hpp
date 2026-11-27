@@ -34,6 +34,7 @@ struct CompressedMqaLayerShape {
     OutputRope output_rope;    // where the inverse rotary of the output heads is applied
     FoldForm fold;
     core::SigmoidGatePrecision gate_precision;
+    attn::ReferenceOrder order = attn::ReferenceOrder::sequential; // arithmetic order of the norms and the head reduction
 };
 
 // rotary(dim, position, compressed) -> RotaryReferenceRow
@@ -50,12 +51,12 @@ std::vector<float> compressed_mqa_layer_reference(const Weights& w, const Compre
 
     std::vector<float> q_lora(s.q_rank), query(std::size_t{s.heads} * width), kv(width);
     w.linear(r.q_down, input, q_lora, 1U);
-    core::rms_norm_bf16_reference(q_lora, w.tensor(r.q_norm, q_lora.size()), s.eps);
+    order_rms_norm_bf16_reference(s.order, q_lora, w.tensor(r.q_norm, q_lora.size()), s.eps);
     w.linear(r.q_up, q_lora, query, 1U);
     w.linear(r.kv_proj, input, kv, 1U);
-    core::rms_norm_bf16_reference(kv, w.tensor(r.kv_norm, kv.size()), s.eps);
-    attn::head_rms_reference(query, width, s.eps);
-    if (s.key_norm == HeadNorm::head_rms) attn::head_rms_reference(kv, width, s.eps);
+    order_rms_norm_bf16_reference(s.order, kv, w.tensor(r.kv_norm, kv.size()), s.eps);
+    order_head_rms_reference(s.order, query, width, s.eps);
+    if (s.key_norm == HeadNorm::head_rms) order_head_rms_reference(s.order, kv, width, s.eps);
 
     std::vector<float> carry_value, carry_logit, pooled;
     if (keep_compressor) {
@@ -71,14 +72,14 @@ std::vector<float> compressed_mqa_layer_reference(const Weights& w, const Compre
         pooled.resize(width);
         projected_ape_pool_reference<Ratio>(state.carry_values, state.carry_logits, carry_value, carry_logit,
             w.tensor(r.compressor_ape, std::size_t{Ratio} * width), pooled);
-        core::rms_norm_bf16_reference(pooled, w.tensor(r.compressor_norm, width), s.eps);
+        order_rms_norm_bf16_reference(s.order, pooled, w.tensor(r.compressor_norm, width), s.eps);
         rotary(s.rope_dim, position + 1U - Ratio, true).apply(pooled, width);
         if (bf16) core::round_bf16_reference(pooled);
     }
 
     const auto sinks = w.tensor(r.sink, s.heads);
     const CompressedMqaInputs operands{query, kv, {}, sinks, carry_value, carry_logit, pooled};
-    auto heads = compressed_mqa_reference(step, operands, window_rope, compressed_rope, state, execute);
+    auto heads = compressed_mqa_reference(step, operands, window_rope, compressed_rope, state, execute, s.order);
     if (bf16) core::round_bf16_reference(heads);
     if (s.output_rope == OutputRope::before_mix) window_rope.apply(heads, width, true);
     value_head_postmix_reference(w, r.mix, s.heads, s.vha_rank, s.fold, heads, folded_mix, execute);

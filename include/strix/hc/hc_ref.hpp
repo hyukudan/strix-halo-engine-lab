@@ -3,6 +3,7 @@
 // Host oracle of the hyper-connection contract (hc_contract.hpp): the reference every device body is compared
 // against. Streams and outputs are FP32 values; with Store::bf16 they carry bfloat16 values (rounded by the oracle).
 
+#include "strix/attn/reference_order.hpp"
 #include "strix/hc/hc_contract.hpp"
 
 #include <cstdint>
@@ -38,7 +39,7 @@ void collapse(const Spec& spec, std::span<const float> streams, std::span<const 
 // numerator sees the store in both cases and the normalized output is BF16.
 void collapse_rms_bf16(const Spec& spec, std::span<const float> streams, std::span<const float> pre,
                        std::span<const float> gain, float epsilon, CollapseVariance variance,
-                       std::span<float> out);
+                       std::span<float> out, attn::ReferenceOrder order = attn::ReferenceOrder::sequential);
 // out[k][i] = expand_at(...) for k < streams, i < hidden (sublayer sites only).
 void expand(const Spec& spec, std::span<const float> sub, std::span<const float> residual, const Mix& mix,
             std::span<float> out);

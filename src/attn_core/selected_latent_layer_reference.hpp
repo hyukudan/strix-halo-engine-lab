@@ -43,6 +43,8 @@ struct SelectedLatentLayerShape {
     bool weighted_index_scoring;  // scale/prefill-mix the head weights and weighted top-k; off adds gate+bias
     FoldForm fold;
     core::SigmoidGatePrecision gate_precision;
+    attn::ReferenceOrder order = attn::ReferenceOrder::sequential; // arithmetic order of the norms and the head reduction
+    unsigned key_align = 0; // declared order: block alignment of each head's plain-key rows in the absorbed row (0 = none)
     // One packed index key (E2M1 pairs plus one scale byte per 32 elements).
     [[nodiscard]] unsigned packed_index_bytes() const { return index_dim / 2U + index_dim / 32U; }
 };
@@ -101,11 +103,11 @@ std::vector<float> selected_latent_layer_reference(const Weights& w, const Selec
     const auto rotary_key = std::span(combined).last(shape.rotary);
     const bool bf16 = s.store == StorePrecision::bf16;
     w.linear(r.q_down, input, q_lora, 1U);
-    core::rms_norm_bf16_reference(q_lora, w.tensor(r.q_norm, q_lora.size()), s.eps);
+    order_rms_norm_bf16_reference(s.order, q_lora, w.tensor(r.q_norm, q_lora.size()), s.eps);
     w.linear(r.q_up, q_lora, query, 1U);
-    if (s.query_norm == HeadNorm::head_rms) attn::head_rms_reference(query, shape.qk(), s.eps);
+    if (s.query_norm == HeadNorm::head_rms) order_head_rms_reference(s.order, query, shape.qk(), s.eps);
     w.linear(r.kv_down, input, combined, 1U);
-    core::rms_norm_bf16_reference(latent, w.tensor(r.kv_norm, latent.size()), s.eps);
+    order_rms_norm_bf16_reference(s.order, latent, w.tensor(r.kv_norm, latent.size()), s.eps);
 
     const auto kv_b = w.tensor(r.kv_up, std::size_t{shape.heads} * (shape.nope + shape.value) * shape.latent);
     const auto projections = split_latent_projection(shape, kv_b, false);
@@ -135,7 +137,7 @@ std::vector<float> selected_latent_layer_reference(const Weights& w, const Selec
         return row == position ? current : cached_latent_row(shape, row, state);
     };
     selected_latent_attention_reference(shape, projections, query, w.tensor(r.softmax_offset, shape.heads), selected,
-                                        row_at, output_heads, execute);
+                                        row_at, output_heads, execute, s.order, s.key_align);
     if (bf16) core::round_bf16_reference(output_heads);
     value_head_postmix_reference(w, r.mix, shape.heads, s.vha_rank, s.fold, output_heads,
                                  folded_mix, execute);

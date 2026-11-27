@@ -6,15 +6,37 @@
 // names of its checkpoint; nothing here knows a model.
 
 #include "attn_core/value_head_mix_reference.hpp"
+#include "attn_core/declared_order_reference.hpp"
 #include "core/bf16_reference.hpp"
+#include "strix/attn/head_rms_reference.hpp"
+#include "strix/attn/reference_order.hpp"
 #include "strix/attn/reference_executor.hpp"
 
 #include <cstdint>
 #include <span>
+#include <stdexcept>
 #include <string_view>
 #include <vector>
 
 namespace strix::attn_core {
+
+// The layer norms of the reference under the chosen order: sequential = core::rms_norm_bf16_reference /
+// attn::head_rms_reference (the shared defaults, unchanged); declared = the device's lane-strided halving sums.
+inline void order_rms_norm_bf16_reference(attn::ReferenceOrder order, std::span<float> row, std::span<const float> gain,
+                                          float epsilon) {
+    core::rms_norm_bf16_reference(row, gain, epsilon, false, order);
+}
+
+inline void order_head_rms_reference(attn::ReferenceOrder order, std::span<float> heads, unsigned head_width, float epsilon) {
+    if (order == attn::ReferenceOrder::sequential) return attn::head_rms_reference(heads, head_width, epsilon);
+    if (head_width == 0 || heads.empty() || heads.size() % head_width != 0 || !(epsilon > 0.0F))
+        throw std::invalid_argument("head RMSNorm: invalid shape or epsilon");
+    for (std::size_t i = 0; i < heads.size(); i += head_width) {
+        const auto head = heads.subspan(i, head_width);
+        const float inv = declared_order::rms_inv(head, epsilon);
+        for (float& value : head) value *= inv;
+    }
+}
 
 struct ValueHeadMixRoles {
     std::string_view output_factor, input_factor;
