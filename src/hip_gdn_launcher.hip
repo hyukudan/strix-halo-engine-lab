@@ -1277,207 +1277,6 @@ __device__ __forceinline__ constexpr std::size_t recurrent_layout_index(
         lane, column);
 }
 
-template <gdn_recurrent_layout_diagnostic::Layout Layout>
-__global__ __launch_bounds__(kRecurrentThreads)
-void recurrent_layout_diagnostic_kernel(
-    const float* qkv,
-    const float* beta,
-    const float* gate,
-    float* state,
-    float* core,
-    std::uint32_t key_heads,
-    std::uint32_t value_heads,
-    std::uint32_t head_dim, std::uint32_t* graph_status) {
-    __shared__ unsigned graph_reject;
-    if (graph_status != nullptr) {
-        if (threadIdx.x == 0) graph_reject = atomicAdd(graph_status, 0U) != 0;
-        __syncthreads();
-        if (graph_reject) return;
-    }
-    const auto tile_count =
-        head_dim /
-        kValueTile;
-    const auto block =
-        static_cast<std::uint32_t>(
-            blockIdx.x);
-    const auto value_head =
-        block /
-        tile_count;
-    const auto tile =
-        block %
-        tile_count;
-    const auto lane =
-        static_cast<std::uint32_t>(
-            threadIdx.x);
-
-    if (value_head >= value_heads ||
-        lane >= head_dim) {
-        return;
-    }
-
-    const auto key_head =
-        value_head %
-        key_heads;
-    const auto value_base =
-        tile *
-        kValueTile;
-
-    const auto q_base =
-        static_cast<std::uint64_t>(
-            key_head) *
-        head_dim;
-    const auto k_base =
-        static_cast<std::uint64_t>(
-            key_heads) *
-            head_dim +
-        q_base;
-    const auto v_base =
-        static_cast<std::uint64_t>(
-            key_heads) *
-            head_dim *
-            2ULL +
-        static_cast<std::uint64_t>(
-            value_head) *
-            head_dim;
-
-    __shared__ float reduction[
-        kRecurrentThreads *
-        (Layout == gdn_recurrent_layout_diagnostic::Layout::stride33 ? 33U : kValueTile)];
-    // The first reduction's broadcast must remain immutable while every wave
-    // reads it. Reusing reduction[column] for the next tree lets lane zero
-    // overwrite a delta before another wave has consumed it.
-    __shared__ float deltas[kValueTile];
-
-    float retained[kValueTile];
-#pragma unroll
-    for (std::uint32_t column = 0;
-         column < kValueTile;
-         ++column) {
-        const auto value_index =
-            value_base +
-            column;
-        const auto state_index =
-            (static_cast<std::uint64_t>(
-                 value_head) *
-                 head_dim +
-             lane) *
-                head_dim +
-            value_index;
-        retained[column] =
-            state[state_index] *
-            expf(
-                gate[value_head]);
-        reduction[recurrent_layout_index<Layout>(lane, column)] =
-            retained[column] *
-            qkv[
-                k_base +
-                lane];
-    }
-    __syncthreads();
-
-    for (std::uint32_t stride =
-             kRecurrentThreads / 2U;
-         stride > 0;
-         stride >>= 1U) {
-        if (lane < stride) {
-#pragma unroll
-            for (std::uint32_t column = 0;
-                 column < kValueTile;
-                 ++column) {
-                reduction[recurrent_layout_index<Layout>(lane, column)] +=
-                    reduction[recurrent_layout_index<Layout>(lane + stride, column)];
-            }
-        }
-        __syncthreads();
-    }
-
-    if (lane == 0) {
-#pragma unroll
-        for (std::uint32_t column = 0;
-             column < kValueTile;
-             ++column) {
-            const auto value_index =
-                value_base +
-                column;
-            deltas[column] =
-                (qkv[
-                     v_base +
-                     value_index] -
-                 reduction[recurrent_layout_index<Layout>(0U, column)]) *
-                beta[value_head];
-        }
-    }
-    __syncthreads();
-
-#pragma unroll
-    for (std::uint32_t column = 0;
-         column < kValueTile;
-         ++column) {
-        const auto delta =
-            deltas[column];
-        retained[column] +=
-            qkv[
-                k_base +
-                lane] *
-            delta;
-        reduction[recurrent_layout_index<Layout>(lane, column)] =
-            retained[column] *
-            qkv[
-                q_base +
-                lane];
-    }
-    __syncthreads();
-
-    for (std::uint32_t stride =
-             kRecurrentThreads / 2U;
-         stride > 0;
-         stride >>= 1U) {
-        if (lane < stride) {
-#pragma unroll
-            for (std::uint32_t column = 0;
-                 column < kValueTile;
-                 ++column) {
-                reduction[recurrent_layout_index<Layout>(lane, column)] +=
-                    reduction[recurrent_layout_index<Layout>(lane + stride, column)];
-            }
-        }
-        __syncthreads();
-    }
-
-    if (lane == 0) {
-#pragma unroll
-        for (std::uint32_t column = 0;
-             column < kValueTile;
-             ++column) {
-            core[
-                static_cast<std::uint64_t>(
-                    value_head) *
-                    head_dim +
-                value_base +
-                column] =
-                reduction[recurrent_layout_index<Layout>(0U, column)];
-        }
-    }
-
-#pragma unroll
-    for (std::uint32_t column = 0;
-         column < kValueTile;
-         ++column) {
-        const auto value_index =
-            value_base +
-            column;
-        const auto state_index =
-            (static_cast<std::uint64_t>(
-                 value_head) *
-                 head_dim +
-             lane) *
-                head_dim +
-            value_index;
-        state[state_index] =
-            retained[column];
-    }
-}
-
 template <gdn_recurrent_layout_diagnostic::Layout Layout,
     GdnRecurrentStorage Storage = GdnRecurrentStorage::key_value>
 __global__ __launch_bounds__(kRecurrentThreads)
@@ -3197,25 +2996,13 @@ void emit_gdn_recurrent_layout(const PreparedGdnLaunch& row, HipGdnRecurrentLayo
     switch (layout) {
     case HipGdnRecurrentLayout::baseline:
     case HipGdnRecurrentLayout::stride32:
-        if constexpr (Storage == GdnRecurrentStorage::key_value) {
-            STRIX_GDN_RECURRENT_LAYOUT(HIP_KERNEL_NAME(recurrent_layout_diagnostic_kernel<gdn_recurrent_layout_diagnostic::Layout::stride32>));
-        } else {
-            STRIX_GDN_RECURRENT_LAYOUT(HIP_KERNEL_NAME(recurrent_storage_kernel<gdn_recurrent_layout_diagnostic::Layout::stride32, Storage>));
-        }
+        STRIX_GDN_RECURRENT_LAYOUT(HIP_KERNEL_NAME(recurrent_storage_kernel<gdn_recurrent_layout_diagnostic::Layout::stride32, Storage>));
         break;
     case HipGdnRecurrentLayout::stride33:
-        if constexpr (Storage == GdnRecurrentStorage::key_value) {
-            STRIX_GDN_RECURRENT_LAYOUT(HIP_KERNEL_NAME(recurrent_layout_diagnostic_kernel<gdn_recurrent_layout_diagnostic::Layout::stride33>));
-        } else {
-            STRIX_GDN_RECURRENT_LAYOUT(HIP_KERNEL_NAME(recurrent_storage_kernel<gdn_recurrent_layout_diagnostic::Layout::stride33, Storage>));
-        }
+        STRIX_GDN_RECURRENT_LAYOUT(HIP_KERNEL_NAME(recurrent_storage_kernel<gdn_recurrent_layout_diagnostic::Layout::stride33, Storage>));
         break;
     case HipGdnRecurrentLayout::transposed:
-        if constexpr (Storage == GdnRecurrentStorage::key_value) {
-            STRIX_GDN_RECURRENT_LAYOUT(HIP_KERNEL_NAME(recurrent_layout_diagnostic_kernel<gdn_recurrent_layout_diagnostic::Layout::transposed>));
-        } else {
-            STRIX_GDN_RECURRENT_LAYOUT(HIP_KERNEL_NAME(recurrent_storage_kernel<gdn_recurrent_layout_diagnostic::Layout::transposed, Storage>));
-        }
+        STRIX_GDN_RECURRENT_LAYOUT(HIP_KERNEL_NAME(recurrent_storage_kernel<gdn_recurrent_layout_diagnostic::Layout::transposed, Storage>));
         break;
     default:
         throw std::invalid_argument("GDN recurrent LDS candidate is invalid");
@@ -6362,7 +6149,7 @@ void validate_island_graph(hipGraph_t graph, const GdnKernelLedger& ledger,
     });
     const auto recurrent_symbol = config.recurrent_layout == HipGdnRecurrentLayout::baseline
         ? step_symbol
-        : reinterpret_cast<const void*>(recurrent_layout_diagnostic_kernel<gdn_recurrent_layout_diagnostic::Layout::transposed>);
+        : reinterpret_cast<const void*>(recurrent_storage_kernel<gdn_recurrent_layout_diagnostic::Layout::transposed>);
     for (const auto& expected : ledger) {
         std::size_t selected = count;
         for (std::size_t i = 0; i < count; ++i) {
@@ -6865,11 +6652,11 @@ const void* kernel_symbol(Layout layout) {
     case Layout::reference:
         return reinterpret_cast<const void*>(recurrent_step_kernel<RecurrentStateType::f32>);
     case Layout::stride32:
-        return reinterpret_cast<const void*>(recurrent_layout_diagnostic_kernel<Layout::stride32>);
+        return reinterpret_cast<const void*>(recurrent_storage_kernel<Layout::stride32>);
     case Layout::stride33:
-        return reinterpret_cast<const void*>(recurrent_layout_diagnostic_kernel<Layout::stride33>);
+        return reinterpret_cast<const void*>(recurrent_storage_kernel<Layout::stride33>);
     case Layout::transposed:
-        return reinterpret_cast<const void*>(recurrent_layout_diagnostic_kernel<Layout::transposed>);
+        return reinterpret_cast<const void*>(recurrent_storage_kernel<Layout::transposed>);
     }
     throw std::invalid_argument("invalid GDN recurrent diagnostic layout");
 }
@@ -6891,11 +6678,11 @@ void enqueue(Shape shape, const Bindings& bindings, Layout layout, hipStream_t s
     switch (layout) {
     case Layout::reference: STRIX_RECURRENT_LAYOUT_LAUNCH(recurrent_step_kernel<RecurrentStateType::f32>); break;
     case Layout::stride32:
-        STRIX_RECURRENT_LAYOUT_LAUNCH(HIP_KERNEL_NAME(recurrent_layout_diagnostic_kernel<Layout::stride32>)); break;
+        STRIX_RECURRENT_LAYOUT_LAUNCH(HIP_KERNEL_NAME(recurrent_storage_kernel<Layout::stride32>)); break;
     case Layout::stride33:
-        STRIX_RECURRENT_LAYOUT_LAUNCH(HIP_KERNEL_NAME(recurrent_layout_diagnostic_kernel<Layout::stride33>)); break;
+        STRIX_RECURRENT_LAYOUT_LAUNCH(HIP_KERNEL_NAME(recurrent_storage_kernel<Layout::stride33>)); break;
     case Layout::transposed:
-        STRIX_RECURRENT_LAYOUT_LAUNCH(HIP_KERNEL_NAME(recurrent_layout_diagnostic_kernel<Layout::transposed>)); break;
+        STRIX_RECURRENT_LAYOUT_LAUNCH(HIP_KERNEL_NAME(recurrent_storage_kernel<Layout::transposed>)); break;
     }
 #undef STRIX_RECURRENT_LAYOUT_LAUNCH
     check_hip(hipGetLastError(), "GDN recurrent diagnostic launch");

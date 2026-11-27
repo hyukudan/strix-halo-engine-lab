@@ -151,7 +151,7 @@ model-kernel src/hip_ds41_trellis.hip 1
 model-kernel src/hip_ds41_trellis_group.hip 2
 model-kernel src/hip_gdn_decode_fuse.inc 2
 model-kernel src/hip_gdn_fp16_chunk.inc 3
-model-kernel src/hip_gdn_launcher.hip 26
+model-kernel src/hip_gdn_launcher.hip 25
 model-kernel src/hip_gdn_prefill_scan.inc 2
 model-kernel src/hip_gdn_qpf2k_prefill.inc 8
 model-kernel src/hip_hc_fast_wmma.inc 6
