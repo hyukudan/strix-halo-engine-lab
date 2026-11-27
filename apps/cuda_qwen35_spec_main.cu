@@ -3,6 +3,7 @@
 // CUDA engine. Verifies output == serial decode token for token, reports accepted tokens per step (mean/p50/p90), tok/s
 // average and best 1 s window, and the engine cost table verify_ms(R) / MTP ms / lm_head share.
 // Home: specific (CLI binding of the qwen35 engine); drafting logic in src/spec (shared), glue in qwen35/cuda_spec.hpp.
+#include <iostream>
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -600,6 +601,7 @@ int main(int argc, char** argv) {
                             (unsigned long long)(S.chain_rows() - rows0), (unsigned long long)(S.chain_kv_calls() - kv0));
                 std::printf("prelaunch[%s]: %s, pre-launched steps %llu of %zu\n", tag.c_str(), prelaunch ? "on" : "off",
                             (unsigned long long)spec.prelaunched_steps(), per_step.size());
+                spec.report_all_on(std::cerr);  // --all-on: a requested pre-launch no step ran (once per process)
                 const double steps_n = double(std::max<std::size_t>(per_step.size(), 1));
                 std::string hist;
                 for (std::size_t k = 1; k < k_hist.size(); ++k)

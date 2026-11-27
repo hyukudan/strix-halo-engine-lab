@@ -64,6 +64,7 @@
 #include <cstring>
 #include <exception>
 #include <functional>
+#include <iostream>
 #include <map>
 #include "strix/recurrent_state_policy.hpp"
 #include <limits>
@@ -1446,6 +1447,10 @@ Prefill::Prefill(const Config& config) : impl_(std::make_unique<Impl>()) {
             ck(cudaEventCreateWithFlags(&m.layer_done[l], cudaEventDisableTiming), "layer event");
             ck(cudaEventCreateWithFlags(&m.copy_done[l], cudaEventDisableTiming), "copy event");
         }
+    }
+    {   // --all-on record, once per process: the switch is read only by the decode entries
+        static const bool all_on_record = strix::spec::all_on_commit_async("STRIX_QRTX_COMMIT_ASYNC", config.decode, std::cerr);
+        (void)all_on_record;
     }
     if (config.decode) {
         m.commit_tail.enabled = strix::envcfg::flag("STRIX_QRTX_COMMIT_ASYNC", false);

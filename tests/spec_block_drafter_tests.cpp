@@ -3,6 +3,7 @@
 // target's committed length equals prompt + emitted - 1 (the anchor is never committed). Costs are a virtual clock.
 #include "strix/spec/block_drafter.hpp"
 
+#include <sstream>
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -429,6 +430,32 @@ void tree_unit_tests() {
 
 int tree_tests() {
     tree_unit_tests();
+    {  // --all-on record of a requested pre-launch that no step ran (report_prelaunch_all_on)
+#if defined(_WIN32)
+        (void)_putenv_s("STRIX_ALL_ON_LEVERS", "qwen_rtx_spec_prelaunch:--prelaunch");
+#else
+        (void)setenv("STRIX_ALL_ON_LEVERS", "qwen_rtx_spec_prelaunch:--prelaunch", 1);
+#endif
+        const auto line = [](const char* why) {
+            return std::string("all-on: lever qwen_rtx_spec_prelaunch source=all-on applied=no reason=") + why + "\n";
+        };
+        const auto text = [](bool requested, std::uint64_t steps, std::uint64_t pre, std::uint64_t sampled, std::uint64_t tree) {
+            std::ostringstream o;
+            sp::report_prelaunch_all_on(requested, steps, pre, sampled, tree, o);
+            return o.str();
+        };
+        BD_CHECK(text(true, 9, 9, 0, 0).empty() && text(true, 9, 1, 0, 0).empty(), "engaged pre-launch records nothing");
+        BD_CHECK(text(false, 9, 0, 0, 0).empty() && text(true, 0, 0, 0, 0).empty(), "not requested / no step records nothing");
+        BD_CHECK(text(true, 9, 0, 9, 0) == line("sampled verification reads the drafted ids on the host"), "sampled record");
+        BD_CHECK(text(true, 9, 0, 0, 9) ==
+                     line("token-tree verification places sibling rows after the drafted ids are read"), "tree record");
+        BD_CHECK(text(true, 9, 0, 0, 0) == line("the draft chain or verify target cannot pre-launch"), "chain/target record");
+#if defined(_WIN32)
+        (void)_putenv_s("STRIX_ALL_ON_LEVERS", "");
+#else
+        (void)unsetenv("STRIX_ALL_ON_LEVERS");
+#endif
+    }
     {  // verify pre-launch + token tree: a tree target is never offered a pre-launch (its siblings are placed after the
        // chain ids are read); a linear target is. Either way the ids and blocks equal the run without pre-launch.
         const auto w = make_world("prose", 40, 600, 71);

@@ -9,6 +9,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <random>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -112,6 +113,18 @@ int main() {
         check(!on.draft_replay_ok(false, true), "on: other in-flight work stops it");
         on.synced();
         check(!on.pending && !on.draft_replay_ok(false, false), "synced: busy stream with no tail is not vouched for");
+    }
+    {  // --all-on record: an entry with no decode steps declines an exported switch, and says so
+#if defined(_WIN32)
+        (void)_putenv_s("STRIX_ALL_ON_LEVERS", "qwen_rtx_commit_async:STRIX_QRTX_COMMIT_ASYNC");
+#else
+        (void)setenv("STRIX_ALL_ON_LEVERS", "qwen_rtx_commit_async:STRIX_QRTX_COMMIT_ASYNC", 1);
+#endif
+        std::ostringstream none, line;
+        check(strix::spec::all_on_commit_async("STRIX_QRTX_COMMIT_ASYNC", true, none) && none.str().empty(), "decode entry: engaged, silent");
+        check(!strix::spec::all_on_commit_async("STRIX_QRTX_COMMIT_ASYNC", false, line), "no-decode entry: not engaged");
+        check(line.str() == "all-on: lever qwen_rtx_commit_async source=all-on applied=no reason=this entry runs no decode steps, "
+                            "so no commit is deferred\n", "exact record line");
     }
     for (std::uint32_t seed = 1; seed <= 64; ++seed) {
         const FakeEngine off = run(false, seed, 200);

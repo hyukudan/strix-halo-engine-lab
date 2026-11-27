@@ -43,6 +43,7 @@
 #include <cstdio>
 #include <functional>
 #include <optional>
+#include <ostream>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -50,6 +51,7 @@
 #include <utility>
 #include <vector>
 
+#include "strix/profile/all_on_engaged.hpp"
 #include "strix/spec/drafting.hpp"
 #include "strix/spec/row_rule.hpp"
 
@@ -405,6 +407,21 @@ private:
     std::vector<unsigned char> buf_;
 };
 
+// Why a run that requested pre-launch pre-launched nothing (all_on record): every step sampled, every step a tree
+// target, or the chain / target pair cannot pre-launch (it needs the device-fed draft chain).
+inline const char* prelaunch_decline_reason(std::uint64_t steps, std::uint64_t sampled, std::uint64_t tree) {
+    if (steps != 0 && sampled == steps) return "sampled verification reads the drafted ids on the host";
+    if (steps != 0 && tree == steps) return "token-tree verification places sibling rows after the drafted ids are read";
+    return "the draft chain or verify target cannot pre-launch";
+}
+// Prints the all_on line when `requested` and no step was pre-launched (steps > 0). Each call; BlockSpeculator::report_all_on
+// guards it once per process.
+inline void report_prelaunch_all_on(bool requested, std::uint64_t steps, std::uint64_t prelaunched, std::uint64_t sampled,
+                                    std::uint64_t tree, std::ostream& out) {
+    if (!requested || steps == 0) return;
+    (void)::strix::profile::all_on::engaged("--prelaunch", prelaunched != 0, prelaunch_decline_reason(steps, sampled, tree), out);
+}
+
 class BlockSpeculator {
 public:
     BlockSpeculator(BlockDrafter& drafter, VerifyTarget& target, const RowRule& rule = {})
@@ -416,6 +433,8 @@ public:
     void set_prelaunch(bool on) { prelaunch_ = on; }
     [[nodiscard]] bool prelaunch() const { return prelaunch_; }
     [[nodiscard]] std::uint64_t prelaunched_steps() const { return prelaunched_; }
+    // --all-on record (strix/profile/all_on_engaged.hpp), once per process: pre-launch was requested and no step ran it.
+    void report_all_on(std::ostream& out) const;
     // One step; appends the emitted ids to `out`. Returns the record (emitted == 0: nothing to do).
     StepRecord step(std::vector<std::uint32_t>& out, const StepParams& params);
     [[nodiscard]] std::uint32_t anchor() const { return anchor_; }
@@ -431,6 +450,7 @@ private:
     std::vector<std::uint32_t> rows_, greedy_, host_rows_;
     bool prelaunch_ = false;
     std::uint64_t prelaunched_ = 0;
+    std::uint64_t steps_ = 0, sampled_steps_ = 0, tree_steps_ = 0;  // verified blocks, and those sampled / tree (never pre-launched)
     TreeRows tree_;
 };
 

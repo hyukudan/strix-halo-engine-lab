@@ -17,6 +17,10 @@
 //     the backend cannot vouch for (other_inflight) still does (draft_replay_ok).
 // A device fault in the tail surfaces at the next synchronisation (the draft's read or the verify prologue) and fails
 // that call, as any asynchronous device fault does.
+#include "strix/profile/all_on_engaged.hpp"
+
+#include <ostream>
+
 namespace strix::spec {
 
 struct CommitTail {
@@ -39,5 +43,11 @@ struct CommitTail {
         return stream_idle || (pending && !other_inflight);
     }
 };
+
+// --all-on record of the async switch (env): the tail exists only where decode steps commit, so an entry that runs none
+// (prefill service) does not engage an exported switch. Returns `decode_entry`.
+inline bool all_on_commit_async(std::string_view env, bool decode_entry, std::ostream& out) {
+    return ::strix::profile::all_on::engaged(env, decode_entry, "this entry runs no decode steps, so no commit is deferred", out);
+}
 
 }  // namespace strix::spec

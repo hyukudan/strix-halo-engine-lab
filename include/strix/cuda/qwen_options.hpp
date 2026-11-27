@@ -6,11 +6,14 @@
 #include "strix/cuda/qwen_turbo.hpp"
 #include "strix/profiles/qwen_cuda.hpp"
 #include "strix/env_flags.hpp"
+#include "strix/profile/all_on_engaged.hpp"
 #include "strix/lever.hpp"
 
 #include <algorithm>
 #include <cstdint>
+#include <iostream>
 #include <limits>
+#include <ostream>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -157,6 +160,29 @@ inline void apply(const cp::Choice& choice, qp::Config& config) {
     }
 }
 
+// --all-on records (strix/profile/all_on_engaged.hpp): the switches --all-on exports as arguments of this engine whose
+// resolved value the engine does not run. Pure over the resolved Choice and Config; prints each declined lever it was asked
+// to export (nothing for a switch the user typed by hand). ple_a8 runs on prefill blocks only (decode and verify windows
+// keep the exact projection); that is its phase, not a decline.
+inline void report_all_on(const cp::Choice& choice, const qp::Config& c, std::ostream& out) {
+    namespace ao = ::strix::profile::all_on;
+    (void)ao::engaged("--ple-a8", choice.ple_a8 && c.forms.ple_a8,
+                      "the resolved profile did not select the PLE A8 projection", out);
+    // The wide tile form is a schedule of the BF16 tensor-core GSQ experts: only a run whose experts (or, under the
+    // integer regime, its other-regime experts) are gsq-iq-bf16mma-cuda-v1 reaches it.
+    const bool bf16_experts = c.expert_arithmetic == qwen_packs::ExpertArithmetic::gsq_bf16_mma ||
+                              (c.expert_narrow && *c.expert_narrow == qwen_packs::ExpertArithmetic::gsq_bf16_mma);
+    (void)ao::engaged("--expert-wide-tile", c.expert_wide_tile && bf16_experts,
+                      c.expert_wide_tile ? "the experts are not the BF16 tensor-core form"
+                                         : "the resolved profile did not select the wide tile form", out);
+    // The regime row is read only with the integer experts on; without them every MoE call keeps the other experts.
+    const bool regime = c.expert_arithmetic == qwen_packs::ExpertArithmetic::gsq_i8_turbo && c.expert_narrow.has_value();
+    (void)ao::engaged("--expert-turbo-rows", regime,
+                      c.expert_arithmetic == qwen_packs::ExpertArithmetic::gsq_i8_turbo
+                          ? "the integer experts run in every MoE call (no regime split)"
+                          : "the integer experts are not selected, so no block runs them", out);
+}
+
 inline qp::Config resolve_route(qp::Config config, const pr::Lookup& lookup = {}) {
     if (!config.route_policy) {
         const auto get = [&](const char* key) { return lookup ? lookup(key) : ::strix::envcfg::text(key); };
@@ -224,6 +250,10 @@ inline Resolved resolve(const Request& r, Entry entry, std::string_view default_
         if(c.route_policy->enabled) throw std::invalid_argument(name+": native IQ RouteBF16 composition unqualified");
     }
     out.contract = with_expert_arithmetic(cp::arithmetic_contract(out.choice), c);
+    {  // once per process: the first resolution is the run's
+        static const bool all_on_record = (report_all_on(out.choice, c, std::cerr), true);
+        (void)all_on_record;
+    }
     const auto name = [&](std::string n, std::string v, std::string why) { out.differences.push_back({std::move(n), std::move(v), std::move(why)}); };
     if (entry == Entry::serve) {
         if (r.release_by_layer.value_or(false))

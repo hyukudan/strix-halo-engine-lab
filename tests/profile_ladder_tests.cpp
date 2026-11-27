@@ -4,6 +4,7 @@
 // the cell below it (or a ladder row is malformed).
 #include "strix/engine_profile.hpp"
 #include "strix/cuda/qwen_options.hpp"
+#include <sstream>
 #include "strix/glm_pair_profile_table.hpp"
 #include "strix/deepseek41_pair_profile_table.hpp"
 #include "strix/model_registry.hpp"
@@ -406,6 +407,52 @@ void walk(const p::Engine& registered) {
             }
         }
     }
+}
+
+// --all-on records of the Qwen MoE CUDA engine (qwen_options::report_all_on): a switch exported as an argument that the
+// resolved run does not engage prints one line; an engaged one prints nothing.
+void cuda_all_on_records() {
+    namespace qo = strix::cuda::qwen_options;
+    namespace qpk = strix::qwen_packs;
+    const auto set = [](const char* v) {
+#if defined(_WIN32)
+        (void)_putenv_s("STRIX_ALL_ON_LEVERS", v);
+#else
+        (void)setenv("STRIX_ALL_ON_LEVERS", v, 1);
+#endif
+    };
+    set("qwen_rtx_ple_a8:--ple-a8,qwen_rtx_expert_wide_tile:--expert-wide-tile,qwen_rtx_expert_turbo_int8:--expert-turbo-rows");
+    const auto run = [](const strix::qwen::cuda_profile::Choice& choice, const strix::cuda::qwen_prefill::Config& c) {
+        std::ostringstream out;
+        qo::report_all_on(choice, c, out);
+        return out.str();
+    };
+    const auto line = [](const char* lever, const char* why) {
+        return std::string("all-on: lever ") + lever + " source=all-on applied=no reason=" + why + "\n";
+    };
+    strix::qwen::cuda_profile::Choice none;
+    strix::cuda::qwen_prefill::Config c;  // incumbent experts, nothing selected
+    require(run(none, c) == line("qwen_rtx_ple_a8", "the resolved profile did not select the PLE A8 projection") +
+                line("qwen_rtx_expert_wide_tile", "the resolved profile did not select the wide tile form") +
+                line("qwen_rtx_expert_turbo_int8", "the integer experts are not selected, so no block runs them"),
+            "Qwen CUDA all-on records: nothing selected");
+    strix::qwen::cuda_profile::Choice on;
+    on.ple_a8 = true;
+    c.forms.ple_a8 = true;
+    c.expert_wide_tile = true;  // wide tile over the incumbent experts: no tensor-core form to schedule
+    require(run(on, c) == line("qwen_rtx_expert_wide_tile", "the experts are not the BF16 tensor-core form") +
+                line("qwen_rtx_expert_turbo_int8", "the integer experts are not selected, so no block runs them"),
+            "Qwen CUDA all-on records: wide tile over incumbent experts");
+    c.expert_arithmetic = qpk::ExpertArithmetic::gsq_i8_turbo;
+    c.expert_narrow = qpk::ExpertArithmetic::gsq_bf16_mma;
+    c.expert_regime_min_rows = 512;
+    require(run(on, c).empty(), "Qwen CUDA all-on records: TURBO regime over BF16 experts engages all three");
+    c.expert_narrow.reset();
+    require(run(on, c) == line("qwen_rtx_expert_wide_tile", "the experts are not the BF16 tensor-core form") +
+                line("qwen_rtx_expert_turbo_int8", "the integer experts run in every MoE call (no regime split)"),
+            "Qwen CUDA all-on records: integer experts everywhere");
+    set("");
+    require(run(none, c).empty(), "Qwen CUDA all-on records: a switch typed by hand is not recorded");
 }
 
 void cuda_cli_server() {
@@ -1822,6 +1869,7 @@ int main(int argc, char** argv) try {
     minimax_i4_binding();
     custom_adapters();
     cuda_cli_server();
+    cuda_all_on_records();
     namespace q = strix::qwen;
     namespace qd = strix::qwen35;
     namespace mm = strix::minimax::defaults;

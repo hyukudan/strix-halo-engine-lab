@@ -506,6 +506,12 @@ void BlockSpeculator::set_row_rule(const RowRule& rule) {
     row_rule_ = rule;
 }
 
+void BlockSpeculator::report_all_on(std::ostream& out) const {
+    if (!prelaunch_ || prelaunched_ != 0 || steps_ == 0) return;
+    static const bool once = (report_prelaunch_all_on(prelaunch_, steps_, prelaunched_, sampled_steps_, tree_steps_, out), true);
+    (void)once;
+}
+
 StepRecord BlockSpeculator::step(std::vector<std::uint32_t>& out, const StepParams& params) {
     StepRecord r;
     if (params.remaining == 0 || params.max_rows == 0) return r;
@@ -531,6 +537,9 @@ StepRecord BlockSpeculator::step(std::vector<std::uint32_t>& out, const StepPara
         if (launched_rows != 0) throw std::logic_error("block speculator: verify pre-launched for an empty block");
         return r;
     }
+    ++steps_;
+    if (sampled) ++sampled_steps_;
+    if (p.tree_rows != 0) ++tree_steps_;
     std::uint32_t accepted = 0;
     std::vector<std::uint32_t> emitted;
     double verify_ms = 0.0;
