@@ -2339,12 +2339,15 @@ template <class Site> void launch(const Site& site, bool a8, hipStream_t stream,
     }
 }
 
-// Head rows (strix/decode_head_rows.hpp): the H GEMVs of a head-input Site in ONE launch of the direct kernel, the
-// form launch() takes for the same Site launched per head (rows <= 2 and no Q6P32 copy / A8 / IU4 / staging), so every
-// output has the same loads, products and tree as the per-head launches (bitwise). Site: head_input, head_outputs,
-// input_stride (elements between two heads' input rows), one segment of heads * head_outputs rows.
+// Head rows (strix/decode_head_rows.hpp): the H GEMVs of a head-input Site in ONE launch of the direct kernel (no
+// Q6P32 copy / A8 / IU4 / staging), so every output has the same loads, products and tree as the per-head launches
+// (bitwise). Site: head_input, head_outputs, input_stride (elements between two heads' input rows), one segment of
+// heads * head_outputs rows. Rows 1..8 (verify windows): every (output, row) accumulator visits the same columns in
+// the same order with the same products whatever Rows and Outs are, and the reduce-scatter adds the same operands in
+// the same lane order for any number of pairs, so a row of an R-row launch has the bits of the one-row launch while
+// the weight is read once for all R rows.
 template <class Site> void launch_heads(const Site& site, hipStream_t stream) {
-    static_assert(head_input_of<Site>() && Site::rows <= 2U, "q8_rows heads: 1..2 rows, head-input Site");
+    static_assert(head_input_of<Site>() && Site::rows >= 1U && Site::rows <= 8U, "q8_rows heads: 1..8 rows, head-input Site");
     constexpr unsigned Outs = outs_of<Site, false>();
     const ::strix::decode::HeadRows plan{site.outputs / (site.head_outputs ? site.head_outputs : 1U), site.head_outputs,
                                          site.input_stride};

@@ -96,7 +96,7 @@ struct LinearGroupF32 : StockQ8Arithmetic {
     }
 };
 
-// HeadsF32 over R input rows in one launch (R <= 2 on the shared heads kernel: verify windows of MLA absorb projections):
+// HeadsF32 over R input rows in one launch (R <= 8 on the shared heads kernel: verify windows of MLA absorb projections):
 // row r reads input[r] (head h at + h * input_stride) and stores at out + r * row_stride + head * out_stride + o; each
 // (output, row) value has the bits of HeadsF32 on that row.
 template <unsigned R>
@@ -127,6 +127,46 @@ inline void launch_heads_f32(const std::uint8_t* w, std::uint32_t heads, std::ui
     site.out_stride = y_stride;
     site.out = y;
     launch_heads(site, s);
+}
+
+// launch_heads_f32 over `rows` input rows (row r: x + r * x_row in, y + r * y_row out): ONE launch per window of up to
+// kHeadRowsMax rows, so a verify window reads the head weights once instead of once per row (or per pair of rows).
+// Every (output, row) value has the bits of launch_heads_f32 on that row (launch_heads).
+inline constexpr std::uint32_t kHeadRowsMax = 8U;
+template <unsigned R>
+void launch_heads_window_f32(const std::uint8_t* w, std::uint32_t heads, std::uint32_t width, std::uint32_t head_outputs,
+                             const float* x, std::uint32_t x_stride, std::size_t x_row, float* y, std::uint32_t y_stride,
+                             std::size_t y_row, hipStream_t s) {
+    HeadsRowsF32<R> site{};
+    for (unsigned r = 0; r < R; ++r) site.input[r] = x + r * x_row;
+    site.segments = segments({{w, heads * head_outputs}});
+    site.width = width;
+    site.outputs = heads * head_outputs;
+    site.head_outputs = head_outputs;
+    site.input_stride = x_stride;
+    site.out_stride = y_stride;
+    site.row_stride = y_row;
+    site.out = y;
+    launch_heads(site, s);
+}
+inline void launch_heads_rows_f32(const std::uint8_t* w, std::uint32_t heads, std::uint32_t width, std::uint32_t head_outputs,
+                                  const float* x, std::uint32_t x_stride, std::size_t x_row, float* y, std::uint32_t y_stride,
+                                  std::size_t y_row, std::uint32_t rows, hipStream_t s) {
+    for (std::uint32_t r0 = 0; r0 < rows; r0 += kHeadRowsMax) {
+        const std::uint32_t n = rows - r0 < kHeadRowsMax ? rows - r0 : kHeadRowsMax;
+        const float* xr = x + r0 * x_row;
+        float* yr = y + r0 * y_row;
+        switch (n) {
+        case 1U: launch_heads_f32(w, heads, width, head_outputs, xr, x_stride, yr, y_stride, s); break;
+        case 2U: launch_heads_window_f32<2U>(w, heads, width, head_outputs, xr, x_stride, x_row, yr, y_stride, y_row, s); break;
+        case 3U: launch_heads_window_f32<3U>(w, heads, width, head_outputs, xr, x_stride, x_row, yr, y_stride, y_row, s); break;
+        case 4U: launch_heads_window_f32<4U>(w, heads, width, head_outputs, xr, x_stride, x_row, yr, y_stride, y_row, s); break;
+        case 5U: launch_heads_window_f32<5U>(w, heads, width, head_outputs, xr, x_stride, x_row, yr, y_stride, y_row, s); break;
+        case 6U: launch_heads_window_f32<6U>(w, heads, width, head_outputs, xr, x_stride, x_row, yr, y_stride, y_row, s); break;
+        case 7U: launch_heads_window_f32<7U>(w, heads, width, head_outputs, xr, x_stride, x_row, yr, y_stride, y_row, s); break;
+        default: launch_heads_window_f32<8U>(w, heads, width, head_outputs, xr, x_stride, x_row, yr, y_stride, y_row, s); break;
+        }
+    }
 }
 
 }  // namespace strix::q8_rows
