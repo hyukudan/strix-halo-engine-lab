@@ -622,15 +622,31 @@ public:
             const auto groups = std::span<const MiniResidentAppendGroup>(groups_).subspan(first, rows);
             select_lowbit_cohort(groups, lanes);
             MiniResidentForward forward(backend_, workspace());
-            forward.append_batch(groups, rows,
-                                 embeddings, hidden, [&] {
-                embed(pass_ids, embeddings, rows, kind, lanes);
-            }, [&](MiniConstRows output) {
-                project_head_rows(output.data(), rows, scores.first(std::size_t{rows} * kLogitPitch));
-                greedy_.enqueue_rows(logits, rows, kLogitPitch, stream_.get());
-            }, [&] {
-                for (unsigned row = 0; row < rows; ++row) (void)checked_token(greedy_, row);
-            });
+            const auto pass = [&] {
+                forward.append_batch(groups, rows,
+                                     embeddings, hidden, [&] {
+                    embed(pass_ids, embeddings, rows, kind, lanes);
+                }, [&](MiniConstRows output) {
+                    project_head_rows(output.data(), rows, scores.first(std::size_t{rows} * kLogitPitch));
+                    greedy_.enqueue_rows(logits, rows, kLogitPitch, stream_.get());
+                }, [&] {
+                    for (unsigned row = 0; row < rows; ++row) (void)checked_token(greedy_, row);
+                });
+            };
+            // Lane mode (mini_served_pass_lanes): the pass's lane-stateful stages are one launch over its lanes
+            // (lane r = slot slots[first + r] at its committed position), not one launch per lane.
+            if (mini_served_pass_lanes(hip_eager_lanes_, rows, backend_.admits_eager_lanes())) {
+                cohort_lanes_.clear();
+                for (unsigned row = 0; row < rows; ++row)
+                    cohort_lanes_.push_back({slots[first + row], groups[row].state->committed(), pass_ids[row]});
+                const auto block = exec::make_cohort_step(cohort_lanes_, rows, static_cast<std::uint32_t>(slots_.size()),
+                                                          cohort_context_);
+                backend_.run_eager_lanes(block, cohort_lanes(slots[first], rows), pass);
+                // Receipt witness, once per decoder: the served cohort passes run the lane forms.
+                if (served_lane_passes_++ == 0U) std::cerr << "Inkling HIP served cohort lanes rows=" << rows << '\n';
+            } else {
+                pass();
+            }
             for (unsigned row = 0; row < rows; ++row) picks[row] = greedy_.token(row);
         }, [&] {
             for (const auto& group : groups_) group.state->poison();
@@ -1617,6 +1633,7 @@ private:
     MiniHead head_{};                  // the effective greedy head (set_screened_head / release_screen)
     std::uint64_t screened_picks_{};  // greedy picks that ran screened (note_screened_pick)
     std::uint64_t lanes_picks_{};     // multi-row picks through the lanes screened head (lanes_picks)
+    std::uint64_t served_lane_passes_{};  // served cohort passes run in lane mode (mini_served_pass_lanes)
     std::array<unsigned, kMaxVerifyRows> verify_ids_{}, verify_top_{};
     std::unique_ptr<float, detail::MiniPinnedLogitsDeleter> staged_logits_;
     std::size_t staged_logits_size_{};
@@ -1624,9 +1641,10 @@ private:
     unsigned cohort_context_{};
     std::vector<state::SlotEntry> slot_directory_host_;
 #if defined(__HIPCC__)
-    // Keep the incumbent execution and allocations unless this candidate is explicitly selected.
-    const bool hip_eager_lanes_{strix::envcfg::flag("STRIX_INKLING_HIP_LANES", false)};
-    mini_gpu::Buffer<state::SlotEntry> slot_directory_{hip_eager_lanes_ && !served_cli_route_ ?
+    // Cohort lane mode (EXACT: each lane keeps its one-row step bits), on by default for the served passes and the
+    // incumbent cohort body; STRIX_INKLING_HIP_LANES=0 keeps one launch per lane for those stages.
+    const bool hip_eager_lanes_{strix::envcfg::flag("STRIX_INKLING_HIP_LANES", true)};
+    mini_gpu::Buffer<state::SlotEntry> slot_directory_{hip_eager_lanes_ ?
         std::size_t{kMiniLaneStates} * decode_rows_ : 0U};
 #else
     mini_gpu::Buffer<state::SlotEntry> slot_directory_{std::size_t{kMiniLaneStates} * decode_rows_};
