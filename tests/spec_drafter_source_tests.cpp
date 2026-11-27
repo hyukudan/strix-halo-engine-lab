@@ -76,6 +76,32 @@ int main() {
     check(drafter_receipt("served", {{}, DrafterSource::context, {}}) ==
               "strix-speculation-drafter/v1 route=served source=context file=-",
           "receipt: a context-only route");
+    // A directory drafter (block drafter): present only with its config.json; the same off / explicit rules.
+    const auto block = dir / "dflash2";
+    fs::remove_all(block, error);
+    check(resolve_drafter_dir({.speculating = true}, checkpoint, "dflash2").source == DrafterSource::absent,
+          "directory drafter: absent without the directory");
+    fs::create_directories(block, error);
+    check(resolve_drafter_dir({.speculating = true}, checkpoint, "dflash2").source == DrafterSource::absent,
+          "directory drafter: absent without its config.json");
+    { std::ofstream(block / "config.json") << "{}"; }
+    const auto block_found = resolve_drafter_dir({.speculating = true}, checkpoint, "dflash2");
+    check(block_found.source == DrafterSource::beside_model && fs::path(block_found.path) == block,
+          "directory drafter: found beside the checkpoint");
+    check(drafter_receipt("resident", block_found) ==
+              "strix-speculation-drafter/v1 route=resident source=beside-model file=dflash2",
+          "directory drafter receipt");
+    check(resolve_drafter_dir({}, checkpoint, "dflash2").source == DrafterSource::not_requested,
+          "directory drafter: not looked up without speculation");
+    check(resolve_drafter_dir({.off = true, .speculating = true}, checkpoint, "dflash2").source == DrafterSource::off,
+          "directory drafter: off wins");
+    check(resolve_drafter_dir({.file = "/x/dir", .speculating = true}, checkpoint, "dflash2").source ==
+              DrafterSource::explicit_file,
+          "directory drafter: an explicit directory wins");
+    check(decline_drafter(block_found, "tap visits").source == DrafterSource::rejected,
+          "directory drafter: a found directory can be declined");
+    fs::remove(block / "config.json", error);
+    fs::remove(block, error);
     fs::remove(beside, error);
     fs::remove(dir, error);
     if (failures != 0) {

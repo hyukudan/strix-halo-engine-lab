@@ -64,6 +64,24 @@ struct ResolvedDrafter {
     return {{}, DrafterSource::absent, {}};
 }
 
+// A drafter that is a directory (a block drafter: config.json + its weights), looked for beside the checkpoint under
+// the model's registry name (dir_name, relative to the checkpoint's directory); same rules as resolve_drafter_file.
+// Present = the directory holds config.json; the engine never fetches it.
+[[nodiscard]] inline ResolvedDrafter resolve_drafter_dir(const DrafterRequest& request,
+                                                         const std::filesystem::path& checkpoint,
+                                                         std::string_view dir_name) {
+    if (request.off && !request.file.empty())
+        throw std::invalid_argument("a drafter directory and drafter off are exclusive");
+    if (request.off) return {{}, DrafterSource::off, {}};
+    if (!request.file.empty()) return {std::string(request.file), DrafterSource::explicit_file, {}};
+    if (!request.speculating || dir_name.empty()) return {{}, DrafterSource::not_requested, {}};
+    std::error_code error;
+    const auto beside = checkpoint.parent_path() / std::filesystem::path(dir_name);
+    if (std::filesystem::is_regular_file(beside / "config.json", error))
+        return {beside.string(), DrafterSource::beside_model, {}};
+    return {{}, DrafterSource::absent, {}};
+}
+
 // A sidecar found beside the model that the model's loader cannot use (unreadable, wrong schema): the run keeps its
 // context drafts and says why. An explicit file is not declined (its loader error stands).
 [[nodiscard]] inline ResolvedDrafter decline_drafter(const ResolvedDrafter& drafter, std::string reason) {
