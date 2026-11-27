@@ -42,6 +42,7 @@
 #include "strix/pair/link_mux.hpp"
 #include "strix/pair/relayout.hpp"
 #include "strix/pair/stage_map.hpp"
+#include "strix/pair/tp_inputs.hpp"
 #include "strix/pair/window_ring.hpp"
 #include "xport/hip_pipe_staging.hpp"
 #include "xport/tp_gather_hip.hpp"
@@ -624,6 +625,7 @@ int main(int argc, char** argv) {
         // tensor-parallel pair (Forward::enable_tp on both ranks, each holding the whole pack): rank 0 drafts and decides,
         // both ranks run every verify pass with their shares (strix/spec/pair_round.hpp); bench mode runs on both ranks
         int tp_rank = -1;
+        double tp_trip_ms = 0.0;
         std::string tp_spec = "usb4auto";
         std::string prefill_route = "auto";
         for (int i = 1; i < argc; ++i) {
@@ -700,6 +702,8 @@ int main(int argc, char** argv) {
             const auto stream = static_cast<hipStream_t>(f.stream_handle());
             tpg = std::make_unique<strix::xport::tp_gather::HipPairGather>(std::move(opened), rank, std::size_t{2} << 20, stream,
                                                                            strix::envcfg::flag("STRIX_TP_CHANNEL", true));
+            // trip cost measured over the gather form the passes run, agreed by both ranks (prices the verify seeds, as the rank)
+            tp_trip_ms = strix::pair::tp::trip_cost(tpg->measure_link()).latency_ms;
             f.enable_tp(rank, {&tpg->link(), &strix::xport::tp_gather::HipPairGather::Link::fn});
             std::printf("%s\n", f.tp_receipt().c_str());
             // the round message rides the same gather: [2][kSlot] bytes on the device, stream-ordered after the last pass
@@ -833,7 +837,11 @@ int main(int argc, char** argv) {
             const double step_ms = plain_ms / static_cast<double>(spec_n - 1U);
             hb::rows::SpecOptions so;
             so.max_rows = max_rows;
-            so.verify_ms = verify_ms.empty() ? strix::spec::moe_verify_seed_ms(strix::spec::hy4_verify_bytes(), step_ms, gbps, max_rows) : verify_ms;
+            if (!verify_ms.empty()) so.verify_ms = verify_ms;
+            // tensor-parallel: each rank reads half the bytes and pays the gathers (the one-node seed exceeds the pair's
+            // plain wall and was refused): the seed rule strix-hy4-rank calls
+            else if (tpg) hb::rows::seed_spec_options(so, step_ms, 2U, tp_trip_ms, f.tp_gathers_per_step());
+            else so.verify_ms = strix::spec::moe_verify_seed_ms(strix::spec::hy4_verify_bytes(), step_ms, gbps, max_rows);
             std::uint64_t plain_fnv = 1469598103934665603ULL;  // the plain ids (compared across one node / pair runs)
             for (const auto id : plain) plain_fnv = (plain_fnv ^ id) * 1099511628211ULL;
             // tensor-parallel drafter (both ranks; STRIX_HY4_TP_DRAFT=0: rank 0 alone, one-node block): both ranks must agree
