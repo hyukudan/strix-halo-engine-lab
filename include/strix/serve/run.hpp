@@ -97,7 +97,8 @@ struct ServeShell {
     struct NativeRequest {
         std::optional<profile::Name> tier;
         std::string backend, asset, bind, port;
-        bool print = false, native_profile = false;
+        bool print = false, native_profile = false, all_on = false;
+        std::string all_on_band;
         profile::multi_device::Query placement;   // --device-count N / --placement FORM (tier set by the resolver)
     };
     std::string registry_root = ".";

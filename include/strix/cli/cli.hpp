@@ -24,6 +24,8 @@ struct Request {
     support::Filter support_filter;
     std::optional<profile::Name> profile;
     bool native_profile = false;
+    bool all_on = false;          // --all-on (or STRIX_ALL_ON=1): the shared resolver in strix/profile/all_on.hpp
+    std::string all_on_band;      // --all-on-band any|prefill[:N]|decode[:N]
     bool print_effective_config = false;
     std::string backend;
     std::string asset;
@@ -54,6 +56,7 @@ struct Command {
     std::vector<std::string> args;
     std::optional<profile::ModelPreset> preset = {};
     std::optional<profile::multi_device::Decision> placement = {};   // also set when a native --profile skips the preset
+    std::string backend = {};   // the route's backend (hip | cuda)
 };
 using ExecutableExists = std::function<bool(const std::filesystem::path&)>;
 

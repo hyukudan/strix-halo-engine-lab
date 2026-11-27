@@ -1,0 +1,6 @@
+#pragma once
+
+namespace strix::profile::all_on::detail {
+inline constexpr char catalogue_json[] = R"strix_json(
+@STRIX_ALL_ON_JSON@)strix_json";
+}

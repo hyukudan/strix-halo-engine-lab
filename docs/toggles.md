@@ -78,6 +78,23 @@ FAST changes the numerics. Use it when throughput matters more than bit-identica
 
 `STRIX_RECURRENT_STATE` (FAST, opt-in, never part of a profile) stores the GDN recurrent state matrix as `f16` or `bf16` instead of `f32`: kernels widen each element, update in f32 and narrow on store (round to nearest even), so outputs differ from the f32 run. Equal storage types alone do not establish equality across routes with different rounding boundaries. One resolver (`strix::recurrent_state_policy()`) sets `ModelContract::recurrent_state`, the single source for HIP dispatch, matrix sizing (half the bytes) and session layout identity. Shared session restore rejects cross-type layouts. CUDA application startup currently refuses typed state until prefill rounding is independent of scheduling and prefix history; low-level typed CUDA kernels remain experimental. RTX handoff/import also refuses typed state on both ends until the wire protocol negotiates a producer state contract; equal f16/bf16 byte counts and an echoed consumer identity are insufficient. F32 behavior and identities are unchanged. Routes that still read the state as f32 refuse a 16-bit type through `recurrent_state_route_refusal`. Kernel-level ABAB of the storage types: `scripts/bench/gdn-state/run.sh BIN OUT` (fixture `bench-state16`); these measurements do not qualify application performance or model fidelity.
 
+## All-on: `--all-on` (`STRIX_ALL_ON=1`)
+
+`strix run|serve ... --all-on` and `strix-serve --all-on` turn on every lever of the catalogue that is qualified for
+the resolved tier, the regime band and the backend but is still an explicit option. It is one shared resolver
+(`strix/profile/all_on.hpp`) fed by the `all_on` objects of [optimizations.json](optimizations.json).
+
+- EXACT: exact levers only, the result stays bit-exact. FAST: exact levers plus lossy levers whose gate v2 verdict is
+  pass. TURBO: everything, each lossy line with its stated quality. A lever of a looser tier is never switched on.
+- KV precision is not touched: it stays the tier preset's own toggle (OFF in EXACT and FAST, ON in TURBO).
+- Output: `all-on: tier=... backend=... levers=N`, then one line per lever,
+  `lever NAME source=default|all-on|refused [reason=...]`. `refused` carries the reason: incompatible with another
+  lever, a missing requirement, a band the lever is not qualified for, a failed or pending gate, or `unclassified`
+  (a catalogue row without a complete classification; it stays off).
+- `--all-on-band any|prefill[:N]|decode[:N]` (env `STRIX_ALL_ON_BAND`) states the regime; band-limited levers need it.
+- An environment variable you set always wins (`source=default reason=explicit setting kept`).
+- `--dry-run` prints the lines and the lever arguments without exporting anything.
+
 ## The regime rule
 
 The engine picks a kernel family by the number of rows in flight, not by model.

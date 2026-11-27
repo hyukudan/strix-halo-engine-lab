@@ -1,4 +1,5 @@
 #include "strix/token_sampling.hpp"
+#include "strix/profile/all_on.hpp"
 #include "strix/serve/run.hpp"
 #include "strix/serve/serve_config.hpp"
 
@@ -47,7 +48,8 @@ int run(int argc, char** argv, const ServiceFactories& factories, std::ostream& 
             {"model", "--model", Kind::value}, {"registry_root", "--registry-root", Kind::path}, {"registry", "--registry", Kind::path},
             {"description", "--description", Kind::value}, {"bind", "--bind", Kind::value}, {"port", "--port", Kind::value},
             {"profile", "--profile", Kind::value}, {"backend", "--backend", Kind::value}, {"asset", "--asset", Kind::path},
-            {"device_count", "--device-count", Kind::value}, {"placement", "--placement", Kind::value}};
+            {"device_count", "--device-count", Kind::value}, {"placement", "--placement", Kind::value},
+            {"all_on", "--all-on", Kind::flag}, {"all_on_band", "--all-on-band", Kind::value}};
         auto file = config_file::expand(argc, argv, shell_options);
         if (file.print) { out << file.effective; return 0; }
         std::vector<char*> expanded;
@@ -83,6 +85,11 @@ int run(int argc, char** argv, const ServiceFactories& factories, std::ostream& 
             else if (arg == "--profile" || arg.starts_with("--profile=")) {
                 if (request.tier) throw std::invalid_argument("duplicate --profile");
                 request.tier = profile::parse_tier(arg == "--profile" ? value(i) : arg.substr(10));
+            } else if (arg == "--all-on") {
+                if (request.all_on) throw std::invalid_argument("duplicate --all-on");
+                request.all_on = true;
+            } else if (arg == "--all-on-band") {
+                request.all_on_band = value(i);
             } else if (arg == "--native-profile") {
                 if (request.native_profile) throw std::invalid_argument("duplicate --native-profile");
                 request.native_profile = true;
@@ -204,6 +211,11 @@ int run(int argc, char** argv, const ServiceFactories& factories, std::ostream& 
             out << profile::resolve_model_preset(selection.description, request.tier, backend, request.placement).config.dump() << '\n';
             return 0;
         }
+        // --all-on / STRIX_ALL_ON=1: the resolver shared with the strix launcher; one line per lever, then the exports.
+        std::optional<profile::all_on::Scope> all_on;
+        if (request.all_on || profile::all_on::env_requested())
+            all_on.emplace(profile::all_on::begin(&selection.description, request.tier, backend, request.all_on_band, out,
+                                                  !request.print, selection.arguments));
         const bool external_cuda = backend == "cuda" && !(factory && factory->serves_cuda);
         if ((preset_requested || placement_requested) && (!factory || external_cuda) && shell.launch) {
             // The native handoff carries the whole query (device count, placement) to the backend launcher, which
