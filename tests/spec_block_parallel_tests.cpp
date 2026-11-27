@@ -3,6 +3,7 @@
 // every policy / accuracy / source mix, ONE forward per draft, anchor position tracked through every step kind), the flat
 // cost config, and the MoE verify pricing used in the HY4 break-even table.
 #include "strix/spec/block_parallel.hpp"
+#include "strix/ernie/draft.hpp"
 
 #include <algorithm>
 #include <array>
@@ -208,6 +209,25 @@ void controller_tests() {
                     ++cases;
                 }
     std::printf("controller: %d cases PASS (hybrid blocks with a prefix policy: %llu)\n", cases, (unsigned long long)hybrids);
+}
+
+void ernie_draft_layout() {
+    const auto& policy = strix::ernie::dspark_block_policy;
+    const auto& declaration = strix::ernie::dspark_declaration;
+    sp::validate(policy);
+    BP_CHECK(sp::max_drafts(policy) == 7 && declaration.max_k == 7, "DSpark proposes from all seven rows");
+    BP_CHECK(policy.target_layers[0] == 40 && policy.target_layers[1] == 41 && policy.target_layers[2] == 42,
+             "DSpark takes three late target taps");
+    BP_CHECK(policy.kv == sp::KvSource::own_ring && policy.ring == 128 && declaration.shares.size() == 2,
+             "DSpark owns its context ring and shares the target vocabulary weights");
+    std::vector<std::uint32_t> ids;
+    sp::block_ids(policy, 17, {}, 2, ids);
+    BP_CHECK(ids.size() == 7 && ids.front() == 17 &&
+             std::ranges::all_of(std::span(ids).subspan(1), [](auto id) { return id == 1024; }),
+             "DSpark fills the complete block even when fewer proposals are requested");
+    BP_CHECK(sp::proposal_row(policy, 0) == 0 && sp::proposal_row(policy, 6) == 6 && sp::row_visible(policy, 0, 6),
+             "the anchor predicts first and sees trailing noise rows");
+    static_assert(strix::ernie::echo_mtp_layers == 0, "Preview only has the bundled block drafter");
 }
 
 void cost_tests() {
@@ -561,6 +581,7 @@ void replay_tests() {
 
 int main() {
     layout_tests();
+    ernie_draft_layout();
     cost_tests();
     prefix_tests();
     pricing_tests();
