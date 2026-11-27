@@ -1,5 +1,9 @@
 #pragma once
+#include <cstdint>
 #include <memory>
+#include <span>
+#include <string>
+#include <string_view>
 #include "strix/onfly_i4.hpp"
 
 // Q6P32 dense weights (6.5 bits per weight) that stand in for Q8_0 tensors.
@@ -81,6 +85,17 @@ std::shared_ptr<const Tensor> find(const void* original_address) noexcept;
 // Registered copies (lock-free; launchers skip the lookup when zero) and successful find() calls.
 std::uint64_t count() noexcept;
 std::uint64_t hits() noexcept;
+// Calibration tap (diagnostic; the loader opens it from STRIX_IU4_TAP_DIR before any launch): every registered copy
+// gets a name and an id; while the tap is open the IU4 row sites do not dispatch INT4 (the run computes with the
+// reference Q8_0 weights) and append the FP32 input rows of every launch whose segments all have copies to
+// DIR/in-<first segment id>.f32. DIR/index.tsv: "id name outputs inputs"; DIR/sites.tsv: "first_id segment_ids..."
+// once per input. The rows feed the shared calibration statistics (strix/weight/calib_moments.hpp).
+inline constexpr std::uint32_t kNoTap = 0xFFFFFFFFU;
+void tap_open(const std::string& dir);
+[[nodiscard]] bool tap_active() noexcept;
+std::uint32_t tap_name(const void* original_address, std::string_view name, std::uint32_t outputs, std::uint32_t inputs);
+[[nodiscard]] std::uint32_t tap_id(const void* original_address) noexcept;
+void tap_append(std::span<const std::uint32_t> segment_ids, std::uint32_t width, const float* rows, std::uint32_t count);
 // The independent MTP golden replay validates the EXACT arithmetic: onfly INT4 dispatch is suspended on the calling thread
 // while it runs (the INT4 copies are lossy by design and are never compared with the exact golden).
 inline std::atomic<std::uint64_t> launches{0};  // INT4 kernel launches issued (printed at exit by the owner)

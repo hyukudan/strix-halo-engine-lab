@@ -2,6 +2,10 @@
 #include "strix/q6p_registry.hpp"
 
 #include <atomic>
+#include <cstdio>
+#include <filesystem>
+#include <map>
+#include <stdexcept>
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
@@ -183,6 +187,71 @@ std::shared_ptr<const Tensor> find(const void* original_address) noexcept {
 }
 std::uint64_t count() noexcept { return registry().count.load(std::memory_order_acquire); }
 std::uint64_t hits() noexcept { return registry().hits.load(std::memory_order_relaxed); }
+
+namespace {
+struct Tap {
+    std::mutex mutex;
+    std::atomic<bool> active{false};
+    std::string dir;
+    std::unordered_map<const void*, std::uint32_t> ids;
+    std::map<std::uint32_t, std::FILE*> files;
+    std::FILE* index = nullptr;
+    std::FILE* sites = nullptr;
+};
+Tap& tap() {
+    static Tap instance;
+    return instance;
+}
+std::FILE* open_or_throw(const std::string& path, const char* mode) {
+    std::FILE* f = std::fopen(path.c_str(), mode);
+    if (!f) throw std::runtime_error("IU4 calibration tap: cannot open " + path);
+    return f;
+}
+}  // namespace
+void tap_open(const std::string& dir) {
+    auto& t = tap();
+    const std::lock_guard lock(t.mutex);
+    if (t.active.load()) throw std::invalid_argument("IU4 calibration tap already open");
+    std::filesystem::create_directories(dir);
+    if (std::filesystem::exists(std::filesystem::path(dir) / "index.tsv"))
+        throw std::invalid_argument("IU4 calibration tap: " + dir + " already holds a capture (use a new directory)");
+    t.dir = dir;
+    t.index = open_or_throw(dir + "/index.tsv", "w");
+    t.sites = open_or_throw(dir + "/sites.tsv", "w");
+    t.active.store(true, std::memory_order_release);
+}
+bool tap_active() noexcept { return tap().active.load(std::memory_order_acquire); }
+std::uint32_t tap_name(const void* original_address, std::string_view name, std::uint32_t outputs, std::uint32_t inputs) {
+    auto& t = tap();
+    const std::lock_guard lock(t.mutex);
+    if (!t.active.load()) return kNoTap;
+    const auto id = static_cast<std::uint32_t>(t.ids.size());
+    if (!t.ids.emplace(original_address, id).second) return t.ids.at(original_address);
+    std::fprintf(t.index, "%u\t%.*s\t%u\t%u\n", id, static_cast<int>(name.size()), name.data(), outputs, inputs);
+    std::fflush(t.index);
+    return id;
+}
+std::uint32_t tap_id(const void* original_address) noexcept {
+    auto& t = tap();
+    const std::lock_guard lock(t.mutex);
+    const auto it = t.ids.find(original_address);
+    return it == t.ids.end() ? kNoTap : it->second;
+}
+void tap_append(std::span<const std::uint32_t> segment_ids, std::uint32_t width, const float* rows, std::uint32_t count) {
+    auto& t = tap();
+    const std::lock_guard lock(t.mutex);
+    if (!t.active.load() || segment_ids.empty()) return;
+    auto& file = t.files[segment_ids.front()];
+    if (!file) {
+        file = open_or_throw(t.dir + "/in-" + std::to_string(segment_ids.front()) + ".f32", "wb");
+        std::fprintf(t.sites, "%u", segment_ids.front());
+        for (const auto id : segment_ids.subspan(1)) std::fprintf(t.sites, "\t%u", id);
+        std::fprintf(t.sites, "\t# width %u\n", width);
+        std::fflush(t.sites);
+    }
+    if (std::fwrite(rows, sizeof(float) * width, count, file) != count)
+        throw std::runtime_error("IU4 calibration tap: short write in " + t.dir);
+}
 }  // namespace iu4
 
 }  // namespace strix::q6p

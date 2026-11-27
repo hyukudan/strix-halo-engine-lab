@@ -54,6 +54,8 @@
 #include <stdexcept>
 #include <type_traits>
 #include <utility>
+#include <span>
+#include <vector>
 
 #include "hip_q6p_weights.hpp"
 #include "hip/weight/ggml_sources.hpp"

@@ -171,4 +171,25 @@ inline HostCopy convert_q8_0_host(const std::uint8_t* q8, std::size_t n, std::si
         }
     return out;
 }
+// A strix.q4_g64 matrix (strix/weight/host_lowbit.hpp: each row a run of 128-weight superblocks, 64 code bytes with the
+// even element in the low nibble, then the FP16 scales of elements [0, 64) and [64, 128)) holds the values of an IU4
+// g64 copy (signed nibbles [-8, 7] times one FP16 scale per output and K64 group) in another byte order: a calibrated
+// pack is read by the same kernels after this relayout (no requantisation). `copy`: copy_bytes(n, k) bytes, packed
+// tiles then the scales [padded][K/64]; pad columns stay zero.
+inline void q4_g64_to_copy(const std::uint8_t* q4, std::size_t n, std::size_t k, std::uint8_t* copy) {
+    if (!q4 || !copy || !n || !k || k % 128U) throw std::invalid_argument("q4_g64 relayout: N > 0, K % 128 == 0");
+    const std::size_t padded = padded_outputs(n), groups = k / 64U, row_bytes = k / 128U * 68U;
+    std::memset(copy, 0, copy_bytes(n, k));
+    std::uint8_t* scales = copy + packed_bytes(padded, k);
+    for (std::size_t c = 0; c < n; ++c)
+        for (std::size_t sb = 0; sb < k / 128U; ++sb) {
+            const std::uint8_t* block = q4 + c * row_bytes + sb * 68U;
+            for (std::size_t i = 0; i < 64U; ++i)
+                copy[iu4_weight_byte(static_cast<int>(sb * 128U + 2U * i), static_cast<int>(c), static_cast<int>(padded))] = block[i];
+            for (std::size_t h = 0; h < 2U; ++h) {
+                scales[(c * groups + sb * 2U + h) * 2U] = block[64U + 2U * h];
+                scales[(c * groups + sb * 2U + h) * 2U + 1U] = block[65U + 2U * h];
+            }
+        }
+}
 }  // namespace strix::core::onfly

@@ -1,5 +1,6 @@
 #include "strix/weight/pack_source.hpp"
 
+#include "core/iu4_onfly.hpp"
 #include "core/sha256.hpp"
 #include "strix/serve/json.hpp"
 #include "strix/weight/confined_file.hpp"
@@ -27,7 +28,7 @@ Digest256 matrix_digest(PackMatrixSource::Encoding encoding, const Digest256& co
     constexpr std::string_view tag = "strix-pack-source/v1";
     core::Sha256 hash;
     hash.update(tag.data(), tag.size());
-    constexpr char kinds[] = "-mfnxe";
+    constexpr char kinds[] = "-mfnxeq";
     const char kind = kinds[static_cast<std::size_t>(encoding)];
     hash.update(&kind, 1);
     append(hash, codes);
@@ -129,9 +130,10 @@ Status PackCheckpoint::open(const std::string& path, PackCheckpoint& out) {
         PackCheckpoint result;
         fs::path input(path);
         if (fs::is_directory(input)) input /= "model.safetensors.index.json";
+        const bool gguf = input.extension() == ".gguf";
         const auto add_shard = [&](std::shared_ptr<const Source> source) -> Status {
             TensorIndex index;
-            if (const auto s = index_safetensors(source, index); !s)
+            if (const auto s = gguf ? index_gguf(source, index) : index_safetensors(source, index); !s)
                 return {s.code, source->shard_name() + ": " + s.detail};
             result.tensors_.insert(result.tensors_.end(), std::make_move_iterator(index.tensors.begin()),
                                    std::make_move_iterator(index.tensors.end()));
@@ -221,6 +223,14 @@ Status PackMatrixSource::bind(const PackCheckpoint& checkpoint, const RawTensor&
     if (logical_rows > limit / logical_columns) return {Error::unsupported_shape, tensor.name + ": matrix size overflow"};
     PackMatrixSource result{Encoding::bf16, static_cast<std::size_t>(logical_rows), static_cast<std::size_t>(logical_columns),
                             tensor.payload, {}};
+    constexpr std::uint32_t kGgmlQ8_0 = 8U;
+    if (tensor.wire_dtype.empty() && tensor.wire_type == kGgmlQ8_0) {  // GGUF Q8_0 (index_gguf leaves wire_dtype empty)
+        if (result.columns % 32U != 0U || tensor.payload.range.bytes != result.rows * (result.columns / 32U) * 34U)
+            return {Error::malformed, tensor.name + ": Q8_0 payload disagrees with its shape"};
+        result.encoding = Encoding::q8_0;
+        out = std::move(result);
+        return ok;
+    }
     if (mxfp4 || fp8) {
         using Block = BlockScaledE4M3<128, 128, float>;
         const auto* scale = checkpoint.find(tensor.name + "_scale_inv");
@@ -232,7 +242,7 @@ Status PackMatrixSource::bind(const PackCheckpoint& checkpoint, const RawTensor&
         result.encoding = mxfp4 ? Encoding::mxfp4 : Encoding::fp8_block;
         result.scales = scale->payload;
     } else if (tensor.wire_dtype != "BF16") {
-        return {Error::unknown_format, tensor.name + ": expected BF16, MXFP4 or block E4M3"};
+        return {Error::unknown_format, tensor.name + ": expected BF16, MXFP4, block E4M3 or GGUF Q8_0"};
     }
     out = std::move(result);
     return ok;
@@ -292,7 +302,8 @@ std::string packed_expert_name(std::string_view bank, std::size_t expert) {
 Status PackMatrixSource::digest(Digest256& out) const {
     Digest256 raw{}, scale{};
     if (const auto s = digest_slice(codes, raw); !s) return s;
-    if (encoding != Encoding::bf16)
+    if (encoding == Encoding::q8_0) scale = digest_bytes({});  // the scales live in the blocks: no separate plane
+    else if (encoding != Encoding::bf16)
         if (const auto s = digest_slice(scales, scale); !s) return s;
     if (encoding == Encoding::exl3) {
         std::vector<Byte> svh(static_cast<std::size_t>(output_scales.range.bytes));
@@ -336,6 +347,7 @@ Status PackMatrixSource::decode(std::vector<float>& out, Digest256* digest_out) 
     const auto stored = total_rows * columns;
     using Block = BlockScaledE4M3<128, 128, float>;
     if ((encoding == Encoding::bf16 && (codes.range.bytes != 2U * count || scales.range.bytes)) ||
+        (encoding == Encoding::q8_0 && (columns % 32U || codes.range.bytes != count / 32U * 34U || scales.range.bytes)) ||
         (encoding == Encoding::mxfp4 && (columns % 32U || codes.range.bytes != count / 2U ||
                                          scales.range.bytes != count / 32U)) ||
         (encoding == Encoding::fp8_block && (codes.range.bytes != count ||
@@ -355,6 +367,13 @@ Status PackMatrixSource::decode(std::vector<float>& out, Digest256* digest_out) 
         for (std::size_t i = 0; i < matrix.size(); ++i)
             matrix[i] = scalar_float::u2f((std::uint32_t{raw[2U * i]} << 16U) |
                                          (std::uint32_t{raw[2U * i + 1U]} << 24U));
+    } else if (encoding == Encoding::q8_0) {
+        for (std::size_t b = 0; b < count / 32U; ++b) {
+            const auto* block = raw.data() + b * 34U;
+            const float d = core::onfly::f16_bits_to_f32(static_cast<std::uint16_t>(block[0] | (block[1] << 8U)));
+            for (std::size_t j = 0; j < 32U; ++j)
+                matrix[b * 32U + j] = d * static_cast<float>(static_cast<std::int8_t>(block[2U + j]));
+        }
     } else if (encoding == Encoding::mxfp4) {
         try {
             for (std::size_t row = 0; row < rows; ++row)

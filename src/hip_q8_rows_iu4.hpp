@@ -110,12 +110,55 @@ __global__ __launch_bounds__(32 * S) void project_rows_iu4_kernel(Site site, Iu4
     }
 }
 
+// Calibration tap (q6p::iu4::tap_open): row r of the site's input, as FP32, to out[r * width ...].
+template <class Site> __global__ void tap_rows_kernel(Site site, float* out, unsigned width) {
+    const unsigned r = blockIdx.y;
+    for (unsigned i = (blockIdx.x * blockDim.x + threadIdx.x) * 8U; i < width; i += gridDim.x * blockDim.x * 8U) {
+        float x[8];
+        load8(row_input(site, r) + i, x);
+#pragma unroll
+        for (unsigned j = 0; j < 8U; ++j) out[r * width + i + j] = x[j];
+    }
+}
+// Appends the input rows of a launch whose segments all have INT4 copies (the launch itself stays on Q8_0).
+template <class Site> void tap_rows(const Site& site, hipStream_t stream) {
+    std::uint32_t ids[kMaxSegments];
+    for (unsigned m = 0; m < site.segments.count; ++m)
+        if ((ids[m] = q6p::iu4::tap_id(site.segments.weights[m])) == q6p::iu4::kNoTap || site.segments.types[m]) return;
+    const unsigned width = site.width;
+    if (site.segments.count == 0U || width % 8U) return;
+    static thread_local float* device = nullptr;
+    static thread_local std::size_t capacity = 0;
+    const std::size_t floats = std::size_t{Site::rows} * width;
+    if (capacity < floats) {
+        if (device) (void)hipFree(device);
+        device = nullptr;
+        capacity = 0;
+        if (hipMalloc(&device, floats * sizeof(float)) != hipSuccess) throw std::runtime_error("IU4 calibration tap: allocation");
+        capacity = floats;
+    }
+    hipStreamCaptureStatus capture = hipStreamCaptureStatusNone;
+    if (hipStreamIsCapturing(stream, &capture) != hipSuccess || capture != hipStreamCaptureStatusNone)
+        throw std::runtime_error("IU4 calibration tap needs an eager run (no graph capture)");
+    std::vector<float> host(floats);
+    hipLaunchKernelGGL(tap_rows_kernel<Site>, dim3(4U, Site::rows), dim3(256U), 0, stream, site, device, width);
+    if (hipMemcpyAsync(host.data(), device, floats * sizeof(float), hipMemcpyDeviceToHost, stream) != hipSuccess ||
+        hipStreamSynchronize(stream) != hipSuccess)
+        throw std::runtime_error("IU4 calibration tap: copy");
+    q6p::iu4::tap_append(std::span<const std::uint32_t>(ids, site.segments.count), width, host.data(), Site::rows);
+}
+
 // True when INT4 launched. A8 slots remain exclusively for the Q8 fallback.
 // Even with a slot, use the original site rows and the serial FP16 conversion.
 template <class Site> bool launch_iu4_rows(const Site& site, hipStream_t stream, bool any_order, const DenseA8Slot* slot) {
     if constexpr (Site::rows > 8U || !iu4_group_of<Site>()) return false;
     else {
-        if (!q6p::iu4::count() || q6p::iu4::suspended()) return false;
+        if (!q6p::iu4::count()) return false;
+        if (q6p::iu4::tap_active()) {  // calibration capture: record the rows, compute with the reference Q8_0 weights
+            tap_rows(site, stream);
+            return false;
+        }
+        if (q6p::iu4::suspended()) return false;
         const unsigned width = site.width;
         if (!onfly_i4::dispatch_width(width) || site.segments.count == 0U ) return false;
         Iu4Weights w{};

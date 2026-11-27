@@ -5,7 +5,7 @@
 
 namespace strix::weight {
 
-// One file, a checkpoint directory, or its safetensors index JSON. Opening
+// One file (safetensors or GGUF), a checkpoint directory, or its safetensors index JSON. Opening
 // indexes headers only; content identity is an explicit full checkpoint read.
 class PackCheckpoint {
 public:
@@ -21,7 +21,9 @@ private:
 };
 
 struct PackMatrixSource {
-    enum class Encoding { bf16, mxfp4, fp8_block, nvfp4, mxfp8, exl3 };
+    // q8_0: a GGUF Q8_0 matrix (ggml type 8, rows of K/32 blocks of 34 bytes: FP16 d, 32 int8), codes = the whole
+    // payload, no separate scale plane; value = float(d) * q (exact in FP32), the engines' Q8_0 dequantisation.
+    enum class Encoding { bf16, mxfp4, fp8_block, nvfp4, mxfp8, exl3, q8_0 };
     Encoding encoding{};
     std::size_t rows{}, columns{};
     Slice codes, scales;

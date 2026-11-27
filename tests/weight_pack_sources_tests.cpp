@@ -1,5 +1,7 @@
 #include "moe_core/grouped_strixpack.hpp"
 #include "strix/weight/calib_moments.hpp"
+#include "strix/weight/pack_source.hpp"
+#include "core/iu4_onfly.hpp"
 
 #include <array>
 #include <bit>
@@ -7,6 +9,8 @@
 #include <fstream>
 #include <iostream>
 #include <stdexcept>
+#include <string>
+#include <vector>
 
 namespace {
 namespace wei = strix::weight;
@@ -215,10 +219,49 @@ void mixed_group() {
 }
 }  // namespace
 
+// A GGUF Q8_0 matrix is a pack source: the checkpoint opens by its .gguf name, the matrix binds as q8_0 and decodes to
+// float(d) * q per 32-weight block, the dequantisation every Q8_0 engine runs.
+void gguf_q8_0_source() {
+    const auto u32 = [](std::string& b, std::uint32_t v) { for (unsigned i = 0; i < 4U; ++i) b += static_cast<char>((v >> (8U * i)) & 0xFFU); };
+    const auto u64 = [](std::string& b, std::uint64_t v) { for (unsigned i = 0; i < 8U; ++i) b += static_cast<char>((v >> (8U * i)) & 0xFFU); };
+    std::string file = "GGUF";
+    u32(file, 3U); u64(file, 1U); u64(file, 1U);
+    const std::string key = "general.architecture", arch = "fixture", name = "blk.0.attn_qkv.weight";
+    u64(file, key.size()); file += key; u32(file, 8U); u64(file, arch.size()); file += arch;
+    u64(file, name.size()); file += name; u32(file, 2U); u64(file, 64U); u64(file, 2U); u32(file, 8U); u64(file, 0U);
+    while (file.size() % 32U) file += static_cast<char>(0);
+    const std::array<std::uint16_t, 4> d{0x3800U, 0x3C00U, 0xB400U, 0x4100U};  // 0.5, 1, -0.25, 2.5
+    std::vector<float> expect;
+    for (unsigned b = 0; b < 4U; ++b) {
+        file += static_cast<char>(d[b] & 0xFFU); file += static_cast<char>(d[b] >> 8U);
+        for (int j = 0; j < 32; ++j) {
+            const auto q = static_cast<std::int8_t>(j * 7 - 100 + static_cast<int>(b));
+            file += static_cast<char>(q);
+            expect.push_back(strix::core::onfly::f16_bits_to_f32(d[b]) * static_cast<float>(q));
+        }
+    }
+    { std::ofstream out("q8_source.gguf", std::ios::binary); out.write(file.data(), static_cast<std::streamsize>(file.size())); }
+    wei::PackCheckpoint checkpoint;
+    require(bool(wei::PackCheckpoint::open("q8_source.gguf", checkpoint)), "GGUF checkpoint opens");
+    const auto* tensor = checkpoint.find(name);
+    require(tensor != nullptr, "GGUF tensor indexed");
+    wei::PackMatrixSource source;
+    require(bool(wei::PackMatrixSource::bind(checkpoint, *tensor, source)) && source.encoding == wei::PackMatrixSource::Encoding::q8_0 &&
+            source.rows == 2U && source.columns == 64U, "Q8_0 binds as a 2 x 64 q8_0 matrix");
+    std::vector<float> values;
+    wei::Digest256 digest{}, again{};
+    require(bool(source.decode(values, &digest)) && values.size() == expect.size(), "Q8_0 decodes");
+    for (std::size_t i = 0; i < values.size(); ++i)
+        require(std::bit_cast<std::uint32_t>(values[i]) == std::bit_cast<std::uint32_t>(expect[i]), "Q8_0 value = float(d) * q");
+    require(bool(source.digest(again)) && again.bytes == digest.bytes, "decode and digest name the same source bytes");
+    std::filesystem::remove("q8_source.gguf");
+}
+
 int main() {
     try {
         moment_layers();
         mixed_group();
+        gguf_q8_0_source();
         std::cout << "weight pack CPU reference tests passed\n";
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
