@@ -696,6 +696,11 @@ void hy4_launcher_resolves_documented_drafter(const fs::path& data) {
     require(classify({"--top", "10"}) == "explicit-route", "--top 10 keeps the per-step logits");
     require(classify({"--teacher", "t.ids"}) == "explicit-route", "--teacher keeps the per-step logits");
     require(strix::hy4::speculation_run_from_arguments({"--no-mtp"}, "0").environment != nullptr, "the caller's environment is kept");
+    require(classify({"--top", "5", "--top", "0"}) == "default", "the last top option wins");
+    require(classify({"--top", "0", "--top", "5"}) == "explicit-route", "the final nonzero top requests logits");
+    require(classify({"--ids-file", "--no-mtp"}) == "default", "an option value is not an MTP opt-out");
+    require(classify({"--ids-file", "--timing", "--no-mtp"}) == "cli-opt-out", "real flags after values are read");
+    require(classify({"--dump-logits", "--no-mtp"}) == "explicit-route", "output filename is not an opt-out");
     require(classify({"--timing"}) == "explicit-route", "--timing keeps the plain steps");
     require(classify({"--no-mtp"}) == "cli-opt-out", "--no-mtp opts out");
     require(classify({"--mtp", "--timing"}) == "explicit", "--mtp wins over the per-step route");
