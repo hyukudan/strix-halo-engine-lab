@@ -269,12 +269,12 @@ void test_ladder() {
     require(mini::mini_prompt_moe_may_select(options, "sm_120", A::iu4_rot, known), "an explicit iu4 load builds them");
 
     // strix-serve resolves under a model preset, which admits only ready cells: the server selects what the CLI
-    // selects for the same prompt (served prompts of the receipt: 4,307 / 8,234 / 32,758 tokens).
+    // selects for the same prompt (served prompts of the receipts: 1,148 / 4,307 / 8,234 / 32,758 tokens).
     {
         const PresetEnv preset;
-        for (const std::uint64_t tokens : {4307ULL, 8234ULL, 32758ULL})
+        for (const std::uint64_t tokens : {1148ULL, 2048ULL, 4307ULL, 8234ULL, 32758ULL})
             require(prompt(profile::Name::turbo, "gfx1151", tokens) == A::iu4_rot, "served TURBO selects the CLI cell");
-        require(prompt(profile::Name::turbo, "gfx1151", 2048U) == A::bf16, "served TURBO keeps BF16 outside the rows");
+        require(prompt(profile::Name::turbo, "gfx1151", 1024U) == A::bf16, "served TURBO keeps BF16 outside the rows");
         require(prompt(profile::Name::fast, "gfx1151", 8234U) == A::bf16, "served FAST keeps the BF16 tile");
         options.tier = inputs(profile::Name::turbo);
         require(mini::mini_prompt_moe_may_select(options, "gfx1151", A::iu4_rot, known), "a served TURBO load builds images");
