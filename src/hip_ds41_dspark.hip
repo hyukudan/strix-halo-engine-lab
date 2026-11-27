@@ -6,6 +6,7 @@
 #include "strix/hip_check.hpp"
 #include "strix/hip_ds41_dspark.hpp"
 #include "strix/hip_stream_readback.hpp"
+#include <iostream>
 
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
@@ -791,7 +792,10 @@ struct DeviceDrafter::Impl {
         gpu_routes = flag("STRIX_DS41_DSPARK_GPU_ROUTES");
         if (mcfg.cand) cand_init();
         check(hipDeviceSynchronize(), "upload");
-        if (device::hip_pinned_replies_enabled()) draft_reply.emplace();
+        if (device::hip_pinned_replies_enabled()) {
+            draft_reply.emplace();
+            ::strix::session::record_pinned_reply(*draft_reply, std::cerr);
+        }
         memlog("route tables + extra rows", gtt_mark, std::uint64_t{extra_capacity} * output.row_bytes);
     }
     std::uint64_t memlog_stages_expected = 0;

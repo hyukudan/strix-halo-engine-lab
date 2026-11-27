@@ -7,6 +7,7 @@
 #include <cstring>
 #include <iostream>
 #include <span>
+#include <sstream>
 #include <stdexcept>
 #include <string_view>
 #include <vector>
@@ -477,6 +478,51 @@ void test_projected_bias() {
     require(refused, "malformed projected-bias switch must be refused");
 }
 
+// The all-on record (all_on_engaged.hpp) of the verify rows and SP4 head levers: a lever the engine declines says so once.
+void test_all_on_records() {
+    const auto set_levers = [](const char* value) {
+#ifdef _MSC_VER
+        (void)_putenv_s("STRIX_ALL_ON_LEVERS", value ? value : "");
+#else
+        if (value) (void)::setenv("STRIX_ALL_ON_LEVERS", value, 1);
+        else (void)::unsetenv("STRIX_ALL_ON_LEVERS");
+#endif
+    };
+    set_levers("ink_verify_rows:STRIX_INK_VERIFY_ROWS,ink_lowbit_head_sp4t:STRIX_INK_LOWBIT_HEAD");
+    require(mini::mini_verify_rows_decline(1U, 0U) != nullptr && mini::mini_verify_rows_decline(0U, 0U) == nullptr &&
+                mini::mini_verify_rows_decline(1U, 1U) == nullptr && mini::mini_verify_rows_decline(2U, 1U) == nullptr,
+            "verify rows decline: selected and not admitted only");
+    std::ostringstream idle;
+    mini::mini_record_verify_rows_idle(1U, false, idle);
+    require(idle.str() == "all-on: lever ink_verify_rows source=all-on applied=no reason=the run does not speculate: "
+                          "no verify window runs\n", "verify rows without speculation prints the exact line");
+    std::ostringstream quiet;
+    mini::mini_record_verify_rows_idle(1U, true, quiet);
+    mini::mini_record_verify_rows_idle(0U, false, quiet);
+    mini::mini_record_verify_rows_idle(2U, false, quiet);
+    require(quiet.str().empty(), "verify rows with speculation, off, or the lanes pick prints nothing");
+    set_levers("ink_lowbit_head_sp4t:STRIX_INK_LOWBIT_HEAD");
+    std::ostringstream unlisted;
+    mini::mini_record_verify_rows_idle(1U, false, unlisted);
+    require(unlisted.str().empty(), "a switch not exported by all-on stays silent");
+    set_levers("ink_lowbit_head_sp4t:STRIX_INK_LOWBIT_HEAD");
+    mini::MiniWeightOptions options;
+    profile::Inputs inputs;
+    inputs.profile = profile::Name::standard;
+    inputs.env = [](const char* key) -> const char* {
+        return std::strcmp(key, "STRIX_INK_LOWBIT_HEAD") == 0 ? "sp4t" : nullptr;
+    };
+    options.tier = inputs;
+    const auto resolved = mini::resolve_mini_profile(options, true);
+    std::ostringstream head;
+    auto* saved = std::cerr.rdbuf(head.rdbuf());
+    mini::apply_mini_lowbit_head(options, resolved);
+    std::cerr.rdbuf(saved);
+    require(head.str() == "all-on: lever ink_lowbit_head_sp4t source=all-on applied=no reason=FAST and TURBO only\n" &&
+                options.qualify == nullptr, "the SP4 head lever in EXACT prints the exact line and loads nothing");
+    set_levers(nullptr);
+}
+
 // The narrow expert image row: bit-changing, off in EXACT, pending (off) in FAST and TURBO until its gate and served
 // receipt; an explicit STRIX_MOE_EXPERTS_NVFP4=1 opts in (unqualified), 0 is the off switch, other values are refused.
 // The verify rows row: an exact lever, opt-in (off in every tier, builtin the per-row incumbent), bound to the engine,
@@ -879,6 +925,7 @@ int main() {
         test_round_fold_admission();
         test_projected_bias();
         test_verify_rows();
+        test_all_on_records();
         test_narrow_experts();
         test_screened_head_row();
         test_screened_head_decision();

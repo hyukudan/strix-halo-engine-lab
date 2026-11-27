@@ -20,6 +20,7 @@
 #include <filesystem>
 #include <fstream>
 #include <random>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -116,6 +117,32 @@ void test_draft_readback() {
         expect(FakeReadback::pins == start_pins + 1U, "readback pins once at setup");
         expect(FakeReadback::releases == start_releases + (refuse_pin ? 0U : 1U), "readback releases pinned storage once");
     }
+}
+
+void test_pinned_reply_record() {
+    struct Reply { std::array<std::uint32_t, 2U> ids; };
+    const auto record = [](bool refuse_pin) {
+        FakeReadback::refuse_pin = refuse_pin;
+        strix::session::StreamReadback<Reply, FakeReadback> staging;
+        std::ostringstream out;
+        strix::session::record_pinned_reply(staging, out);
+        FakeReadback::refuse_pin = false;
+        return out.str();
+    };
+#ifdef _MSC_VER
+    (void)_putenv_s("STRIX_ALL_ON_LEVERS", "hip_pinned_replies:STRIX_HIP_PINNED_REPLIES");
+#else
+    (void)::setenv("STRIX_ALL_ON_LEVERS", "hip_pinned_replies:STRIX_HIP_PINNED_REPLIES", 1);
+#endif
+    expect(record(false).empty(), "a pinned reply prints no all-on line");
+    expect(record(true) == "all-on: lever hip_pinned_replies source=all-on applied=no reason=pinning was refused: "
+                           "pageable staging storage\n", "a refused pin prints the exact all-on line");
+#ifdef _MSC_VER
+    (void)_putenv_s("STRIX_ALL_ON_LEVERS", "");
+#else
+    (void)::unsetenv("STRIX_ALL_ON_LEVERS");
+#endif
+    expect(record(true).empty(), "a switch the user set by hand stays silent");
 }
 
 void test_f16() {
@@ -740,6 +767,7 @@ int main() {
 
     test_f16();
     test_draft_readback();
+    test_pinned_reply_record();
     test_e4m3();
     test_wave_sum();
     test_sinkhorn();

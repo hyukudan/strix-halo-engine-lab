@@ -20,6 +20,7 @@
 // tools/glm/split_plan.py (H128-aligned EXL3 slices, plain tensors by rows).
 #include "strix/glm/engine.hpp"
 #include "strix/hip_stream_readback.hpp"
+#include <iostream>
 #include "strix/session/prefill_session.hpp"
 #include "strix/session/embed_splice_hip.hpp"
 
@@ -1379,7 +1380,10 @@ struct Engine::Impl {
         const auto t0 = Clock::now();
         start_monitor();
         hip_ok(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking), "stream");
-        if (device::hip_pinned_replies_enabled()) id_reply.emplace();
+        if (device::hip_pinned_replies_enabled()) {
+            id_reply.emplace();
+            ::strix::session::record_pinned_reply(*id_reply, std::cerr);
+        }
         const auto& pf_policy = pf::capacity_policy();
         const auto initial_pf_layout = pf::capacity_candidates(pf_policy, kv_shard != nullptr).front();
         pf::capacity_layout() = initial_pf_layout;

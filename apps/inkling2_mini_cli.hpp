@@ -3,6 +3,7 @@
 #include "core/dense_linear.hpp"
 #include "inkling2/inkling2_mini_config.hpp"
 #include "inkling2/inkling2_mini_weight_options.hpp"
+#include "strix/profile/all_on_engaged.hpp"
 #include "strix/exec/route_capabilities.hpp"
 #include "strix/serve/serial_generation_cli.hpp"
 #include "strix/session/head_gate_cli.hpp"
@@ -114,6 +115,8 @@ inline Options parse(int argc, char** argv, const serve::SerialGenerationFamily&
     }
     options.weights.lowbit_turbo = mini_lowbit_turbo(options.tier);
     if (native) apply_mini_lowbit_head(options.weights, options.tier);
+    else if (const auto* head = options.tier.find(kMiniLowBitHead); head != nullptr && head->value != "0")
+        (void)strix::profile::all_on::engaged("STRIX_INK_LOWBIT_HEAD", false, "native HIP execution only", std::cerr);
     mini_cli_decline_served_route(options.tier);
     if (options.gate_order_null && (!gate || options.tier.profile != profile::Name::standard))
         throw std::invalid_argument("--gate-order-null requires an exact gate arm");

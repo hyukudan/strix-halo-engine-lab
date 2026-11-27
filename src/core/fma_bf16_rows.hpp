@@ -7,10 +7,12 @@
 #include "core/f16_tile_gemm.hpp"
 #include "core/fma_rows.hpp"
 #include "strix/hip/legacy_launch.hpp"
+#include "strix/profile/all_on_engaged.hpp"
 #include "strix/weight/formats/scalar_float.hpp"
 
 #include <algorithm>
 #include <atomic>
+#include <iostream>
 #include <limits>
 #include <string_view>
 #include <type_traits>
@@ -95,9 +97,17 @@ inline hipError_t enqueue_bf16_rows(const float* input, unsigned input_width, un
         f16_tile_gemm::Bf16ProjectionGroup<kGroupMax> wmma_group{};
         const auto pitch = effective_pitch(projections.front());
         const bool split = Schedule == Bf16RowsSchedule::compact_narrow &&
-            std::ranges::any_of(projections, [&](const auto& projection) {
-                return admits_bf16_compact_projection(input_width, rows, projection);
-            }) && image_routes_order_free(input, input_width, rows, projections, true);
+            bf16_compact_call_split(input, input_width, rows, projections);
+        // One record with --all-on: a call with a narrow projection that the compact schedule leaves on the shared
+        // tile (an ordered alias between its projections) says so once (all_on_engaged.hpp).
+        if constexpr (Schedule == Bf16RowsSchedule::compact_narrow) {
+            if (!split && bf16_compact_narrow_present(input_width, rows, projections)) {
+                static const bool recorded = strix::profile::all_on::engaged(
+                    "STRIX_INKLING2_HIP_ATTN_PREP_COMPACT", false,
+                    "a narrow projection shares bytes with another projection of its call", std::cerr);
+                (void)recorded;
+            }
+        }
         f16_tile_gemm::Bf16ProjectionGroup<kGroupMax> compact_group{};
         for (const auto& projection : projections) {
             auto& dst = split && admits_bf16_compact_projection(input_width, rows, projection)

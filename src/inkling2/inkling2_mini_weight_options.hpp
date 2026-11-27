@@ -5,6 +5,7 @@
 #include "moe_core/grouped_w4a4.hpp"
 #include "strix/env_flags.hpp"
 #include "strix/model_data/inkling2_mini.hpp"
+#include "strix/profile/all_on_engaged.hpp"
 #include "strix/profiles/inkling2_mini.hpp"
 #include "strix/serve/row_budget.hpp"
 #include "strix/spec/probe_policy.hpp"
@@ -129,7 +130,12 @@ inline bool mini_lowbit_head(const profile::Resolution& tier) { return mini_lowb
 // STRIX_LOWBIT_PACK and combines with no other weight arm. The command line and the server call this one rule.
 inline void apply_mini_lowbit_head(MiniWeightOptions& options, const profile::Resolution& tier) {
     const auto* policy = mini_lowbit_head_policy(tier);
-    if (policy == nullptr) return;
+    if (policy == nullptr) {
+        // One record with --all-on: a selected SP4 head arm that this tier does not take says so (all_on_engaged.hpp).
+        if (const auto* entry = tier.find(kMiniLowBitHead); entry != nullptr && entry->value != "0")
+            (void)profile::all_on::engaged("STRIX_INK_LOWBIT_HEAD", false, "FAST and TURBO only", std::cerr);
+        return;
+    }
     if (options.qualify != nullptr || options.qualify_q8 || options.lowbit_turbo || options.disable_q8)
         throw std::invalid_argument("STRIX_INK_LOWBIT_HEAD combines with no other weight arm");
     options.qualify = policy;
@@ -323,6 +329,23 @@ inline unsigned mini_verify_rows(const profile::Resolution& tier) {
     throw std::invalid_argument("STRIX_INK_VERIFY_ROWS must be 0, 1 or 2");
 }
 
+// The all-on record of the verify rows lever: the reason a selected level is not admitted (nullptr: admitted or not
+// selected). The decoder admits it on HIP when a verify window of two or more rows exists (set_verify_rows).
+inline const char* mini_verify_rows_decline(unsigned selected, unsigned admitted) noexcept {
+    return selected != 0U && admitted == 0U ? "HIP verify windows of two or more rows only" : nullptr;
+}
+
+// Level 1 of the verify rows lever only shapes verify windows: a run that does not speculate stages none (the lanes
+// pick of level 2 also serves cohorts, so it is not idle). nullptr: the lever has a window to shape or is not level 1.
+inline const char* mini_verify_rows_idle(unsigned selected, bool speculating) noexcept {
+    return selected == 1U && !speculating ? "the run does not speculate: no verify window runs" : nullptr;
+}
+// The record of both entry points (all_on_engaged.hpp): once per run, at its speculation decision.
+inline void mini_record_verify_rows_idle(unsigned selected, bool speculating, std::ostream& out) {
+    if (const char* idle = mini_verify_rows_idle(selected, speculating))
+        (void)profile::all_on::engaged("STRIX_INK_VERIFY_ROWS", false, idle, out);
+}
+
 // Resolved speculation row (kMiniSpeculation): true = auto. The one default of the command line and the server; an
 // explicit --speculation of either entry point wins over it.
 inline bool mini_speculation(const profile::Resolution& tier) {
@@ -489,6 +512,10 @@ MiniDecoderLevers configure_mini_decoder(Decoder& decoder, moe_core::grouped_w4a
     levers.prepared_round_fold = decoder.set_prepared_round_fold(prepared_round_fold);
     levers.down_image = decoder.set_combine_image(combine_image);
     levers.verify_rows = decoder.set_verify_rows(verify_rows);
+    if (const char* decline = mini_verify_rows_decline(verify_rows, levers.verify_rows)) {
+        static const bool recorded = profile::all_on::engaged("STRIX_INK_VERIFY_ROWS", false, decline, std::cerr);
+        (void)recorded;
+    }
     levers.head = decoder.set_screened_head(screened_head);
     return levers;
 }
@@ -775,6 +802,9 @@ auto load_mini_weight_pack(weight::WeightLoadPlan& plan, profile::Name tier, con
         if (const auto checked = rows.admitted->verify_identity(); !checked) throw std::runtime_error(checked.detail);
         return loaded;
     } catch (const std::runtime_error& error) {
+        if (options.qualify == &kMiniSp4HeadPolicy)
+            (void)profile::all_on::engaged("STRIX_INK_LOWBIT_HEAD", false,
+                                           "no calibrated pack was admitted; incumbent weights", receipt);
         receipt << "strix-lowbit-pack/v2 declined (" << error.what() << "); retrying incumbent weights\n";
         plan = mini_plain_weight_fallback(tier, options, incumbent_scope, extent,
                                           "calibrated pack declined; incumbent weights");

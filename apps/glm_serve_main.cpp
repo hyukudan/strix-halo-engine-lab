@@ -57,6 +57,7 @@
 #include "glm_prefill_turbo.hpp"
 #include "glm/prefill/glm_pf_wmma.hpp"
 #include "glm_auto_rows.hpp"
+#include "strix/profile/all_on_engaged.hpp"
 #include "strix/env_flags.hpp"
 #include "glm_rank_startup.hpp"
 #include "glm_pair_hello.hpp"
@@ -1548,6 +1549,8 @@ int main(int argc, char** argv) {
         lc.mtp = mtp_on;
         lc.sampling = sampling;
         lc.sampled_mtp = eff.sampled_mtp.on();  // the resolved row (rd::resolve_sampled_mtp), nothing else
+        if (const char* decline = rd::sampled_mtp_decline(eff.sampled_mtp, mtp_on, sampling))
+            (void)strix::profile::all_on::engaged("STRIX_GLM_SERVE_SAMPLED_MTP", false, decline, std::cerr);
         lc.sampler_options = sampler_options;
         lc.mtp_cycles = mtp_cycles;
         lc.g2 = g2_on;

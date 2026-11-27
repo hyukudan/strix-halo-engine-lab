@@ -460,6 +460,7 @@ int main(int argc, char** argv) {
             return found;
         }();
         const bool speculating = options.generation.speculation != serve::CliSpeculation::off;
+        mini_record_verify_rows_idle(mini_verify_rows(options.tier), speculating, std::cerr);
 #if defined(STRIX_INKLING2_STEP_PROGRAM)
         if (step_program)
             family.load = [program_load = cli::select_mini_cuda_program(program_options.epilogue_fusion,

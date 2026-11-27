@@ -87,6 +87,27 @@ bool check_cuda_bf16_paths() {
            plan(input, 3072U, 2048U, false) == Bf16RowPath::short_rows;
 }
 
+// The compact narrow schedule splits a call only with a narrow projection and no ordered alias between projections.
+bool check_compact_call_split() {
+    using namespace strix::core;
+    using fma_rows::bf16_compact_call_split;
+    using fma_rows::bf16_compact_narrow_present;
+    alignas(16) static float input[2048U * 48U];
+    alignas(16) static float out_a[2048U * 96U], out_b[2048U * 96U];
+    static std::uint16_t weights_a[96U * 48U], weights_b[96U * 48U];
+    const unsigned rows = 2048U, width = 48U;
+    const Bf16RowProjection narrow{weights_a, 24U, out_a, true};
+    const Bf16RowProjection wide{weights_b, 96U, out_b, true};
+    const Bf16RowProjection both[] = {wide, narrow};
+    const Bf16RowProjection only_wide[] = {wide};
+    // the narrow output aliases the wide output: an ordered alias keeps the shared tile
+    const Bf16RowProjection aliased[] = {wide, {weights_a, 24U, out_b, true}};
+    return bf16_compact_narrow_present(width, rows, both) && !bf16_compact_narrow_present(width, rows, only_wide) &&
+           !bf16_compact_narrow_present(width, gemv_rows::max_rows, both) &&
+           bf16_compact_call_split(input, width, rows, both) && !bf16_compact_call_split(input, width, rows, only_wide) &&
+           bf16_compact_narrow_present(width, rows, aliased) && !bf16_compact_call_split(input, width, rows, aliased);
+}
+
 bool check_hip_compact_bf16() {
     using namespace strix::core;
     using f16_tile_gemm::Bf16TileShape;
@@ -701,7 +722,7 @@ int main() {
     if (!check_row_chunks() || !check_projection_groups() || !check_cuda_bf16_paths() ||
         !check_cuda_bf16_fast_terms() || !check_reported_planes() || !check_exact_operand_planes() || !check_image_routes() ||
         !check_image_route_order() || !check_dense_declared() || !check_low_rank_bound() ||
-        !check_staged_scan() || !check_hip_compact_bf16()) {
+        !check_staged_scan() || !check_hip_compact_bf16() || !check_compact_call_split()) {
         std::cerr << "Dense row or projection chunk policy failed\n";
         return 1;
     }

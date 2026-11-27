@@ -23,6 +23,21 @@ constexpr bool admits_bf16_compact_projection(unsigned width, unsigned rows, con
            plan_bf16_row_projection(width, projection.outputs, rows, true, limits) == Bf16RowPath::big_compact;
 }
 
+// True when some projection of the call takes the compact narrow tile.
+inline bool bf16_compact_narrow_present(unsigned width, unsigned rows, std::span<const Bf16RowProjection> projections) noexcept {
+    for (const auto& projection : projections)
+        if (admits_bf16_compact_projection(width, rows, projection)) return true;
+    return false;
+}
+
+// The compact narrow schedule splits a call only when a projection is narrow and the call has no ordered alias
+// (image_routes_order_free). One source for enqueue_bf16_rows and for the all-on record of the lever.
+inline bool bf16_compact_call_split(const float* input, unsigned width, unsigned rows,
+                                    std::span<const Bf16RowProjection> projections) noexcept {
+    return bf16_compact_narrow_present(width, rows, projections) &&
+           image_routes_order_free(input, width, rows, projections, true);
+}
+
 inline Bf16RowsPath bf16_rows_path(unsigned input_width, unsigned rows, std::span<const Bf16RowProjection> projections,
                                    unsigned max_outputs) noexcept {
     constexpr auto max_elements = std::numeric_limits<std::size_t>::max() / sizeof(float);

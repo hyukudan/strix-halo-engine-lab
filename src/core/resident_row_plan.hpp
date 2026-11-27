@@ -161,6 +161,15 @@ constexpr bool lowbit_sweep_cell(std::string_view arch, unsigned bits, unsigned 
             return std::ranges::find(cell.rows, rows) != cell.rows.end();
     return false;
 }
+// True when a measured cell exists for this device and one of the model's projection input widths: the rows-select
+// lever can change a launch only then (every other launch keeps the group-scale arithmetic).
+constexpr bool lowbit_sweep_reachable(std::string_view arch, std::span<const unsigned> widths,
+                                      std::span<const LowBitSweepCell> cells = kLowBitSweepCells) {
+    if (arch.empty()) return false;
+    for (const auto& cell : cells)
+        if (cell.arch == arch && std::ranges::find(widths, cell.width) != widths.end()) return true;
+    return false;
+}
 static_assert([] {
     for (const auto& cell : kLowBitSweepCells) {
         if ((cell.bits != 4U && cell.bits != 6U) || cell.rows.empty() || cell.width % 128U != 0U)

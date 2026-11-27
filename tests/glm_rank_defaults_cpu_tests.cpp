@@ -928,6 +928,12 @@ void test_sampled_mtp_admission() {
     CHECK(fast.sampled_mtp.route == rd::SampledMtp::rejection && fast.sampled_mtp.acceptance() == strix::SampledAcceptance::rejection);
     CHECK(fast.product && fast.product->engine_overrides.size() == 1 &&
           fast.product->engine_overrides[0] == "STRIX_GLM_SERVE_SAMPLED_MTP=rejection");
+    // all-on record: the route that does not run says why (nullptr: it runs or the row is off)
+    CHECK(rd::sampled_mtp_decline(def.sampled_mtp, false, false) == nullptr);
+    const auto coupled = resolve(args, {{"STRIX_GLM_SERVE_SAMPLED_MTP", "coupled"}});
+    CHECK(rd::sampled_mtp_decline(coupled.sampled_mtp, true, true) == nullptr);
+    CHECK(std::string(rd::sampled_mtp_decline(coupled.sampled_mtp, false, true)) == "MTP self-speculation is off in this run");
+    CHECK(std::string(rd::sampled_mtp_decline(coupled.sampled_mtp, true, false)) == "this server does not serve sampled requests");
     CHECK(line_of(fast).find("identity glm-sampled-mtp-rejection-v1;") != std::string::npos);
     // the two rules and off are distinct resolution identities; unset keeps the legacy (pre-row) fingerprint
     const auto fp = [&](const char* v) {

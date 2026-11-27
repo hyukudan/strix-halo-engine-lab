@@ -270,6 +270,15 @@ struct SampledMtpPolicy {
     }
 };
 
+// The all-on record of the row (all_on_engaged.hpp): why a resolved sampled-MTP route does not run in this server
+// (nullptr: it runs, or the row is off). Sampled requests reach MTP only with MTP self-speculation on and sampling served.
+[[nodiscard]] inline const char* sampled_mtp_decline(const SampledMtpPolicy& policy, bool mtp_on, bool sampling) noexcept {
+    if (!policy.on()) return nullptr;
+    if (!mtp_on) return "MTP self-speculation is off in this run";
+    if (!sampling) return "this server does not serve sampled requests";
+    return nullptr;
+}
+
 struct Effective {
     std::optional<strix::profile::Resolution> product;
     bool baseline = false;

@@ -3,6 +3,7 @@
 #include "core/resident_row_plan.hpp"
 #include "inkling2_mini_weight_options.hpp"
 #include "strix/device/runtime.hpp"
+#include "strix/profile/all_on_engaged.hpp"
 #include "strix/model_content_hash.hpp"
 
 #include <algorithm>
@@ -11,6 +12,7 @@
 
 #if defined(__HIPCC__)
 #include "device/hip_cost_identity.hpp"
+#include "device/hip_current_device_arch.hpp"
 #include "strix/device/hip_enumerator.hpp"
 #include "strix/device/hip_gate.hpp"
 #include <hip/hip_runtime_api.h>
@@ -146,6 +148,16 @@ auto load_mini_weights(const std::string& model, weight::WeightLoadPlan& plan, p
     };
     if (arithmetic != kMiniLowBitArithmetic && (!admits_arithmetic() || scope.backend != weight::Backend::hip))
         throw std::invalid_argument("the low-bit arithmetic candidate requires resident HIP q4_g64 or q6_g64 weights");
+#if defined(__HIPCC__)
+    // One record with --all-on: the rows-select lever runs only in measured cells (core::kLowBitSweepCells), none of
+    // which has an input width of this model (all_on_engaged.hpp).
+    if (arithmetic == core::LowBitArithmetic::f16_rows_select) {
+        static constexpr unsigned kWidths[] = {kHiddenWidth, kQueryWidth, kExpertWidth};
+        (void)strix::profile::all_on::engaged(
+            "STRIX_LOWBIT_ROWS_SELECT", core::lowbit_sweep_reachable(strix::hip::arch::current_device_arch_name(), kWidths),
+            "no measured cell for this device and this model's projection widths", std::cerr);
+    }
+#endif
     if (!lowbit)
         return load_mini_weight_pack(plan, tier, options, scope, extent, {}, nullptr, std::cerr, load);
     const auto load_with_arithmetic = [&](MiniLowBitRows rows) {

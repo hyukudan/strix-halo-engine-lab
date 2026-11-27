@@ -1,7 +1,10 @@
 #pragma once
 
+#include "strix/profile/all_on_engaged.hpp"
+
 #include <cstddef>
 #include <memory>
+#include <ostream>
 #include <span>
 #include <stdexcept>
 #include <type_traits>
@@ -54,9 +57,19 @@ public:
         return *reply_;
     }
 
+    [[nodiscard]] bool pinned() const noexcept { return pinned_; }
+
 private:
     Reply* reply_ = nullptr;
     bool pinned_ = false;
 };
+
+// One record with --all-on (all_on_engaged.hpp): STRIX_HIP_PINNED_REPLIES stages a reply through pinned host memory;
+// when the host allocator refuses, the reply uses reusable pageable storage and the lever is not engaged.
+template<class Reply, class Backend>
+inline void record_pinned_reply(const StreamReadback<Reply, Backend>& readback, std::ostream& out) {
+    (void)profile::all_on::engaged("STRIX_HIP_PINNED_REPLIES", readback.pinned(),
+                                   "pinning was refused: pageable staging storage", out);
+}
 
 }  // namespace strix::session

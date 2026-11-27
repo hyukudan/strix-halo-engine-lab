@@ -104,6 +104,7 @@ ResolvedService resolve(const serve::ServiceSelection& selection, const MiniServ
     out.speculation_requested = out.speculation_policy.requested;
     out.speculation = out.speculation_policy.admitted;
     out.lane_speculation = out.speculation && resolved.backend != "hip";
+    mini_record_verify_rows_idle(mini_verify_rows(resolution), out.speculation, std::cerr);
     out.verify_rows = mini_speculation_verify_rows(mini_verify_rows(resolution), out.speculation);
     // The W4A4 class is admitted for the resolved backend (HIP refuses a selected class instead of running BF16).
     out.moe_w4a4 = admit_mini_moe_w4a4(resolution, resolved.backend);

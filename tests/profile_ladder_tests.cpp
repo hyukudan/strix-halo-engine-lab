@@ -819,6 +819,17 @@ void strixpack_candidates() {
     }
 }
 
+// The rows-select lever can change a launch only in a measured cell: device and input width must both be in the table.
+void lowbit_sweep_reachability() {
+    using strix::core::lowbit_sweep_reachable;
+    constexpr unsigned inkling[] = {2304U, 3072U, 1152U};
+    constexpr unsigned cell_width[] = {5120U};
+    static_assert(lowbit_sweep_reachable("gfx1151", cell_width));
+    static_assert(!lowbit_sweep_reachable("gfx1151", inkling));
+    static_assert(!lowbit_sweep_reachable("gfx1100", cell_width));
+    static_assert(!lowbit_sweep_reachable("", cell_width));
+}
+
 void lowbit_candidate(const p::Lever& candidate, strix::core::LowBitArithmetic candidate_arithmetic,
                       const p::Regime& regime) {
     using strix::core::LowBitArithmetic;
@@ -1855,6 +1866,7 @@ int main(int argc, char** argv) try {
     }
     incumbents(argv[2], false);
     strixpack_candidates();
+    lowbit_sweep_reachability();
     lowbit_candidate(strix::weight::kLowBitFoldedScaleLever, strix::core::LowBitArithmetic::f16_folded_scale,
                      {p::Phase::prefill, 8192U, 1, "gfx1151", kExec});
     lowbit_candidate(strix::weight::kLowBitRowsSelectLever, strix::core::LowBitArithmetic::f16_rows_select,
