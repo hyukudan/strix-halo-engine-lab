@@ -9,6 +9,7 @@
 #include "hy4/hip/hy4_hip_forward.hpp"
 #include "hy4/hip/hy4_hip_plan.hpp"
 #include "hy4/hip/hy4_hip_rows.hpp"
+#include "hy4/ref/hy4_dfly_pack.hpp"
 #include "strix/hy4/tp_layout.hpp"
 
 #include "attn_core/cache_rows.hpp"
@@ -481,8 +482,11 @@ struct Forward::Impl {
         return layer >= first && layer < last;
     }
     // per-block attention / FFN form: the text layers' arrays, else the next-token block's (hy4_host_ref State::heads_of)
-    [[nodiscard]] std::uint32_t heads_of(std::uint32_t l) const { return l < c.layers ? c.heads[l] : c.nextn_heads; }
-    [[nodiscard]] bool indexed_of(std::uint32_t l) const { return l < c.layers ? c.indexed[l] != 0U : c.nextn_indexed != 0U; }
+    // DFly2 draft blocks (l > c.layers, hy4_hip_dfly.inc): the target's indexed 32-head DSA layer form, without an indexer
+    [[nodiscard]] std::uint32_t heads_of(std::uint32_t l) const {
+        return l < c.layers ? c.heads[l] : l == c.layers ? c.nextn_heads : 32U;
+    }
+    [[nodiscard]] bool indexed_of(std::uint32_t l) const { return l < c.layers ? c.indexed[l] != 0U : l == c.layers ? c.nextn_indexed != 0U : true; }
     [[nodiscard]] bool dense_of(std::uint32_t l) const { return l < c.layers && c.dense[l] != 0U; }
 
     void load(const std::vector<std::filesystem::path>& parts) {
@@ -2348,6 +2352,7 @@ struct Forward::Impl {
     }
 
 #include "hy4/hip/hy4_hip_rows.inc"  // verify rows (hy4_rows): forward_rows / commit_rows over the step's helpers
+#include "hy4/hip/hy4_hip_dfly.inc"  // DFly2 block drafter: draft layers as target DSA blocks over the shared latent caches
 };
 
 Forward::Forward(const ForwardOptions& o) : impl_(std::make_unique<Impl>()) {
@@ -2377,6 +2382,7 @@ Forward::Forward(const ForwardOptions& o) : impl_(std::make_unique<Impl>()) {
     if (impl_->rmax) impl_->allocate_prompt();
     if (impl_->vr.max) impl_->allocate_verify();
     if (impl_->nx.on) impl_->allocate_nextn();
+    if (!o.dfly.empty()) impl_->allocate_dfly(o.dfly, o.dfly_format);
 }
 void Forward::forward_rows(std::span<const std::uint32_t> tokens, bool logits) { impl_->forward_rows(tokens, logits); }
 std::span<const std::uint32_t> Forward::rows_greedy() const noexcept { return impl_->vr.greedy; }
@@ -2440,6 +2446,13 @@ Forward::~Forward() {
 }
 const float* Forward::rows_hidden() const noexcept { return impl_->vr.xn; }
 bool Forward::has_nextn() const noexcept { return impl_->nx.on; }
+bool Forward::has_dfly() const noexcept { return impl_->df.on; }
+void Forward::dfly_hidden(const float* device_row) { copy_f32_async(impl_->df.hid, device_row, impl_->c.hidden); }
+void Forward::dfly_block(std::uint32_t anchor, std::uint32_t pos, std::uint32_t k, std::uint32_t* proposals) {
+    impl_->dfly_block(anchor, pos, k, proposals);
+}
+std::uint64_t Forward::dfly_blocks() const noexcept { return impl_->df.blocks; }
+double Forward::dfly_ms() const noexcept { return impl_->df.ms; }
 void Forward::set_nextn_row_loop(bool on) noexcept { impl_->nx.row_loop = on; }
 void Forward::set_nextn_head(NextnHead head) { impl_->nx.head = head; }
 void Forward::set_nextn_tp(bool on) {

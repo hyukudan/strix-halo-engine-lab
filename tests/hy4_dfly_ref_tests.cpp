@@ -36,6 +36,7 @@ public:
     }
     std::span<const float> embed(std::uint32_t token) override {
         if (token >= vocab_) throw std::out_of_range("tiny target: token");
+        embedded.push_back(token);
         return {emb.data() + std::size_t{token} * g_.hidden, g_.hidden};
     }
     std::span<const float> latent(std::uint32_t layer, std::uint32_t pos) override {
@@ -48,6 +49,7 @@ public:
             for (std::size_t i = 0; i < g_.hidden; ++i) out[r] += head[r * g_.hidden + i] * y[i];
     }
     std::vector<float> emb, head, lat;
+    std::vector<std::uint32_t> embedded;  // every embed() id, in call order
     std::uint32_t limit = 0;  // the anchor position: target rows at or after it do not exist yet
 
 private:
@@ -70,7 +72,7 @@ void run() {
     const std::uint32_t pos = 6;
     t.limit = pos;
     const Variant causal = parse_variant("h=post,fus=eh,hc=off,mask=causal");
-    check(Variant{}.fusion == FusionForm::e_plus_gate && Variant{}.mask == Mask::causal && Variant{}.correction == Correction::off &&
+    check(Variant{}.fusion == FusionForm::e_plus_gate && Variant{}.mask == Mask::causal && Variant{}.correction == Correction::chain &&
               Variant{}.hidden == HiddenForm::post_norm,
           "default = the measured choice");
 
@@ -115,6 +117,27 @@ void run() {
     check(!same(draft(g, parse_variant("fus=e+g"), *w, t, 3, pos, h, g.block).final_rows, b4.final_rows, g.hidden),
           "gate fusion changes slot 0");
     check(!same(draft(g, causal, *w, t, 4, pos, h, g.block).final_rows, b4.final_rows, g.hidden), "anchor token matters");
+
+    // hidden_correction chain (the publisher's serving contract)
+    {
+        const auto off = draft(g, parse_variant("hc=off"), *w, t, 3, pos, h, g.block);
+        t.embedded.clear();
+        const auto ch = draft(g, parse_variant("hc=chain"), *w, t, 3, pos, h, g.block);
+        check(same(ch.final_rows, off.final_rows, off.final_rows.size()), "chain: the trunk (final rows) is untouched");
+        // embeds: anchor + mask (the block), then prev = anchor for slot 1 and the slot j-1 pick for j >= 2
+        std::vector<std::uint32_t> want{3U, g.mask_id, 3U};
+        for (std::size_t j = 0; j + 2U < g.block; ++j) want.push_back(ch.proposals[j]);
+        check(t.embedded == want, "chain: slot j reads E(anchor) for j = 1, else E(own pick j-1), in order");
+        const auto c3 = draft(g, parse_variant("hc=chain"), *w, t, 3, pos, h, 3);
+        check(c3.proposals[0] == ch.proposals[0] && c3.proposals[1] == ch.proposals[1], "chain: proposals are a prefix");
+        const auto one = draft(g, parse_variant("hc=chain,cand=1"), *w, t, 3, pos, h, g.block);
+        check(one.proposals == off.proposals, "chain with one candidate = the uncorrected argmax");
+        const auto all = draft(g, parse_variant("hc=chain,cand=16"), *w, t, 3, pos, h, g.block);
+        check(all.proposals == ch.proposals, "chain with every candidate = the full corrected argmax");
+        bool conf_moved = false;
+        for (std::size_t j = 0; j < ch.confidence.size(); ++j) conf_moved = conf_moved || ch.confidence[j] != off.confidence[j];
+        check(conf_moved, "chain: confidence reads the corrected row");
+    }
 
     // invalid input
     bool threw = false;
