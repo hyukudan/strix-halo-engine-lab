@@ -3,7 +3,10 @@
 //  - exchange_host() and exchange() are interchangeable on the wire, also after ready-view exchanges whose CRC is
 //    deferred: the deferred CRC is carried and checked by both calls, in both mixed orders (host/device, device/host),
 //    host/host, host/host/device/device and staged/host/staged/device; a corrupted deferred payload fails the next
-//    exchange_host() on the receiving rank (before: it was never checked by exchange_host());
+//    exchange_host() on the receiving rank (before: it was never checked by exchange_host()); the damage is injected
+//    above a transport that verifies delivery (a host-memory fault after delivery);
+//  - over a transport that does not verify delivery (raw stream) the CRC is never deferred: a damaged payload fails
+//    the exchange that carries it, before its view is handed to a consumer;
 //  - transfer() is one way on every route of the default table (host <= 64 KiB, device <= 1 MiB, mixed above):
 //    the bytes arrive, nothing travels in the unused direction (host or device), no early receive is posted; a
 //    deferred CRC rides one-way messages per direction (a corrupted one fails at the receiving rank);
@@ -55,10 +58,13 @@ std::byte pattern(unsigned rank, std::size_t i, unsigned salt) {
 class Counting final : public Transport {
     std::unique_ptr<Transport> inner_;
     long corrupt_at_;
+    bool verifies_;
     long seen_ = 0;
 public:
     std::atomic<std::uint64_t> sent{0};
-    Counting(std::unique_ptr<Transport> inner, long corrupt_at) : inner_(std::move(inner)), corrupt_at_(corrupt_at) {}
+    Counting(std::unique_ptr<Transport> inner, long corrupt_at, bool verifies)
+        : inner_(std::move(inner)), corrupt_at_(corrupt_at), verifies_(verifies) {}
+    bool verifies_delivery() const noexcept override { return verifies_ && inner_->verifies_delivery(); }
     void send(std::span<const std::byte> b) override { sent += b.size(); inner_->send(b); }
     void receive(std::span<std::byte> b) override { inner_->receive(b); flip(b); }
     void exchange(std::span<const std::byte> out, std::span<std::byte> in) override {
@@ -137,6 +143,7 @@ struct Rank {
 struct PairOptions {
     bool direct = false, one_way_form = true;
     long corrupt_rank1_at = -1;
+    bool raw_host = false;  // the host transport does not verify delivery (a raw USB4 stream)
     std::size_t max_bytes = std::size_t{1} << 20U;
 };
 std::array<Rank, 2> make_pair(const PairOptions& o) {
@@ -145,7 +152,7 @@ std::array<Rank, 2> make_pair(const PairOptions& o) {
     auto wire = std::make_shared<DeviceWire>();
     std::array<Rank, 2> ranks;
     for (unsigned r = 0; r < 2U; ++r) {
-        auto host = std::make_unique<Counting>(std::move(t[r]), r == 1U ? o.corrupt_rank1_at : -1L);
+        auto host = std::make_unique<Counting>(std::move(t[r]), r == 1U ? o.corrupt_rank1_at : -1L, !o.raw_host);
         ranks[r].host = host.get();
         const Group group{r, 2U, 1U, 0x7465737400000001ULL};
         if (o.direct) {
@@ -250,6 +257,22 @@ void carry_interop() {
                std::string("corrupted deferred payload, then ") + (host_next ? "exchange_host" : "exchange") +
                    ": rank 1 must fail on the deferred CRC, got '" + errs[1] + "'");
         expect(errs[0].empty(), "corrupted deferred payload: rank 0 (sound data) passes, got '" + errs[0] + "'");
+    }
+    // Over a raw host stream the same damage fails the ready-view exchange itself (checked before the view is handed
+    // over); the deferred carry never starts. (Rank 0's outcome is the two-rank failure contract, not checked here.)
+    {
+        std::fputs("[dist-contract] carry_interop corrupted raw host\n", stderr);
+        auto fresh = make_pair({.corrupt_rank1_at = 0, .raw_host = true});
+        bool viewed = false;
+        const auto errs = run(fresh, [&](unsigned r, Rank& rank) {
+            auto& c = *rank.comm;
+            staged(c, r, 4096U, 1U, false);
+            if (r == 1U) viewed = true;
+            host_control(c, r, 2U);
+        });
+        expect(errs[1].find("payload CRC mismatch [exchange 0") != std::string::npos && errs[1].find("(deferred") == std::string::npos,
+               "raw host stream: the damaged ready view fails its own exchange, got '" + errs[1] + "'");
+        expect(!viewed, "raw host stream: rank 1 never gets past the damaged ready view");
     }
 }
 
