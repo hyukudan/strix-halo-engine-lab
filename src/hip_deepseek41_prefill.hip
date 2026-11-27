@@ -355,7 +355,9 @@ std::uint32_t prefill_joint_layer_rows() { return strix::envcfg::number<std::uin
 // FAST policy ds41-decoder-replay-bounded-v1 (STRIX_DS41_DECODER_REPLAY = R rows, a multiple of 128; 0/unset off; set by the
 // governed profile table): every decoder layer runs only its last R rows, window keys floored at the cut
 // (ds41::plan_bounded_replay). STRIX_DS41_DECODER_REPLAY_ORACLE=1 (measurement only): the exact cone's rows with the same
-// key floors, whose last-row logits and state must equal the bounded run's bit for bit (fixture b).
+// key floors, whose last-row logits and state equal the bounded run's bit for bit only without row-set dependent FAST
+// levers (fixture b); under the FAST set (for one, FAST Engram's per-view FP16 flag) they differ (ds_replay: en32-a R = 512,
+// the last 8 head rows, which both forms compute, differ), so the bounded run keeps every decoder row from the cut.
 std::uint32_t prefill_decoder_replay_rows() { return strix::envcfg::number<std::uint32_t>("STRIX_DS41_DECODER_REPLAY", 0U, 0U, 65536U); }
 bool prefill_decoder_replay_oracle() { return strix::envcfg::flag("STRIX_DS41_DECODER_REPLAY_ORACLE", false, strix::EnvFlagMatch::exact); }
 unsigned prefill_window_drain() { return strix::envcfg::number<unsigned>("STRIX_DS41_PREFILL_WINDOW_DRAIN", 1U, 0U, 3U); }
@@ -1774,9 +1776,9 @@ PrefillResult DevicePrefill::run_full_prompt(std::span<const std::uint32_t> toke
         ~RestoreOptions() { active = std::move(previous); }
     } restore{m.options, m.options};
     apply_d1_prefill(m.options);
-    if (replay && replay->value == "256") {
+    if (const auto bound = pair_defaults::resolved_replay_rows(*resolution); replay && bound != 0U) {
         std::fprintf(stderr, "%s\n", replay->ladder.c_str());
-        m.options.decoder_replay_rows = 256U;
+        m.options.decoder_replay_rows = bound;
     }
     return run(tokens);
 }

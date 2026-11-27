@@ -118,11 +118,14 @@ const strix::profile::Resolution& profile_resolution();
 // Fresh whole-prompt device prefill only. The adapter supplies its measured reference route, the live lane count of
 // the pass (sequences in one prefill forward) and runtime device facts; the band rows bound the lanes.
 // A drafter seed (options.draft_rows, the serve's DSpark: 128 rows) is admitted up to the replay bound when the band
-// also resolves decoder_replay 256: plan_bounded_replay computes the same rows for any draft_rows <= R, so the seed is
-// a copy of rows the CLI's execution computes anyway. Without the replay (a cone widened by the seed) it declines.
+// also resolves a decoder_replay bound R >= draft_rows: plan_bounded_replay runs every decoder row from the cut, which
+// holds any seed <= R, so the seed adds no row and the logits and state stay the CLI's bits.
+// Without the replay (a cone widened by the seed) it declines.
 std::optional<strix::profile::Resolution> resolve_prefill_profile(const strix::profile::Resolution& startup,
     const PrefillOptions& options, std::uint64_t prompt_tokens, std::uint32_t lanes, std::string_view device_product,
     bool measured_reference);
+// The decoder_replay bound R a resolution sets (0: off, absent or not a positive multiple of 128).
+[[nodiscard]] std::uint32_t resolved_replay_rows(const strix::profile::Resolution& resolution);
 // The served device prefill enters the one admission (DevicePrefill::run_full_prompt, the pair prefill CLI's entry)
 // for a fresh whole text prompt run as one piece, whatever the slot count: the band rows then decide as for the CLI.
 // A server with a disk tier (prefix cache directory, session directory) keeps the previous route: the cache namespace

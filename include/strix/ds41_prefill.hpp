@@ -136,6 +136,10 @@ bool try_grow_moe_scratch(std::unique_ptr<Scratch>& current, std::uint64_t bytes
 // out_begin = kv_begin = max(cached, floor), and a row s of a decoder layer reads the window keys
 // max(kv_begin, s - window + 1) .. s (the key floor; no window key of that layer before the cut). The first decoder
 // layer still projects every row's compressed KV and index keys (the engine's x0 = 0): those keys stay readable.
+// The first window - 1 rows above the cut of every decoder layer attend a truncated window.
+// Its effects accumulate through the decoder. Keep every row from the cut: with FAST,
+// row-set-dependent choices such as Engram's FP16 fallback can change the last head rows
+// when replay is reduced to its dependency cone. Qualification used the full rows.
 // Policy identity: floor = round_down(max(T - R, 0), 256), independent of window_rows.
 // 256 is the largest legal scheduling window (attn::kMaxCallRows); v1 scheduling windows must divide it.
 // draft_rows > R is refused.

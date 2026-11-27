@@ -13,7 +13,9 @@
 
 #include <algorithm>
 #include <array>
+#include <charconv>
 #include <string_view>
+#include <system_error>
 #include <chrono>
 #include <stdexcept>
 #include <cstdio>
@@ -269,12 +271,21 @@ std::optional<strix::profile::Resolution> resolve_prefill_profile(const strix::p
     inputs.env = [](const char*) -> const char* { return nullptr; };
     inputs.regime = {p::Phase::prefill, prompt_tokens, lanes, "gfx1151", execution};
     auto out = p::resolve(profile_engine(), inputs);
-    // A drafter seed rides only on the bounded replay (the same rows for any seed <= R); D1 alone would widen its cone.
+    // A drafter seed rides only on the bounded replay (its rows above the cut, seed <= R); D1 alone would widen its cone.
     if (const auto* d1 = out.find("d1_prefill"); o.draft_rows != 0U && d1 != nullptr && d1->value == "1") {
-        const auto* replay = out.find("decoder_replay");
-        if (replay == nullptr || replay->value != "256") return std::nullopt;
+        const auto bound = resolved_replay_rows(out);
+        if (bound == 0U || o.draft_rows > bound) return std::nullopt;
     }
     return out;
+}
+
+std::uint32_t resolved_replay_rows(const strix::profile::Resolution& resolution) {
+    const auto* replay = resolution.find("decoder_replay");
+    if (replay == nullptr) return 0U;
+    std::uint32_t rows = 0;
+    const auto& v = replay->value;
+    const auto [end, ec] = std::from_chars(v.data(), v.data() + v.size(), rows);
+    return ec == std::errc{} && end == v.data() + v.size() && rows % 128U == 0U ? rows : 0U;
 }
 
 const std::vector<std::pair<std::string, std::string>>& baseline_off_items() {

@@ -506,6 +506,10 @@ void ds41() {
         const auto result = pd::resolve_prefill_profile(*startup.profile, o, prompt, 1U,
                                                        "gfx1151|AMD Radeon 8060S Graphics|fixture", true);
         if (!result) return {{"d1_prefill", "declined"}, {"decoder_replay", "declined"}};
+        // the bound the served admission and the seed rule take (pd::resolved_replay_rows) is the resolved cell's value
+        const auto value = std::string(result->find("decoder_replay")->value);
+        if (pd::resolved_replay_rows(*result) != (value == "0" ? 0U : static_cast<std::uint32_t>(std::stoul(value))))
+            return {{"d1_prefill", "replay bound mismatch"}, {"decoder_replay", value}};
         return {{"d1_prefill", result->find("d1_prefill")->value}, {"decoder_replay", result->find("decoder_replay")->value},
                 {"profile.receipt", result->json()}};
     };
