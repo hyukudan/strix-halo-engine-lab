@@ -191,6 +191,7 @@ std::vector<Result> run_chain(const Weights& m, const std::vector<std::uint32_t>
                     layers::RelayOps r;
                     r.save = [&](std::uint32_t layer) { return t.save(layer, layer + 1U); };
                     r.load = [&](std::uint32_t layer, std::span<const std::byte> b) { t.load(layer, layer + 1U, b); };
+                    r.layer_bytes = [](std::uint32_t) { return std::uint64_t{H} * 8U; };
                     if (relay_decoder % 2U) r.checksum = [](std::span<const std::byte> b) {   // an injected checksum (odd decoders)
                         std::uint32_t h = 2166136261U; for (auto v : b) { h ^= std::to_integer<std::uint32_t>(v); h *= 16777619U; } return h; };
                     const auto rs = layers::relay_state(p, relay_decoder, first, up ? &lu : nullptr, down ? &ld : nullptr, r);
@@ -511,9 +512,18 @@ int main() {
             } catch (const std::exception& e) { return std::string(e.what()); }
             return std::string("no error");
         };
-        const auto huge = relay_error(0U, std::uint64_t{1} << 40, false);
-        expect(huge.find("message length 1099511627776 bytes for layer 0, bound 4294967296 (protocol error)") != std::string::npos,
+        const auto huge = relay_error(0U, std::uint64_t{1} << 40, true);
+        expect(huge.find("message length 1099511627776 bytes for layer 0, expected 64 (protocol error)") != std::string::npos,
                "relay header with a huge length refused before allocation: got '" + huge + "'");
+        const auto unsized = relay_error(0U, 64U, false);
+        expect(unsized.find("the decoder needs its layer state sizes") != std::string::npos,
+               "a decoder without its layer sizes refused before reading: got '" + unsized + "'");
+        const auto own = relay_error(3U, 64U, true);
+        expect(own.find("message names layer 3 of the receiving stage itself (protocol error)") != std::string::npos,
+               "relay header naming a layer of the decoder's own stage refused before allocation: got '" + own + "'");
+        const auto wide = relay_error((std::uint64_t{1} << 32) + 1U, 64U, true);
+        expect(wide.find("of a 7-layer plan (protocol error)") != std::string::npos,
+               "relay header naming a layer past 32 bits refused: got '" + wide + "'");
         const auto off = relay_error(1U, 65U, true);
         expect(off.find("message length 65 bytes for layer 1, expected 64 (protocol error)") != std::string::npos,
                "relay header with a wrong layer length refused: got '" + off + "'");

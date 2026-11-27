@@ -375,7 +375,8 @@ struct RelayOps {
     std::function<std::uint32_t(std::span<const std::byte>)> checksum;
     std::size_t chunk_bytes = link_chunk_bytes;   // largest single transport call of a message's payload
     // Receiver-side length check of each incoming message, before its payload is allocated: the exact state bytes of one
-    // layer on this engine (empty: only the bound below applies). A header outside it is a named protocol error.
+    // layer on this engine, from its local state layout. The decoder of a plan of two or more stages must bind it; a
+    // forwarding stage may leave it empty (only the bound below applies). A header outside it is a named protocol error.
     std::function<std::uint64_t(std::uint32_t layer)> layer_bytes;
     std::uint64_t max_message_bytes = std::uint64_t{1} << 32;
 };
@@ -387,6 +388,8 @@ inline RelayStats relay_state(const Placement& p, std::uint32_t decoder, std::ui
     if (decoder >= p.stages()) throw std::invalid_argument("state relay: decoder stage outside the plan");
     if ((up != nullptr) == p.embeds() || (down != nullptr) == p.head())
         throw std::invalid_argument("layer pipeline: links do not match the stage (up: not first, down: not last)");
+    if (p.stage == decoder && p.stages() > 1U && !ops.layer_bytes)
+        throw std::invalid_argument("state relay: the decoder needs its layer state sizes (RelayOps::layer_bytes)");
     const auto start = Clock::now();
     const auto check_sum = [&](std::span<const std::byte> b) {
         if (ops.checksum) return ops.checksum(b);
@@ -401,6 +404,9 @@ inline RelayStats relay_state(const Placement& p, std::uint32_t decoder, std::ui
         if (w[1] >= layers_total)
             throw std::runtime_error("state relay: message names layer " + std::to_string(w[1]) + " of a " +
                                      std::to_string(layers_total) + "-layer plan (protocol error)");
+        if (w[1] >= p.first() && w[1] < p.last())
+            throw std::runtime_error("state relay: message names layer " + std::to_string(w[1]) +
+                                     " of the receiving stage itself (protocol error)");
         const std::uint64_t expected = ops.layer_bytes ? ops.layer_bytes(static_cast<std::uint32_t>(w[1])) : 0U;
         if ((ops.layer_bytes && w[2] != expected) || w[2] > ops.max_message_bytes)
             throw std::runtime_error("state relay: message length " + std::to_string(w[2]) + " bytes for layer " +
