@@ -318,11 +318,30 @@ int main() {
            canonical_cli.options.turbo.row_reduction.effective == canonical_serve.options.turbo.row_reduction.effective &&
            decode_cli::effective_prefill_argv(canonical_cli.options) == decode_cli::effective_prefill_argv(canonical_serve.options),
            "CLI and server share the canonical reduction contract and cache identity");
+    const auto legacy_cli = decode_cli::initialize_prefill_config({options_for({"--profile", "turbo", "--turbo-weights", "onfly",
+        "--turbo-onfly-groups=gdn_in,gdn_out"}), {{"STRIX_IU4_ROW_REDUCTION", "legacy"}}});
     expect(canonical_cli.options.turbo.identity().find("iu4-g64g96-gc32-v1") != std::string::npos &&
-           canonical_cli.options.turbo.identity() != onfly_i4::resolve({}, no_env, true).identity(),
-           "canonical reduction changes the numerical identity only when requested");
-    expect(cli.options.turbo.row_reduction.effective == Reduction::legacy &&
-           cli.options.turbo.identity() == std::string(onfly_i4::kIdentity) + "-g3-full", "legacy default identity preserved");
+           canonical_cli.options.turbo.identity() == onfly_i4::resolve({}, no_env, true).identity(),
+           "canonical reduction is the default numerical identity");
+    expect(cli.options.turbo.row_reduction.effective == Reduction::canonical &&
+           cli.options.turbo.identity() == std::string(onfly_i4::kIdentity) + "-g3-full-iu4-g64g96-gc32-v1",
+           "default identity names the row-invariant contract");
+    expect(legacy_cli.options.turbo.row_reduction.effective == Reduction::legacy &&
+           legacy_cli.options.turbo.identity() == std::string(onfly_i4::kIdentity) + "-g3-full" &&
+           decode_cli::effective_prefill_argv(legacy_cli.options) != decode_cli::effective_prefill_argv(cli.options),
+           "explicit legacy keeps its historical identity and a separate cache identity");
+    // MTP composes with the low-bit rows: the plan of every G64/G96 site is the same at 1..8 rows (verify windows), so
+    // each row of a window sums the same K groups per wave in the same order as the one-row decode step.
+    for (const unsigned groups : {32U, 40U, 64U, 96U}) {
+        const auto one = core::iu4_rows::iu4_plan(1U, groups, core::iu4_rows::parse_row_reduction(""));
+        for (unsigned rows = 2U; rows <= 8U; ++rows) {
+            const auto plan = core::iu4_rows::iu4_plan(rows, groups, core::iu4_rows::parse_row_reduction(""));
+            expect(plan.S == one.S && plan.GC == one.GC, "default reduction: verify-window rows reduce like the decode step");
+        }
+    }
+    expect(onfly_i4::weight_format_value_option("--turbo-onfly-groups") && onfly_i4::weight_format_value_option("--turbo-onfly-scale-rule") &&
+           onfly_i4::weight_format_inline_option("--turbo-onfly-groups=gdn_in") && !onfly_i4::weight_format_inline_option("--turbo-onfly-groupsx") &&
+           !onfly_i4::weight_format_value_option("--turbo-onfly"), "onfly sub-switches are weight-format options (speculation neutral)");
     const auto canonical_native = decode_cli::initialize_prefill_config({options_for({}), {{"STRIX_IU4_ROW_REDUCTION", "canonical"}}});
     expect(!canonical_native.options.turbo.row_reduction.active && canonical_native.options.turbo.identity().empty() &&
            decode_cli::effective_prefill_argv(canonical_native.options) == decode_cli::effective_prefill_argv(native.options),

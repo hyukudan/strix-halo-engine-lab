@@ -2231,7 +2231,8 @@ inline Options parse_options(
                     value_next=false;
                     if (argv[i-1]==std::string_view("--generate")) generate=std::strtoull(arg.c_str(),nullptr,10);
                     else if (argv[i-1]==std::string_view("--prompt-ids")) prompt_ids_path=arg;
-                } else if (arg=="--generate" || arg=="--context" || strix::session::speculation_neutral_value_option(arg)) {
+                } else if (arg=="--generate" || arg=="--context" || strix::session::speculation_neutral_value_option(arg) ||
+                           strix::onfly_i4::weight_format_value_option(arg)) {
                     value_next=true;
                     if (arg!="--generate" && arg!="--context") leading=false;
                     prompt_ids_file |= arg=="--prompt-ids";
@@ -2241,7 +2242,7 @@ inline Options parse_options(
                     leading=false;
                     http_serve |= arg=="--http-serve";
                     plain &= arg.starts_with("--context=") || arg=="--unqualified-context" ||
-                        strix::session::speculation_neutral_inline_option(arg) ||
+                        strix::session::speculation_neutral_inline_option(arg) || strix::onfly_i4::weight_format_inline_option(arg) ||
                         arg=="--print-effective-config" || arg=="--mtp-bundle" || arg.starts_with("--mtp-bundle=");
                 } else {
                     ++prompt_tokens;

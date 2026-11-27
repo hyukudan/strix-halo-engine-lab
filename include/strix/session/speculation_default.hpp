@@ -43,11 +43,16 @@ inline bool speculation_opt_out_argument(std::string_view argument) {
 }
 // Options the launchers add to every production command (the tier, the KV storage) and the prompt source: they
 // choose levers and inputs, never a decode route, so an engine's "plain production command" test must not count them.
+// The weight-format switches of strix/turbo.hpp (--turbo-weights, --turbo-weight-bits, --turbo-weights-pack) choose
+// which bytes the same projections read, not a decode route: speculation composes with them (a low-bit format that
+// turned the drafter off could never win), so they are neutral too.
 inline bool speculation_neutral_value_option(std::string_view argument) {
-    return argument == "--profile" || argument == "--kv" || argument == "--prompt-ids";
+    return argument == "--profile" || argument == "--kv" || argument == "--prompt-ids" || argument == "--turbo-weights" ||
+        argument == "--turbo-weight-bits" || argument == "--turbo-weights-pack";
 }
 inline bool speculation_neutral_inline_option(std::string_view argument) {
-    return argument.starts_with("--profile=") || argument.starts_with("--kv=");
+    return argument.starts_with("--profile=") || argument.starts_with("--kv=") || argument.starts_with("--turbo-weights=") ||
+        argument.starts_with("--turbo-weight-bits=") || argument.starts_with("--turbo-weights-pack=");
 }
 inline bool speculation_environment_off(const char* value) {
     const std::string_view text = value ? value : "";

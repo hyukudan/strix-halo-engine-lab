@@ -33,6 +33,13 @@ inline void require_serial(bool active, bool window_route) {
 inline void require_serial_projection(unsigned rows, bool from_a8_slot) {
     require_serial(true, rows < 1U || rows > 8U || from_a8_slot);
 }
+// The sub-switches select weight bytes, not a decode route: the speculation default treats them like --turbo-weights.
+inline constexpr std::string_view kGroupsOption = "--turbo-onfly-groups", kScaleRuleOption = "--turbo-onfly-scale-rule";
+inline bool weight_format_value_option(std::string_view a) { return a == kGroupsOption || a == kScaleRuleOption; }
+inline bool weight_format_inline_option(std::string_view a) {
+    return (a.starts_with(kGroupsOption) && a.size() > kGroupsOption.size() && a[kGroupsOption.size()] == '=') ||
+        (a.starts_with(kScaleRuleOption) && a.size() > kScaleRuleOption.size() && a[kScaleRuleOption.size()] == '=');
+}
 inline std::string_view scale_rule_name(int rule) { return rule == kScaleLegacy ? "legacy" : rule == kScaleMse ? "mse" : "full"; }
 
 enum class Source : unsigned { native = 0, onfly = 1, converted = 2 };

@@ -12,9 +12,12 @@ namespace strix::core::iu4_rows {
 
 struct Iu4Plan { unsigned S, GC; };
 enum class RowReduction { legacy, canonical };
+// Default canonical: S and GC do not depend on the row count, so every wave sums the same K groups in the same order
+// at 1..8 rows and a speculative verify window computes each row with the bits of the one-row decode step (MTP ids ==
+// plain ids). legacy (GC follows the row bucket) stays available explicitly; its bits change with the row count.
 inline RowReduction parse_row_reduction(std::string_view value) {
-    if (value.empty() || value == "legacy") return RowReduction::legacy;
-    if (value == "canonical") return RowReduction::canonical;
+    if (value.empty() || value == "canonical") return RowReduction::canonical;
+    if (value == "legacy") return RowReduction::legacy;
     throw std::invalid_argument("STRIX_IU4_ROW_REDUCTION must be legacy or canonical");
 }
 constexpr std::string_view row_reduction_name(RowReduction policy) {
@@ -24,8 +27,8 @@ constexpr std::string_view row_reduction_contract(RowReduction policy) {
     return policy == RowReduction::canonical ? "iu4-g64g96-gc32-v1" : "iu4-row-buckets-v1";
 }
 struct RowReductionResolution {
-    RowReduction requested = RowReduction::legacy;
-    RowReduction effective = RowReduction::legacy;
+    RowReduction requested = RowReduction::canonical;
+    RowReduction effective = RowReduction::legacy;  // inactive (native weights): no IU4 launch at all
     bool active = false;
 };
 inline RowReductionResolution resolve_row_reduction(bool active, std::string_view value) {
@@ -59,7 +62,7 @@ inline SingleDecodeResolution resolve_single_decode_policy(bool active, std::str
 
 struct ExecutionPolicy {
     SingleDecodePolicy single_decode = SingleDecodePolicy::automatic;
-    RowReduction reduction = RowReduction::legacy;
+    RowReduction reduction = RowReduction::canonical;
 };
 inline std::atomic<std::uint64_t> single_decode_launches{0};
 namespace detail {

@@ -4,6 +4,7 @@
 #include "strix/serve/json.hpp"
 #include "../src/cli/detail.hpp"
 #include "strix/session/speculation_default.hpp"
+#include "strix/turbo.hpp"
 #include "../src/hy4/hy4_speculation.hpp"
 
 #include <algorithm>
@@ -741,6 +742,14 @@ void hy4_launcher_resolves_documented_drafter(const fs::path& data) {
     require(classify({"--timing"}) == "explicit-route", "--timing keeps the plain steps");
     require(classify({"--no-mtp"}) == "cli-opt-out", "--no-mtp opts out");
     require(classify({"--mtp", "--timing"}) == "explicit", "--mtp wins over the per-step route");
+    // A weight-format switch chooses which bytes the same projections read, not a route: speculation composes with it.
+    namespace tb = strix::profile::turbo;
+    for (const std::string_view option : {tb::kWeightsOption, tb::kBitsOption, tb::kPackOption}) {
+        require(strix::session::speculation_neutral_value_option(option), "turbo weight switches are speculation neutral");
+        require(strix::session::speculation_neutral_inline_option(std::string(option) + "=x"), "inline form is neutral too");
+    }
+    require(!strix::session::speculation_neutral_value_option("--turbo-weightsx") &&
+            !strix::session::speculation_neutral_value_option("--timing"), "only the named switches are neutral");
 }
 } // namespace
 
