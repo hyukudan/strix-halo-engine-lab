@@ -310,10 +310,21 @@ inline constexpr std::array<profile::Lever, 19> kMiniLevers{{
 // the server alike) inside the band; no FAST prefill lever runs on that device, so the reference is the builtin arm.
 // Measured ends, CLI (prompts of 4,309 / 8,236 / 32,760 tokens) / served (the same texts, 4,307 / 8,234 / 32,758
 // tokens): 4K x1.1211 / x1.1171, 8K x1.0915 / x1.0944, 32K x1.0689 / x1.0861. A band takes the lower speedup of its
-// two ends, rounded down; prompts below 4,307 or above 32,760 tokens are unmeasured and keep the tier below.
+// two ends, rounded down. Low band (ink_meas t6 / s7, iu4 alone against the TURBO default outside the band, i.e. the BF16
+// tile; CLI ABBA, served off / on with the command line's route): 1,143 tokens CLI x1.234 / x1.233, 1,148 tokens served
+// x1.239 / x1.238; its upper end is the 4K end above. Above 32,760 tokens the served 59,258-token end measured x1.002
+// (CLI 59,253 x1.080 / x1.086): no band there. Prompts below 1,143 or above 32,760 tokens are unmeasured and keep the tier
+// below.
 inline constexpr std::string_view kMiniIu4PrefillReceipt =
     "grouped-iu4a4-rot-v1 prefill timing, gfx1151, CLI + served, EXACT/TURBO interleaved, prompts of 4,307..32,760 tokens";
-inline constexpr std::array<profile::LadderRow, 2> kMiniLadder{{
+inline constexpr std::string_view kMiniIu4PrefillLowReceipt =
+    "grouped-iu4a4-rot-v1 prefill timing, gfx1151, CLI ABBA + served off/on, TURBO default vs iu4, prompts of 1,143 / "
+    "1,148 tokens with the 4,307 / 4,309-token ends";
+inline constexpr std::array<profile::LadderRow, 3> kMiniLadder{{
+    {.lever = kMiniMoeW4a4, .value = "iu4", .tier = profile::Name::turbo, .phase = profile::Phase::prefill,
+     .device = "gfx1151", .min_context = 1143, .max_context = 4306, .min_lanes = 1, .max_lanes = 1,
+     .speedup = 1.117, .noise = 0.01, .receipt = kMiniIu4PrefillLowReceipt, .identity = "v1", .band_bound = true,
+     .band_evidence = {{1143, 1148, 4307, 4309}, {}, "Gate v2 prefill, 16 replayed prose windows, 1,008 scored rows; prompt lengths unspecified."}},
     {.lever = kMiniMoeW4a4, .value = "iu4", .tier = profile::Name::turbo, .phase = profile::Phase::prefill,
      .device = "gfx1151", .min_context = 4307, .max_context = 8236, .min_lanes = 1, .max_lanes = 1,
      .speedup = 1.091, .noise = 0.01, .receipt = kMiniIu4PrefillReceipt, .identity = "v1", .band_bound = true,
