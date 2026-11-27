@@ -406,12 +406,21 @@ void explicit_catalogue_tests(const std::filesystem::path& root) {
     // A4: direct B is not bitwise at 32.5K: never an EXACT all-on lever.
     const auto qwen_exact = run("qwen3.8-flash-next", ao::Tier::exact, {}, "prefill:2048");
     require(qwen_exact.find("qwen_moe_direct_b") == std::string::npos, "EXACT all-on has no lossy direct B: got\n" + qwen_exact);
+    // A6: the BF16 route storage declines the MTP bundle (the launcher's default speculative decode, about twice the
+    // plain decode): all-on takes it only when MTP is off, and route I8 (which requires it) follows.
+    require(qwen_short.find("lever qwen_moe_route_bf16 source=refused reason=precondition "
+                            "arg:--no-mtp|env:STRIX_MTP=0|env:STRIX_MTP=off unmet") != std::string::npos &&
+                qwen_short.find("lever qwen_moe_route_i8 source=all-on") == std::string::npos,
+            "all-on never trades the MTP decode for the BF16 route storage: got\n" + qwen_short);
+    const auto qwen_plain = run("qwen3.8-flash-next", ao::Tier::turbo, only("STRIX_MTP", "0"), "prefill:2048");
+    require(qwen_plain.find("lever qwen_moe_route_bf16 source=all-on") != std::string::npos,
+            "with MTP off all-on takes the BF16 route storage: got\n" + qwen_plain);
     // A2: one-byte route words and the tier split / down LDS epilogue are declared alternatives: TURBO all-on keeps the
     // earlier rows and refuses route I8 (the pair ran a non-finite MoE accumulation).
-    require(qwen_short.find("lever qwen_moe_route_i8 source=refused reason=incompatible with qwen_moe_tiers\n") !=
+    require(qwen_plain.find("lever qwen_moe_route_i8 source=refused reason=incompatible with qwen_moe_tiers\n") !=
                     std::string::npos &&
-                qwen_short.find("lever qwen_moe_tiers source=all-on") != std::string::npos,
-            "TURBO all-on never runs route I8 with the tier split: got\n" + qwen_short);
+                qwen_plain.find("lever qwen_moe_tiers source=all-on") != std::string::npos,
+            "TURBO all-on never runs route I8 with the tier split: got\n" + qwen_plain);
     // A5: the served tall chunk is not bitwise: never an EXACT all-on lever; TURBO takes it (gate pending for FAST) on
     // the held-back route only, which is what the server admits (mini_served_tall_chunk_admitted): on the default
     // command line route it would be printed but not run.
