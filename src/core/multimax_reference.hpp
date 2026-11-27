@@ -3,15 +3,17 @@
 #include "strix/attn/group_indexer.hpp"
 
 #include <algorithm>
+#include <limits>
 #include <span>
 
 namespace strix::core {
 
 inline void multimax_f32_reference(std::span<float> logits,
                                     std::span<const float, 4> ranges,
-                                    std::span<const float, 4> strengths) {
+                                    std::span<const float, 4> strengths, bool preserve_mask = false) {
     const auto relu = [](float value) { return value <= 0.0F ? 0.0F : value; };
     for (float& logit : logits) {
+        if (preserve_mask && logit == -std::numeric_limits<float>::infinity()) continue;
         const float source = logit;
         const float lower = relu(ranges[0] - source);
         const float upper = relu(source - ranges[1]);

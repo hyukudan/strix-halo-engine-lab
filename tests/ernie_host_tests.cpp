@@ -1,4 +1,7 @@
 #include "strix/ernie/inventory.hpp"
+#include "core/draft_features_reference.hpp"
+#include "core/draft_markov_reference.hpp"
+#include "core/multimax_reference.hpp"
 #include "moe_core/latent_experts_reference.hpp"
 #include "strix/moe/route_policy.hpp"
 #include "strix/weight/formats/fp8_block.hpp"
@@ -9,6 +12,7 @@
 #include <array>
 #include <cmath>
 #include <iostream>
+#include <limits>
 #include <stdexcept>
 
 namespace {
@@ -151,7 +155,44 @@ void check_fp8() {
     throw std::runtime_error("short FP8 scale plane accepted");
 }
 
+void check_draft_operators() {
+    constexpr std::array post{1.0F, 3.0F, 5.0F, 7.0F};
+    std::array<float, 2> mean{};
+    core::draft_stream_mean_bf16_reference(post, mean);
+    require(mean == std::array{3.0F, 5.0F}, "DSpark tap averages only the stream axis");
+    constexpr std::array feature_matrix{0.0F, 0.2F, 0.0F, 0.0F};
+    constexpr std::array gain{1.0F, 1.0F};
+    std::array<float, 2> context{};
+    core::draft_project_norm_bf16_reference(feature_matrix, mean, gain, 0.5F, context);
+    require(context == std::array{1.0F, 0.0F}, "DSpark normalizes projected target features");
+
+    constexpr std::array prev{1.0F, 0.0F, 0.0F, 1.0F};
+    constexpr std::array embedding{1.0F, 0.0F};
+    constexpr std::array hidden_matrix{2.0F, 0.0F, 0.0F, 4.0F};
+    constexpr std::array embed_matrix{0.0F, 2.0F, 3.0F, 0.0F};
+    std::array<float, 4> output{};
+    core::mtp_join_bf16_reference(prev, embedding, gain, gain, hidden_matrix, embed_matrix, 0.5F, output);
+    require(output == std::array{2.0F, 3.0F, 0.0F, 7.0F}, "MTP projects each stream and broadcasts the embedding");
+
+    const auto inf = std::numeric_limits<float>::infinity();
+    constexpr std::array ranges{0.0F, 0.0F, 0.0F, 0.0F}, strengths{0.0F, 0.0F, 0.0F, -1.0F};
+    std::array special{-inf, -2.0F, std::numeric_limits<float>::quiet_NaN()};
+    core::multimax_f32_reference(special, ranges, strengths, true);
+    require(special[0] == -inf && special[1] == -2.0F && std::isnan(special[2]),
+            "masked logits stay masked and genuine NaNs remain visible");
+    const std::array raw{0.0F, 0.5F, -inf, 0.0F, 1.0F, -inf};
+    constexpr std::array by_rank{-1.0F, 0.0F, 1.0F}, head{0.5F, 1.0F, 0.0F};
+    std::array<std::uint32_t, 2> ids{};
+    core::draft_markov_greedy_reference(raw, 3, by_rank, head, 2, ids, [&](auto row) {
+        core::multimax_f32_reference(row, ranges, strengths, true);
+        require(row[2] == -inf, "the vocabulary mask survives MultiMax");
+    });
+    require(ids == std::array<std::uint32_t, 2>{0, 1},
+            "DSpark applies the previous token's Markov bias before the vocabulary activation");
+}
+
 void check_operator_traits() {
+    check_draft_operators();
     std::array collapse{1.00390625F};
     constexpr std::array unit_gain{1.0F};
     strix::core::rms_norm_bf16_reference(collapse, unit_gain, 1e-6F, true);
