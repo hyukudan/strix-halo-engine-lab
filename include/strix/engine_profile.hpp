@@ -1188,6 +1188,20 @@ struct NoExplicitSetting {
     return banded;
 }
 
+// The longest context a band-bound timing row of `lever` (any value, any tier) covers in `phase` on `device`; 0 when
+// there is none. Literal rows, joint rows and incumbent grants do not count. A per-request entry gate in front of the
+// shared judgement (a serving path that asks the ladder only where a band row can decide) is bounded by this instead
+// of a literal, so widening a band stays a change of its row.
+[[nodiscard]] constexpr std::uint64_t band_max_context(std::span<const LadderRow> rows, std::string_view lever,
+                                                       Phase phase, std::string_view device) noexcept {
+    std::uint64_t edge = 0;
+    for (const auto& row : rows)
+        if (!row.incumbent && row.band_bound && row.joint.empty() && row.lever == lever && row.phase == phase &&
+            !row.device.empty() && row.device == device && row.max_context > edge)
+            edge = row.max_context;
+    return edge;
+}
+
 // The cell `lever` runs in `tier` over `lower`, its resolved cell of the tier below (the same cell the tier below
 // exports, an unqualified benchmark cell included: a fallback never drops what the reference was spelled over).
 template <class Row, class Admission>

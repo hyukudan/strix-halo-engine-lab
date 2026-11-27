@@ -203,6 +203,29 @@ void verdicts() {
             "exact (scheduling) levers are outside the ladder");
 }
 
+// band_max_context: the widest band-bound row of a lever on one phase and device; literal rows, other levers, phases
+// and devices do not widen it, and widening a band row moves the edge with it.
+void band_max_edge() {
+    constexpr auto row = [](std::string_view lever, p::Name tier, p::Phase phase, std::string_view device,
+                            std::uint64_t lo, std::uint64_t hi, bool band) {
+        return p::LadderRow{.lever = lever, .value = "1", .tier = tier, .phase = phase, .device = device,
+                            .min_context = lo, .max_context = hi, .speedup = 1.3, .noise = 0.1, .receipt = "r",
+                            .band_bound = band};
+    };
+    constexpr std::array rows{row("pf", p::Name::fast, p::Phase::prefill, "dev", 2049, 8192, true),
+                              row("pf", p::Name::turbo, p::Phase::prefill, "dev", 31258, 31258, false),
+                              row("pf", p::Name::fast, p::Phase::decode, "dev", 1, 65536, true),
+                              row("pf", p::Name::fast, p::Phase::prefill, "other", 1, 65536, true),
+                              row("qq", p::Name::fast, p::Phase::prefill, "dev", 1, 131072, true)};
+    static_assert(p::band_max_context(rows, "pf", p::Phase::prefill, "dev") == 8192, "literal and foreign rows ignored");
+    static_assert(p::band_max_context(rows, "pf", p::Phase::prefill, "") == 0, "an empty device matches no row");
+    static_assert(p::band_max_context(rows, "zz", p::Phase::prefill, "dev") == 0, "no row: no edge");
+    constexpr std::array wider{row("pf", p::Name::fast, p::Phase::prefill, "dev", 2049, 8192, true),
+                               row("pf", p::Name::fast, p::Phase::prefill, "dev", 8193, 32768, true)};
+    static_assert(p::band_max_context(wider, "pf", p::Phase::prefill, "dev") == 32768, "a wider band row moves the edge");
+    require(p::band_max_context(rows, "pf", p::Phase::decode, "dev") == 65536, "phase selects the rows");
+}
+
 void defects() {
     const auto defect = [](p::LadderRow row) {
         const std::array rows{row};
@@ -1874,6 +1897,7 @@ int main(int argc, char** argv) try {
     verdicts();
     band_chain();
     band_lower_edge();
+    band_max_edge();
     bound_evidence();
     defects();
     shipped_rows();
