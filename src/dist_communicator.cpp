@@ -327,14 +327,13 @@ using link::errno_text;  // the stream errors read the same on the raw and the i
 // _ACK_MS (unacknowledged retained pieces are resent after this long, doubling), _LINGER_US (send() waits this long for
 // the acknowledgement before it keeps a copy), _RESENDS (resends of one damaged piece before the hard error).
 bool usb4_integrity_wanted() {
-    const char* v = std::getenv("STRIX_DIST_USB4_INTEGRITY");
-    return !(v && std::string(v) == "0");
+    return strix::envcfg::flag("STRIX_DIST_USB4_INTEGRITY", true, strix::EnvFlagMatch::exact);
 }
 link::Options usb4_link_options(std::chrono::milliseconds timeout) {
     link::Options o;
     o.timeout = timeout;
     const auto number = [](const char* key, unsigned long long fallback) {
-        const char* v = std::getenv(key);
+        const char* v = strix::envcfg::text(key);  // recorded in the env receipt
         return v && *v ? std::stoull(v) : fallback;
     };
     o.piece = static_cast<std::size_t>(std::clamp<unsigned long long>(number("STRIX_DIST_USB4_PIECE", o.piece), 4096ULL, 1ULL << 30U));

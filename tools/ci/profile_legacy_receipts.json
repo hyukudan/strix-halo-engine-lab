@@ -7,10 +7,10 @@
     "window-band": 0
   },
   "include/strix/glm_pair_profile_table.hpp": {
-    "band": 1,
+    "band": 2,
     "incumbent": 0,
     "legacy-reference": 0,
-    "unversioned-table-row": 2,
+    "unversioned-table-row": 3,
     "window-band": 0
   },
   "include/strix/profiles/hy4.hpp": {
