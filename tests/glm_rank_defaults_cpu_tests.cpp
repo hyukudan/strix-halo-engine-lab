@@ -888,6 +888,32 @@ void test_pf_variants() {
     CHECK(sb.find("STRIX_GLM_PF_OBAR=2 (baseline, item pf-obar-v10; resolved v2)\n") != std::string::npos);
 }
 
+// Every value --all-on exports for a GLM lever (data/profile/all_on.json, the rows whose engines name glm) must be a
+// value the engine's own resolver accepts: the catalogue once shipped glm_sampled_mtp=1 while the resolver takes
+// 0|coupled|rejection, which stopped every GLM all-on run at start-up. A refusal for another reason (a tier) is fine.
+void test_all_on_values_accepted() {
+    const auto path = std::filesystem::path(__FILE__).parent_path().parent_path() / "data" / "profile" / "all_on.json";
+    std::ifstream in(path);
+    CHECK(in.good());
+    const auto field = [](const std::string& line, const std::string& key) {
+        const std::string tag = "\"" + key + "\":\"";
+        const auto at = line.find(tag);
+        if (at == std::string::npos) return std::string();
+        const auto from = at + tag.size();
+        return line.substr(from, line.find('"', from) - from);
+    };
+    int rows = 0;
+    for (std::string line; std::getline(in, line);) {
+        if (line.find("\"engines\":[") == std::string::npos || line.find("\"glm\"") == std::string::npos) continue;
+        const auto env = field(line, "env"), value = field(line, "value");
+        if (env.empty() || value.empty()) continue;
+        ++rows;
+        try { (void)resolve(cat(kDeploy, kDecodeWork), {{env, value}}); }
+        catch (const std::invalid_argument& x) { CHECK(std::string(x.what()).find("must be") == std::string::npos); }
+    }
+    CHECK(rows >= 1);
+}
+
 // Sampled MTP on the server: one typed row (off / coupled / rejection) resolved by rd::resolve for the command line and
 // the server alike, printed in the effective receipt and admitted by tier there (no private switch). Written against
 // names that existed before the row was resolved here: the receipt line and the refusals below fail on that tree.
@@ -1019,6 +1045,7 @@ void test_mtp_payload_digest() {
 
 int main() {
     test_sampled_mtp_admission();
+    test_all_on_values_accepted();
     test_pf_variants();
     test_mtp_default();
     test_mtp_payload_digest();
