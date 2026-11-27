@@ -190,6 +190,10 @@ Options parse(std::vector<std::string> args) {
     auto options = parse_options(static_cast<int>(argv.size()), argv.data());
     if (options.product_profile_requested == qwen::profile::Name::fast)
         options.product_profile = qwen::profile::resolve(qwen::profile::Name::fast, measured_profile(options.product_profile_inputs));
+    // The route fixtures of this file cover the automatic FP16 WMMA prefill organization. The default column is EXACT
+    // (it resolves the dense-a8 reference prefill, covered by exact_tier_runs_the_reference_prefill below), so a
+    // fixture that names no profile runs the incumbent route with an empty lever resolution.
+    else if (!options.product_profile_requested) options.product_profile.entries.clear();
     return options;
 }
 std::vector<std::string> mtp_fixture(){
@@ -3966,7 +3970,8 @@ int main(int argc, char** arguments) {
                     exported[key] = value; return true;
                 });
                 expect(enabled ? exported.at(candidate_key) == "1" &&
-                    exported.at("STRIX_QWEN_PROFILE_OWNED_moe_route_bf16") == "fast:provisional:1" : exported.empty(),
+                    exported.at("STRIX_QWEN_PROFILE_OWNED_moe_route_bf16") == "fast:provisional:1" :
+                    exported.size() == 2U && exported.at("STRIX_PREFILL_HC_OUTPUT_WMMA") == "0",
                     "native CLI exports storage only after route admission");
                 expect(got.error.empty() && got.options.prefill_moe_route_bf16 == enabled,
                     "fast profile applies provisional storage through native resolver without permission");
@@ -3979,10 +3984,13 @@ int main(int argc, char** arguments) {
                 const auto pair = numerical_profile_pair(got.options);
                 // fast also runs the provisional GDN chunk candidate.
                 const unsigned gdn = enabled ? prefill_option_bit(PrefillOption::gdn_fp16_chunk) : 0U;
-                expect(got.prefill_option_mask == (kPrefillOptionsReady | gdn),
+                // EXACT and quality switch the HC output WMMA off (the reference prefill); FAST keeps the governed default.
+                const unsigned hc_bit = enabled ? 0U : prefill_option_bit(PrefillOption::hc_output_wmma);
+                expect(got.prefill_option_mask == ((kPrefillOptionsReady | gdn) & ~hc_bit),
                     "every product profile retains the governed HC default");
                 const auto composed = prefill_arithmetic_identity(pair, got.prefill_option_mask, false);
                 for (const bool master : {false, true}) {
+                    if (!enabled && !master) continue;  // the HC restriction is already part of the EXACT resolution
                     auto restricted = selected;
                     if (master) restricted.options.prefill_exact_fp16 = true;
                     else restricted.options.prefill_disabled = prefill_option_bit(PrefillOption::hc_output_wmma);
@@ -3991,7 +3999,7 @@ int main(int argc, char** arguments) {
                         off.options.product_profile.json() == got.options.product_profile.json() &&
                         numerical_profile_pair(off.options) == pair,
                         "HC restriction preserves product profile and BF16 route admission");
-                    expect(prefill_arithmetic_identity(pair, off.prefill_option_mask, false) != composed,
+                    expect(!enabled || prefill_arithmetic_identity(pair, off.prefill_option_mask, false) != composed,
                         "HC restriction changes composed arithmetic identity independently of BF16 storage");
                     const auto report = serve::parse_json(effective_config_json(off));
                     expect(report.find("prefill_identity")->as_string() == (master ? "fp16-v1" :
@@ -4269,6 +4277,31 @@ int main(int argc, char** arguments) {
                     automatic_owner.primary_rows==automatic_prompt.primary_rows &&
                     automatic_owner.t16k_policy_source==automatic_prompt.t16k_policy_source,
                     "automatic T16384 threshold is one rule for both callers");
+            }
+            {   // EXACT keeps the tiled organization and runs the dense-a8 reference prefill; FAST and TURBO run FP16 WMMA
+                // (TIER-02): one rule for the single-request route and the server.
+                for (const auto tier : {qwen::profile::Name::standard, qwen::profile::Name::quality,
+                                        qwen::profile::Name::fast}) {
+                    qwen::profile::Inputs inputs;
+                    inputs.env = [](const char*) -> const char* { return nullptr; };
+                    const bool exact = tier != qwen::profile::Name::fast;
+                    auto cli=request; cli.options.tokens.assign(8192,request.options.tokens.front());
+                    cli.options.product_profile = qwen::profile::resolve(tier, measured_profile(inputs));
+                    auto shaped=http; shaped.options.context_tokens=resolve(cli,memory).options.context_tokens;
+                    shaped.options.product_profile = cli.options.product_profile;
+                    shaped.environment=cli.environment;
+                    for (const auto* config : {&cli, &shaped}) {
+                        const auto got=resolve(*config,memory);
+                        expect(got.options.known_prefix_window,"the tier keeps the known-prefix window organization");
+                        expect(got.options.known_prefix_prefill_rows==8192U,"the tier keeps the T8192 tile");
+                        expect(exact ? !got.options.prefill_numerical_profile && !got.options.prefill_profile_automatic &&
+                                got.options.numerical_profile==dense_a8_profile &&
+                                !(got.prefill_option_mask & prefill_option_bit(PrefillOption::hc_output_wmma))
+                            : got.options.prefill_numerical_profile==DecodeNumericalProfile::fast_prefill_f16wmma_v1 &&
+                                (got.prefill_option_mask & prefill_option_bit(PrefillOption::hc_output_wmma)) != 0U,
+                            "EXACT resolves the dense-a8 reference prefill; FAST keeps FP16 WMMA with HC output WMMA");
+                    }
+                }
             }
             auto wide=http; wide.options.context_tokens=40960; wide.environment["STRIX_QPF2K_T16K"]="1";
             auto pinned=wide; pinned.environment["STRIX_SERVE_T16K"]="0";

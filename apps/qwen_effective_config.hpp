@@ -703,6 +703,8 @@ inline PromptRoute resolve_prompt_route(Options& candidate, const Environment& r
     const bool f16_off = env_is(requested, "STRIX_PREFILL_F16", "0");
     if (candidate.prefill_numerical_profile) route.arithmetic_fallback = shape.keep_decode_profile ? "explicit-prefill-profile" : "";
     else if (f16_off) route.arithmetic_fallback = shape.keep_decode_profile ? "STRIX_PREFILL_F16=0" : "";
+    else if (product_profile_prefill_f16_off(candidate))
+        route.arithmetic_fallback = shape.keep_decode_profile ? "profile exact: dense-a8 reference prefill" : "";
     else if (candidate.numerical_profile != dense_a8_profile)
         route.arithmetic_fallback = shape.keep_decode_profile ? "decode-profile-not-dense-a8" : "";
     else if (!capabilities.fp16_operands) route.arithmetic_fallback = "fp16-operands-not-qualified";

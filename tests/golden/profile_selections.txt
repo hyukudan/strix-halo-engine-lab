@@ -173,6 +173,8 @@ B qwen-hip fast ctx=0 qsa_budget=1536 s7
 B qwen-hip fast ctx=0 moe_route_bf16=1 s7
 B qwen-hip fast ctx=0 gdn_fp16_chunk=1 s7
 B qwen-hip fast ctx=0 output_head=default s4
+B qwen-hip fast ctx=0 prefill_f16wmma=1 s3
+B qwen-hip fast ctx=0 hc_output_wmma=1 s3
 B qwen-cuda fast moe_route_bf16=0 s4
 B qwen-cuda fast qsa_budget=default s4
 B qwen-cuda fast gdn_fp16_chunk=0 s4
@@ -185,6 +187,8 @@ B qwen-hip fast ctx=1 qsa_budget=1536 s0
 B qwen-hip fast ctx=1 moe_route_bf16=1 s0
 B qwen-hip fast ctx=1 gdn_fp16_chunk=1 s0
 B qwen-hip fast ctx=1 output_head=default s4
+B qwen-hip fast ctx=1 prefill_f16wmma=1 s3
+B qwen-hip fast ctx=1 hc_output_wmma=1 s3
 B qwen-cuda fast moe_route_bf16=0 s4
 B qwen-cuda fast qsa_budget=default s4
 B qwen-cuda fast gdn_fp16_chunk=0 s4
@@ -197,6 +201,8 @@ B qwen-hip fast ctx=4096 qsa_budget=1536 s0
 B qwen-hip fast ctx=4096 moe_route_bf16=1 s0
 B qwen-hip fast ctx=4096 gdn_fp16_chunk=1 s0
 B qwen-hip fast ctx=4096 output_head=default s4
+B qwen-hip fast ctx=4096 prefill_f16wmma=1 s3
+B qwen-hip fast ctx=4096 hc_output_wmma=1 s3
 B qwen-cuda fast moe_route_bf16=0 s4
 B qwen-cuda fast qsa_budget=default s4
 B qwen-cuda fast gdn_fp16_chunk=0 s4
@@ -209,6 +215,8 @@ B qwen-hip fast ctx=8192 qsa_budget=1536 s0
 B qwen-hip fast ctx=8192 moe_route_bf16=1 s0
 B qwen-hip fast ctx=8192 gdn_fp16_chunk=1 s0
 B qwen-hip fast ctx=8192 output_head=default s4
+B qwen-hip fast ctx=8192 prefill_f16wmma=1 s3
+B qwen-hip fast ctx=8192 hc_output_wmma=1 s3
 B qwen-cuda fast moe_route_bf16=0 s4
 B qwen-cuda fast qsa_budget=default s4
 B qwen-cuda fast gdn_fp16_chunk=0 s4
@@ -221,6 +229,8 @@ B qwen-hip fast ctx=8193 qsa_budget=1536 s7
 B qwen-hip fast ctx=8193 moe_route_bf16=1 s7
 B qwen-hip fast ctx=8193 gdn_fp16_chunk=1 s7
 B qwen-hip fast ctx=8193 output_head=default s4
+B qwen-hip fast ctx=8193 prefill_f16wmma=1 s3
+B qwen-hip fast ctx=8193 hc_output_wmma=1 s3
 B qwen-cuda fast moe_route_bf16=0 s4
 B qwen-cuda fast qsa_budget=default s4
 B qwen-cuda fast gdn_fp16_chunk=0 s4
@@ -233,6 +243,8 @@ B qwen-hip fast ctx=32768 qsa_budget=1536 s7
 B qwen-hip fast ctx=32768 moe_route_bf16=1 s7
 B qwen-hip fast ctx=32768 gdn_fp16_chunk=1 s7
 B qwen-hip fast ctx=32768 output_head=default s4
+B qwen-hip fast ctx=32768 prefill_f16wmma=1 s3
+B qwen-hip fast ctx=32768 hc_output_wmma=1 s3
 B qwen-cuda fast moe_route_bf16=0 s4
 B qwen-cuda fast qsa_budget=default s4
 B qwen-cuda fast gdn_fp16_chunk=0 s4
@@ -250,6 +262,8 @@ B qwen-hip turbo ctx=0 index_score_wmma=1 s7
 B qwen-hip turbo ctx=0 ple_rows_f16=1 s7
 B qwen-hip turbo ctx=0 gdn_gates_f16=1 s7
 B qwen-hip turbo ctx=0 output_head=default s4
+B qwen-hip turbo ctx=0 prefill_f16wmma=1 s3
+B qwen-hip turbo ctx=0 hc_output_wmma=1 s3
 B qwen-hip turbo ctx=0 moe_route_ctrl=0 s4
 B qwen-cuda turbo moe_route_bf16=0 s4
 B qwen-cuda turbo qsa_budget=default s4
@@ -271,6 +285,8 @@ B qwen-hip turbo ctx=1 index_score_wmma=1 s7
 B qwen-hip turbo ctx=1 ple_rows_f16=1 s7
 B qwen-hip turbo ctx=1 gdn_gates_f16=1 s7
 B qwen-hip turbo ctx=1 output_head=default s4
+B qwen-hip turbo ctx=1 prefill_f16wmma=1 s3
+B qwen-hip turbo ctx=1 hc_output_wmma=1 s3
 B qwen-hip turbo ctx=1 moe_route_ctrl=0 s4
 B qwen-cuda turbo moe_route_bf16=0 s4
 B qwen-cuda turbo qsa_budget=default s4
@@ -292,6 +308,8 @@ B qwen-hip turbo ctx=4096 index_score_wmma=1 s7
 B qwen-hip turbo ctx=4096 ple_rows_f16=1 s7
 B qwen-hip turbo ctx=4096 gdn_gates_f16=1 s7
 B qwen-hip turbo ctx=4096 output_head=default s4
+B qwen-hip turbo ctx=4096 prefill_f16wmma=1 s3
+B qwen-hip turbo ctx=4096 hc_output_wmma=1 s3
 B qwen-hip turbo ctx=4096 moe_route_ctrl=0 s4
 B qwen-cuda turbo moe_route_bf16=0 s4
 B qwen-cuda turbo qsa_budget=default s4
@@ -313,6 +331,8 @@ B qwen-hip turbo ctx=8192 index_score_wmma=1 s7
 B qwen-hip turbo ctx=8192 ple_rows_f16=1 s7
 B qwen-hip turbo ctx=8192 gdn_gates_f16=1 s7
 B qwen-hip turbo ctx=8192 output_head=default s4
+B qwen-hip turbo ctx=8192 prefill_f16wmma=1 s3
+B qwen-hip turbo ctx=8192 hc_output_wmma=1 s3
 B qwen-hip turbo ctx=8192 moe_route_ctrl=0 s4
 B qwen-cuda turbo moe_route_bf16=0 s4
 B qwen-cuda turbo qsa_budget=default s4
@@ -334,6 +354,8 @@ B qwen-hip turbo ctx=8193 index_score_wmma=1 s7
 B qwen-hip turbo ctx=8193 ple_rows_f16=1 s7
 B qwen-hip turbo ctx=8193 gdn_gates_f16=1 s7
 B qwen-hip turbo ctx=8193 output_head=default s4
+B qwen-hip turbo ctx=8193 prefill_f16wmma=1 s3
+B qwen-hip turbo ctx=8193 hc_output_wmma=1 s3
 B qwen-hip turbo ctx=8193 moe_route_ctrl=0 s4
 B qwen-cuda turbo moe_route_bf16=0 s4
 B qwen-cuda turbo qsa_budget=default s4
@@ -355,6 +377,8 @@ B qwen-hip turbo ctx=32768 index_score_wmma=1 s7
 B qwen-hip turbo ctx=32768 ple_rows_f16=1 s7
 B qwen-hip turbo ctx=32768 gdn_gates_f16=1 s7
 B qwen-hip turbo ctx=32768 output_head=default s4
+B qwen-hip turbo ctx=32768 prefill_f16wmma=1 s3
+B qwen-hip turbo ctx=32768 hc_output_wmma=1 s3
 B qwen-hip turbo ctx=32768 moe_route_ctrl=0 s4
 B qwen-cuda turbo moe_route_bf16=0 s4
 B qwen-cuda turbo qsa_budget=default s4

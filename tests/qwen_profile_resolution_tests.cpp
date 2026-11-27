@@ -158,7 +158,7 @@ void defaults_matrix() {
 // candidates without a speed row change no resolved value: every tier, with or without --allow-pending, runs the
 // builtin until a ladder row shows the TURBO cell faster than FAST in the regime.
 void registered_controls_resolve_builtin() {
-    const char* registered[] = {"decode_numerical_profile", "gsq_expert_pack", "hc_output_wmma", "moe_small", "moe_tile64",
+    const char* registered[] = {"decode_numerical_profile", "gsq_expert_pack", "moe_small", "moe_tile64",
         "moe_direct_b", "moe_tiers", "moe_down_lds_epi", "moe_route_ctrl", "gsq_prefill_f16", "dense_q6p_pack",
         "dense_trellis_pack"};
     for (const char* key : registered) {
@@ -349,6 +349,47 @@ void common_adapters() {
     check(c.options.product_profile.json().find("\"engine\"")==std::string::npos,"legacy JSON has no engine tag");
 }
 #endif
+// EXACT is bitwise the reference: no bit-changing prefill lever resolves to a non-off value in the default (exact) or
+// quality column, whatever the regime, while FAST and TURBO keep the FP16 WMMA prefill route and the HC output WMMA
+// (their cells leave the incumbent route on). The off value is the reference identity (dense-a8 prefill, serial HC out).
+void exact_resolves_no_bit_changing_prefill_lever() {
+    const Env env;
+    for (const std::uint64_t context : {0U, 2048U, 8192U, 32768U, 262144U}) {
+        for (const bool allow : {false, true}) {
+            pr::Inputs input{{}, lookup(env), allow};
+            input.regime = {strix::profile::Phase::prefill, context, 1, "gfx1151"};
+            for (const auto tier : {pr::Name::standard, pr::Name::quality}) {
+                const auto r = pr::resolve(tier, input);
+                for (const char* key : {"prefill_f16wmma", "hc_output_wmma"}) {
+                    const auto* entry = r.find(key);
+                    check(entry && entry->status == pr::Status::set && entry->value == entry->lever->off,
+                          "EXACT resolves the reference value of the FP16 WMMA prefill rows");
+                }
+                for (const auto& entry : r.entries)
+                    check(entry.lever->kind != strix::profile::Kind::bit_changing || !strix::profile::applied(entry.status) ||
+                              entry.value == entry.lever->off,
+                          "no bit-changing lever is applied in EXACT");
+            }
+            for (const auto tier : {pr::Name::fast, pr::Name::turbo}) {
+                const auto r = pr::resolve(tier, input);
+                for (const char* key : {"prefill_f16wmma", "hc_output_wmma"}) {
+                    const auto* entry = r.find(key);
+                    check(!entry || entry->value != entry->lever->off, "FAST and TURBO keep the FP16 WMMA prefill rows");
+                }
+            }
+        }
+    }
+    // The shared route reader sees the same resolution: only the exact tier turns the automatic FP16 arithmetic off.
+    for (const auto tier : {pr::Name::standard, pr::Name::fast, pr::Name::turbo}) {
+        dc::Options options;
+        const Env empty;
+        pr::Inputs input{{}, lookup(empty), false};
+        input.regime = {strix::profile::Phase::prefill, 8192, 1, "gfx1151"};
+        options.product_profile = pr::resolve(tier, input);
+        check(dc::product_profile_prefill_f16_off(options) == (tier == pr::Name::standard),
+              "the route reads the prefill_f16wmma row: off in EXACT only");
+    }
+}
 }
 int main(int argc,char** argv) try {
     emit=argc==2 && std::string_view(argv[1])=="--fixtures";
@@ -356,6 +397,7 @@ int main(int argc,char** argv) try {
     route_prune_startup_binding();
     prefill_startup_binding();
     registered_controls_resolve_builtin();
+    exact_resolves_no_bit_changing_prefill_lever();
     product_matrix(); admission_matrix(); defaults_matrix(); config_matrix(); identities();
 #ifndef STRIX_STEP1_ORIGINAL
     common_adapters();

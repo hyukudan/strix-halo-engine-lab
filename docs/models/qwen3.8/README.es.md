@@ -27,7 +27,9 @@ Ejecución recomendada: el comando simple selecciona los valores predeterminados
 Añada `--print-effective-config` para inspeccionar antes de la inicialización de HIP. Véase [Valores predeterminados e interruptores de desactivación](../../methodology.es.md#defaults-and-off-switches) para el alcance de la línea base.
 
 Los prompts de CLI simple que lo admiten seleccionan automáticamente el prefill por tiles con prefijo conocido (T8192 para prompts largos,
-T4096 a 4K), la unión de expertos, las filas del router y `fast-prefill-f16wmma-v1`. El contexto se dimensiona automáticamente;
+T4096 a 4K), la unión de expertos, las filas del router y la aritmética de prefill del nivel: `--profile fast` y `--profile turbo` ejecutan
+`fast-prefill-f16wmma-v1` con `hc_output_wmma`; `--profile exact` (la palabra por defecto) ejecuta el prefill de referencia dense-A8 bit-exacto
+con `hc_output_wmma` desactivado, por lo que un prefill EXACT es más lento. Coste medido por la verificación de la auditoría (no es una medición nueva): unos +4,4 s a 32K y +66,9 s a 262K. El contexto se dimensiona automáticamente;
 por encima de 8192 el resolutor añade `--unqualified-context`. La residencia registrada (`--residency register`)
 es la predeterminada en UMA; si falla el bloqueo automático, se avisa y se continúa sin bloqueo, como antes.
 La petición explícita `STRIX_MODEL_REGISTER_MLOCK=1` rechaza el arranque si falla el bloqueo; `STRIX_MODEL_REGISTER_MLOCK=0` lo desactiva, véase [Bloqueo de páginas registradas](../../operations/model-weight-residency.md#registered-page-lock). El prefill FP16 tiene su propia referencia exacta y no es idéntico bit a bit al prefill serial A8 denso.
