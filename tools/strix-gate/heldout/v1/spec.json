@@ -1,0 +1,645 @@
+{
+ "set": "heldout-v1",
+ "note": "Held-out gate windows (gate_r 2026-11-27). Text on disk that is not model output; none of it is a prompt of an existing engine test or gate run (the DS41 ds_restore set used perldiag.pod, pydoc_data/topics.py, typing/argparse/subprocess.py and this repository's docs/sources; the GLM glm_fast set used glm-a8/b8/a32/b32). Each model cuts the first N tokens of each document. Python standard-library code is largely memorized (DeepSeek V4.1 reference: fractions.py window label == top-1 0.984), so the code class uses distribution / tool sources (apport, DistUpgrade, amd_debug, Dpkg) first and keeps the standard-library documents as spares.",
+ "wiki": {
+  "en": {
+   "file": "wiki/20231101.en/train-00000-of-00041.parquet",
+   "start_row": 20000,
+   "min_chars": 20000,
+   "skip_title_prefixes": [
+    "List of",
+    "Lists of",
+    "Timeline of"
+   ]
+  },
+  "es": {
+   "file": "wiki/20231101.es/train-00000-of-00013.parquet",
+   "start_row": 20000,
+   "min_chars": 20000,
+   "skip_title_prefixes": [
+    "Anexo:",
+    "Lista de"
+   ]
+  }
+ },
+ "faq_files": [
+  "usr/share/doc/chrony/FAQ.gz",
+  "usr/share/doc/dnsmasq-base/FAQ.gz",
+  "usr/share/doc/alsa-base/FAQ"
+ ],
+ "chat_phrases": {
+  "en": {
+   "first": "Can you tell me about {title}?",
+   "more": "Please go on."
+  },
+  "es": {
+   "first": "¿Me puedes hablar de {title}?",
+   "more": "Continúa, por favor."
+  }
+ },
+ "templates": {
+  "deepseek41": {
+   "begin": "<｜begin▁of▁sentence｜>",
+   "turn": "<｜User｜>{user}<｜Assistant｜></think>{assistant}<｜end▁of▁sentence｜>"
+  },
+  "glm5": {
+   "begin": "[gMASK]<sop>",
+   "turn": "<|user|>{user}<|assistant|><think></think>{assistant}"
+  }
+ },
+ "docs": [
+  {
+   "id": "en32-a",
+   "kind": "wiki",
+   "class": "prose-en",
+   "lang": "en",
+   "bands": [
+    "b32"
+   ],
+   "chars": 190000
+  },
+  {
+   "id": "es32-a",
+   "kind": "wiki",
+   "class": "prose-es",
+   "lang": "es",
+   "bands": [
+    "b32"
+   ],
+   "chars": 175000
+  },
+  {
+   "id": "en32-b",
+   "kind": "wiki",
+   "class": "prose-en",
+   "lang": "en",
+   "bands": [
+    "b32"
+   ],
+   "chars": 190000
+  },
+  {
+   "id": "es32-b",
+   "kind": "wiki",
+   "class": "prose-es",
+   "lang": "es",
+   "bands": [
+    "b32"
+   ],
+   "chars": 175000
+  },
+  {
+   "id": "en32-c",
+   "kind": "wiki",
+   "class": "prose-en",
+   "lang": "en",
+   "bands": [
+    "b32"
+   ],
+   "chars": 190000
+  },
+  {
+   "id": "es32-c",
+   "kind": "wiki",
+   "class": "prose-es",
+   "lang": "es",
+   "bands": [
+    "b32"
+   ],
+   "chars": 175000
+  },
+  {
+   "id": "en32-d",
+   "kind": "wiki",
+   "class": "prose-en",
+   "lang": "en",
+   "bands": [
+    "b32"
+   ],
+   "chars": 190000
+  },
+  {
+   "id": "es32-d",
+   "kind": "wiki",
+   "class": "prose-es",
+   "lang": "es",
+   "bands": [
+    "b32"
+   ],
+   "chars": 175000
+  },
+  {
+   "id": "en32-e",
+   "kind": "wiki",
+   "class": "prose-en",
+   "lang": "en",
+   "bands": [
+    "b32-spare"
+   ],
+   "chars": 190000
+  },
+  {
+   "id": "es32-e",
+   "kind": "wiki",
+   "class": "prose-es",
+   "lang": "es",
+   "bands": [
+    "b32-spare"
+   ],
+   "chars": 175000
+  },
+  {
+   "id": "code32-a",
+   "kind": "files",
+   "class": "code",
+   "lang": "code",
+   "bands": [
+    "b32-spare"
+   ],
+   "chars": 140000,
+   "files": [
+    "usr/lib/python3.14/_pydecimal.py"
+   ]
+  },
+  {
+   "id": "code32-b",
+   "kind": "files",
+   "class": "code",
+   "lang": "code",
+   "bands": [
+    "b32-spare"
+   ],
+   "chars": 140000,
+   "files": [
+    "usr/lib/python3.14/inspect.py",
+    "usr/lib/python3.14/ast.py"
+   ]
+  },
+  {
+   "id": "code32-c",
+   "kind": "files",
+   "class": "code",
+   "lang": "code",
+   "bands": [
+    "b32-spare"
+   ],
+   "chars": 140000,
+   "files": [
+    "usr/lib/python3.14/tarfile.py",
+    "usr/lib/python3.14/shutil.py"
+   ]
+  },
+  {
+   "id": "code32-d",
+   "kind": "files",
+   "class": "code",
+   "lang": "code",
+   "bands": [
+    "b32"
+   ],
+   "chars": 140000,
+   "files": [
+    "usr/share/perl/5.40.1/Math/BigInt.pm"
+   ]
+  },
+  {
+   "id": "code32-e",
+   "kind": "files",
+   "class": "code",
+   "lang": "code",
+   "bands": [
+    "b32-spare"
+   ],
+   "chars": 140000,
+   "files": [
+    "usr/lib/python3.14/doctest.py",
+    "usr/lib/python3.14/imaplib.py"
+   ]
+  },
+  {
+   "id": "chat32-a",
+   "kind": "chat",
+   "class": "chat",
+   "lang": "mixed",
+   "bands": [
+    "b32"
+   ],
+   "chars": 170000,
+   "faq_pairs": 20,
+   "wiki_langs": [
+    "en",
+    "es"
+   ]
+  },
+  {
+   "id": "chat32-b",
+   "kind": "chat",
+   "class": "chat",
+   "lang": "mixed",
+   "bands": [
+    "b32"
+   ],
+   "chars": 170000,
+   "faq_pairs": 0,
+   "wiki_langs": [
+    "es",
+    "en"
+   ]
+  },
+  {
+   "id": "chat32-c",
+   "kind": "chat",
+   "class": "chat",
+   "lang": "mixed",
+   "bands": [
+    "b32"
+   ],
+   "chars": 170000,
+   "faq_pairs": 15,
+   "wiki_langs": [
+    "en",
+    "es"
+   ]
+  },
+  {
+   "id": "chat32-d",
+   "kind": "chat",
+   "class": "chat",
+   "lang": "mixed",
+   "bands": [
+    "b32-spare"
+   ],
+   "chars": 170000,
+   "faq_pairs": 0,
+   "wiki_langs": [
+    "es",
+    "en"
+   ]
+  },
+  {
+   "id": "en8-a",
+   "kind": "wiki",
+   "class": "prose-en",
+   "lang": "en",
+   "bands": [
+    "b8"
+   ],
+   "chars": 50000
+  },
+  {
+   "id": "es8-a",
+   "kind": "wiki",
+   "class": "prose-es",
+   "lang": "es",
+   "bands": [
+    "b8"
+   ],
+   "chars": 45000
+  },
+  {
+   "id": "en8-b",
+   "kind": "wiki",
+   "class": "prose-en",
+   "lang": "en",
+   "bands": [
+    "b8"
+   ],
+   "chars": 50000
+  },
+  {
+   "id": "es8-b",
+   "kind": "wiki",
+   "class": "prose-es",
+   "lang": "es",
+   "bands": [
+    "b8"
+   ],
+   "chars": 45000
+  },
+  {
+   "id": "en8-c",
+   "kind": "wiki",
+   "class": "prose-en",
+   "lang": "en",
+   "bands": [
+    "b8"
+   ],
+   "chars": 50000
+  },
+  {
+   "id": "es8-c",
+   "kind": "wiki",
+   "class": "prose-es",
+   "lang": "es",
+   "bands": [
+    "b8"
+   ],
+   "chars": 45000
+  },
+  {
+   "id": "en8-d",
+   "kind": "wiki",
+   "class": "prose-en",
+   "lang": "en",
+   "bands": [
+    "b8"
+   ],
+   "chars": 50000
+  },
+  {
+   "id": "es8-d",
+   "kind": "wiki",
+   "class": "prose-es",
+   "lang": "es",
+   "bands": [
+    "b8"
+   ],
+   "chars": 45000
+  },
+  {
+   "id": "en8-e",
+   "kind": "wiki",
+   "class": "prose-en",
+   "lang": "en",
+   "bands": [
+    "b8-spare"
+   ],
+   "chars": 50000
+  },
+  {
+   "id": "code8-a",
+   "kind": "files",
+   "class": "code",
+   "lang": "code",
+   "bands": [
+    "b8"
+   ],
+   "chars": 36000,
+   "files": [
+    "usr/lib/python3.14/fractions.py"
+   ]
+  },
+  {
+   "id": "code8-b",
+   "kind": "files",
+   "class": "code",
+   "lang": "code",
+   "bands": [
+    "b8-spare"
+   ],
+   "chars": 36000,
+   "files": [
+    "usr/lib/python3.14/difflib.py"
+   ]
+  },
+  {
+   "id": "code8-c",
+   "kind": "files",
+   "class": "code",
+   "lang": "code",
+   "bands": [
+    "b8"
+   ],
+   "chars": 36000,
+   "files": [
+    "usr/share/perl/5.40.1/Getopt/Long.pm"
+   ]
+  },
+  {
+   "id": "code8-d",
+   "kind": "files",
+   "class": "code",
+   "lang": "code",
+   "bands": [
+    "b8-spare"
+   ],
+   "chars": 36000,
+   "files": [
+    "usr/lib/python3.14/email/_header_value_parser.py"
+   ]
+  },
+  {
+   "id": "code8-e",
+   "kind": "files",
+   "class": "code",
+   "lang": "code",
+   "bands": [
+    "b8-spare"
+   ],
+   "chars": 36000,
+   "files": [
+    "usr/lib/python3.14/enum.py"
+   ]
+  },
+  {
+   "id": "chat8-a",
+   "kind": "chat",
+   "class": "chat",
+   "lang": "mixed",
+   "bands": [
+    "b8"
+   ],
+   "chars": 45000,
+   "faq_pairs": 10,
+   "wiki_langs": [
+    "en",
+    "es"
+   ]
+  },
+  {
+   "id": "chat8-b",
+   "kind": "chat",
+   "class": "chat",
+   "lang": "mixed",
+   "bands": [
+    "b8"
+   ],
+   "chars": 45000,
+   "faq_pairs": 10,
+   "wiki_langs": [
+    "es",
+    "en"
+   ]
+  },
+  {
+   "id": "chat8-c",
+   "kind": "chat",
+   "class": "chat",
+   "lang": "mixed",
+   "bands": [
+    "b8"
+   ],
+   "chars": 45000,
+   "faq_pairs": 0,
+   "wiki_langs": [
+    "en",
+    "es"
+   ]
+  },
+  {
+   "id": "en2-a",
+   "kind": "wiki",
+   "class": "prose-en",
+   "lang": "en",
+   "bands": [
+    "b2"
+   ],
+   "chars": 14000
+  },
+  {
+   "id": "en2-b",
+   "kind": "wiki",
+   "class": "prose-en",
+   "lang": "en",
+   "bands": [
+    "b2"
+   ],
+   "chars": 14000
+  },
+  {
+   "id": "es2-a",
+   "kind": "wiki",
+   "class": "prose-es",
+   "lang": "es",
+   "bands": [
+    "b2"
+   ],
+   "chars": 13000
+  },
+  {
+   "id": "es2-b",
+   "kind": "wiki",
+   "class": "prose-es",
+   "lang": "es",
+   "bands": [
+    "b2-spare"
+   ],
+   "chars": 13000
+  },
+  {
+   "id": "code2-a",
+   "kind": "files",
+   "class": "code",
+   "lang": "code",
+   "bands": [
+    "b2"
+   ],
+   "chars": 12000,
+   "files": [
+    "usr/lib/python3.14/statistics.py"
+   ]
+  },
+  {
+   "id": "code2-b",
+   "kind": "files",
+   "class": "code",
+   "lang": "code",
+   "bands": [
+    "b2-spare"
+   ],
+   "chars": 12000,
+   "files": [
+    "usr/lib/python3.14/configparser.py"
+   ]
+  },
+  {
+   "id": "chat2-a",
+   "kind": "chat",
+   "class": "chat",
+   "lang": "mixed",
+   "bands": [
+    "b2"
+   ],
+   "chars": 13000,
+   "faq_pairs": 5,
+   "wiki_langs": [
+    "es",
+    "en"
+   ]
+  },
+  {
+   "id": "code32-f",
+   "kind": "files",
+   "class": "code",
+   "lang": "code",
+   "bands": [
+    "b32"
+   ],
+   "chars": 140000,
+   "files": [
+    "usr/lib/python3/dist-packages/apport/ui.py",
+    "usr/lib/python3/dist-packages/apport/report.py"
+   ]
+  },
+  {
+   "id": "code32-g",
+   "kind": "files",
+   "class": "code",
+   "lang": "code",
+   "bands": [
+    "b32"
+   ],
+   "chars": 140000,
+   "files": [
+    "usr/lib/python3/dist-packages/DistUpgrade/DistUpgradeController.py",
+    "usr/lib/python3/dist-packages/DistUpgrade/DistUpgradeCache.py"
+   ]
+  },
+  {
+   "id": "code32-h",
+   "kind": "files",
+   "class": "code",
+   "lang": "code",
+   "bands": [
+    "b32"
+   ],
+   "chars": 140000,
+   "files": [
+    "usr/lib/python3/dist-packages/apport/packaging_impl/apt_dpkg.py",
+    "usr/lib/python3/dist-packages/apport/crashdb_impl/launchpad.py",
+    "usr/lib/python3/dist-packages/amd_debug/prerequisites.py"
+   ]
+  },
+  {
+   "id": "code8-f",
+   "kind": "files",
+   "class": "code",
+   "lang": "code",
+   "bands": [
+    "b8"
+   ],
+   "chars": 36000,
+   "files": [
+    "usr/lib/python3/dist-packages/amd_debug/validator.py",
+    "usr/lib/python3/dist-packages/amd_debug/failures.py"
+   ]
+  },
+  {
+   "id": "code8-g",
+   "kind": "files",
+   "class": "code",
+   "lang": "code",
+   "bands": [
+    "b8"
+   ],
+   "chars": 36000,
+   "files": [
+    "usr/share/perl5/Dpkg/Source/Package/V2.pm",
+    "usr/share/perl5/Dpkg/Vendor/Debian.pm"
+   ]
+  },
+  {
+   "id": "code2-c",
+   "kind": "files",
+   "class": "code",
+   "lang": "code",
+   "bands": [
+    "b2-spare"
+   ],
+   "chars": 12000,
+   "files": [
+    "usr/lib/python3/dist-packages/amd_debug/sleep_report.py"
+   ]
+  }
+ ]
+}

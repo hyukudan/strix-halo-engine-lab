@@ -528,6 +528,32 @@ where a receipt shows them faster than FAST. A lever that passes the FAST bars b
 reference pack, `compare --mode turbo` (above) gives the relative TURBO check. `qual --tier turbo` is the absolute
 check on the gate v2 arms.
 
+### Held-out window set: `heldout_windows.py` + `heldout/v1/spec.json`
+
+One text set for every engine's gate v2 run, so that R3 (labels are held-out text, not greedy ids) holds by
+construction and the windows do not repeat prompts that engine tests already use. `heldout/v1/spec.json` is data: the
+documents (Wikipedia 2023-11-01 English and Spanish dump shards, read from row 20,000 in row order, every article in at
+most one document; system Python 3.14 and Perl 5.40 library sources; three package FAQ files), each with a content class
+(`prose-en`, `prose-es`, `code`, `chat`) and the context bands it serves. Chat documents are multi-turn conversations
+(FAQ questions and answers, Wikipedia articles asked about in English and Spanish) rendered with each model's chat
+template (`templates`, data). No text is model output; the texts are not stored here, `sources.tsv` (written by
+`docs`) lists every input with its SHA-256.
+
+```text
+python heldout_windows.py docs --spec heldout/v1/spec.json --root DATA --out DOCS     # needs pyarrow (wiki shards)
+python heldout_windows.py render --spec heldout/v1/spec.json --docs DOCS --model deepseek41
+strix-tokenize MODEL encode DOCS/<doc>[.<model>].txt > IDS/<doc>.<model>.ids             # per model
+python heldout_windows.py cut --spec heldout/v1/spec.json --ids IDS --model deepseek41 --band b32 --tokens 32768 \
+    --arms exact,CAND,NULL --out WIN                                                       # WIN/windows.tsv + classes.json
+python heldout_windows.py prefilter --dumps DUMPS --manifest WIN/windows.tsv --ref exact --head-rows 64 --out KEPT
+```
+
+A window is the first N tokens of its document, so the scored rows (the window's last rows) are ordinary running
+text. `prefilter` is the reference-only pre-filter: it reads only the reference arm and drops every window whose labels
+equal the reference top-1 on more than 0.95 of its scored rows (near-deterministic text cannot tell a lever from the
+reference), and prints how many it dropped; score the kept manifest. Spare documents (`*-spare` bands) replace dropped
+windows. Bands in v1: `b32` (15 documents), `b8` (15), `b2` (5).
+
 ## GLM scored prefill compare: `glm_score_nll.py`
 
 The GLM rank captures the last N prompt rows' logits with `STRIX_GLM_PF_SCORE_LAST=N` and
