@@ -1896,7 +1896,7 @@ inline cudaError_t launch(const Args& args, cudaStream_t stream, unsigned rows =
             if (const auto status = launch_gate_up_union<Format, TopK, Capacity>(args, rows, stream); status != success)
                 return status;
             if constexpr (kUnionDown<Format>) return launch_down_union<Format, TopK, Capacity>(args, rows, stream);
-            return success;
+            else return success;  // one return per instantiation (MSVC C4702 under /WX)
         };
         const unsigned capacity = decode_union_capacity(expert_union, rows);
         if (capacity != 0U) {
