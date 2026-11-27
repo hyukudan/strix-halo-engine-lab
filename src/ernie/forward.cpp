@@ -69,7 +69,7 @@ void CpuReference::run_layer(ReferenceRows& rows, unsigned layer, AttentionHisto
 }
 
 ReferenceRows CpuReference::prefill(ReferenceRows rows, unsigned first_layer, unsigned end_layer,
-                                    const LayerBoundaryObserver& boundary) const {
+                                    const LayerBoundaryObserver& boundary, const LayerObserver& observe) const {
     if (first_layer > end_layer || end_layer > kLayerCount || rows.empty() ||
         rows.size() > data::dims::max_context ||
         std::ranges::any_of(rows, [&](const auto& row) {
@@ -79,7 +79,7 @@ ReferenceRows CpuReference::prefill(ReferenceRows rows, unsigned first_layer, un
     if (boundary) boundary(first_layer, rows);
     for (auto layer = first_layer; layer < end_layer; ++layer) {
         AttentionHistory history(rows.size());
-        run_layer(rows, layer, history, 0, {}, true);
+        run_layer(rows, layer, history, 0, observe, true);
         if (boundary) boundary(layer + 1, rows);
     }
     return rows;

@@ -35,7 +35,8 @@ public:
     // indexed by the next layer to execute, including kLayerCount at the head.
     [[nodiscard]] ReferenceRows embed_rows(std::span<const std::uint32_t> tokens) const;
     [[nodiscard]] ReferenceRows prefill(ReferenceRows rows, unsigned first_layer, unsigned end_layer,
-                                        const LayerBoundaryObserver& boundary = {}) const;
+                                        const LayerBoundaryObserver& boundary = {},
+                                        const LayerObserver& observe = {}) const;
     [[nodiscard]] std::vector<float> head_input(std::span<const float> row) const;
 private:
     void run_layer(ReferenceRows& rows, unsigned layer, AttentionHistory& history,

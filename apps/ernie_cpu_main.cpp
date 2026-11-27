@@ -46,6 +46,7 @@ struct Options {
     bool bf16 = false, fixed_gain = false, oracle = false, bos = false, save_layers = false, profile = false;
     bool simd = false, parallel_mla = false, dump_logits = false;
     bool rescore_layers = false, head_f32 = false;
+    bool trace_sites = false;
 };
 
 void set_variant(Options& opts, std::string_view name) {
@@ -113,6 +114,7 @@ Options parse_options(int argc, char** argv) {
         if (arg == "--save-layers") { opts.save_layers = true; continue; }
         if (arg == "--rescore-layers") { opts.rescore_layers = true; continue; }
         if (arg == "--head-store-f32") { opts.head_f32 = true; continue; }
+        if (arg == "--trace-sites") { opts.trace_sites = true; continue; }
         if (arg == "--dump-logits") { opts.dump_logits = true; continue; }
         if (arg == "--profile-host") { opts.profile = true; continue; }
         if (arg == "--bf16-projections") { opts.bf16 = true; continue; }
@@ -166,10 +168,10 @@ Options parse_options(int argc, char** argv) {
         opts.start_layer > opts.end_layer || opts.end_layer > ernie::kLayerCount ||
         (opts.start_layer != 0 && opts.resume.empty())))
         throw std::invalid_argument("invalid oracle options or missing layer cache");
-    if (!opts.oracle && (opts.save_layers || opts.rescore_layers || opts.lens_stride || opts.dump_logits ||
+    if (!opts.oracle && (opts.save_layers || opts.rescore_layers || opts.trace_sites || opts.lens_stride || opts.dump_logits ||
         !opts.resume.empty() || opts.start_layer != 0 || opts.end_layer != ernie::kLayerCount || opts.limit != 128))
         throw std::invalid_argument("layer and text options require --oracle");
-    if (opts.rescore_layers && (opts.resume.empty() || opts.save_layers))
+    if (opts.rescore_layers && (opts.resume.empty() || opts.save_layers || opts.trace_sites))
         throw std::invalid_argument("rescoring requires a saved layer cache");
     return opts;
 }
@@ -426,7 +428,20 @@ void run_oracle(std::vector<std::uint32_t> ids, const Options& opts, const fs::p
             observe(layer, rows);
         }
     } else {
-        rows = ref.prefill(std::move(rows), opts.start_layer, opts.end_layer, observe);
+        std::optional<std::ofstream> sites;
+        ernie::LayerObserver trace;
+        if (opts.trace_sites) {
+            sites.emplace(trace_file(folder / "site-rms.tsv", "layer\tposition\tstream\tattention_post\tffn_post"));
+            trace = [&](std::size_t row, unsigned layer, const ernie::LayerResult& result) {
+                for (std::size_t stream = 0; stream < ernie::data::extras::hc_mult; ++stream) {
+                    const auto offset = stream * shape.hidden;
+                    const auto attn = std::span(result.attention_streams).subspan(offset, shape.hidden);
+                    const auto ffn = std::span(result.streams).subspan(offset, shape.hidden);
+                    *sites << layer << '\t' << row << '\t' << stream << '\t' << rms(attn) << '\t' << rms(ffn) << '\n';
+                }
+            };
+        }
+        rows = ref.prefill(std::move(rows), opts.start_layer, opts.end_layer, observe, trace);
     }
     const auto prefill = Clock::now();
     for (auto& row : rows) row = ref.head_input(row);
@@ -672,7 +687,7 @@ int main(int argc, char** argv) try {
                      " [--capture MODEL_DESCRIPTION] [--pack SIDECAR] [--replay TRACE_DIR]\n"
                      "       strix-ernie-cpu CHECKPOINT TEXT_FILE NEW_TRACE_DIR --oracle"
                      " [--bos] [--limit N] [--save-layers] [--dump-logits] [--resume TRACE_DIR]"
-                     " [--rescore-layers] [--lens-stride N] [--head-store-f32]"
+                     " [--rescore-layers] [--lens-stride N] [--head-store-f32] [--trace-sites]"
                      " [--start-layer N] [--end-layer N] [--threads N] [--cache-mib N] [--profile-host]"
                      " [--ordered-simd] [--table-mxfp4] [--parallel-mla] [--checkpoint-contract|--recovered-contract|--candidate-contract]"
                      " [--variant NAME] [--multimax checkpoint|identity|hinge|signed-hinge|softplus]\n";
