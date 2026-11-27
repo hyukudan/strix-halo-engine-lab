@@ -4992,7 +4992,7 @@ their checks.
 ### FAST WMMA prefill bundle (glm-pf-wmma-x)
 
 **Engine:** `glm`. **Control:** `STRIX_GLM_PF_WMMA`. **Default:** on under `--profile fast` (and `turbo`) for a two-rank
-pair prompt of 2,049..8,192 tokens in the measured execution (below); off everywhere else. `STRIX_GLM_PF_WMMA=1` forces
+pair prompt of 1,024..8,192 tokens in the measured execution (below); off everywhere else. `STRIX_GLM_PF_WMMA=1` forces
 it, `=0` keeps the exact cores.
 
 The exact prefill's X3 linear calls run on `v_wmma_f32_16x16x16_f16` over the exact cores' FP16 operands: dense calls of
@@ -5005,7 +5005,7 @@ inherit it).
 
 | Engine | Device | Status |
 |---|---|---|
-| glm-5.3-flash, pair (`strix-glm5-rank`, `strix-glm5-serve`) | two Radeon 8060S (gfx1151), USB4 2x2x40 host transport | FAST/TURBO: ON for prompts of 2,049..8,192 tokens; TURBO also at the measured 31,258-token prompt |
+| glm-5.3-flash, pair (`strix-glm5-rank`, `strix-glm5-serve`) | two Radeon 8060S (gfx1151), USB4 2x2x40 host transport | FAST/TURBO: ON for prompts of 1,024..8,192 tokens; TURBO also at the measured 31,258-token prompt |
 | glm-5.3-flash, one GPU or other topologies | any | exact cores (no receipt for that execution) |
 | glm-5.3-flash, CUDA producer | sm_120 | not applicable (own profile table) |
 | deepseek-v4.1-flash, minimax-m3.1-flash, qwen3.8-flash-next, qwen3.8-27b, hy4-flash, inkling2-mini, nemotron-3.5-bolt-e4b, ernie-5.5-flash-preview | any | not applicable (GLM prefill cores; their FAST rows are their own) |
@@ -5018,13 +5018,14 @@ inherit it).
   gate (below) and timed by a band receipt bound to the run's own execution (`profile::bind_band_receipts`): device
   gfx1151/Radeon-8060S, prefill, one lane, 2,049..8,192 tokens, x1.37 noise 0.10 (gated at 8,192 tokens; timed at
   8,192 (x1.50) and at the lower edge, pair CLI ABBA cold: 2,049 EXACT 3.83 / 3.82 s vs FAST 2.79 / 2.79 s x1.37,
-  4,096 6.70 / 6.67 s vs 4.57 / 4.55 s x1.47; the row takes the lower ratio). TURBO runs the FAST cell inside that
+  4,096 6.70 / 6.67 s vs 4.57 / 4.55 s x1.47; the row takes the lower ratio). A second band row covers 1,024..2,048 tokens with its own gate and timing: pair CLI, one load per arm, product route, 1,024 tokens EXACT 2.17 / 2.17 s vs FAST 1.66 / 1.67 s (x1.31), 2,048 tokens 3.52 / 3.54 s vs 2.62 / 2.64 s (x1.34), same argmax ids; the row takes x1.31. TURBO runs the FAST cell inside that
   band and its own literal receipt at 31,258 tokens. Each prompt prints
   `glm-pf-wmma-x profile=<p> prompt=<n> chunk=<rows> scratch=<routed|full> effective=wmma|exact-cores (reason)` and the `strix-ladder/v1 pf_wmma`
   route that decided it.
-- **Fallback notice:** prompts of 2,048 tokens or fewer, above 8,192 tokens (32K is TURBO only, and only on the rank CLI: the server prefills in chunks of at most 8,192 rows), other devices, links,
+- **Fallback notice:** prompts of fewer than 1,024 tokens, above 8,192 tokens (32K is TURBO only, and only on the rank CLI: the server prefills in chunks of at most 8,192 rows), other devices, links,
   chunks or compositions, and two-rank native modes without configuration agreement keep the exact cores. Two-rank
   execution still requires configuration agreement for an explicit arithmetic switch.
+- **Exactness evidence (1,024..2,048 band):** gate v2 with MoE route replay, pair, 8 windows (six of 2,048 and two of 1,024 tokens: prose, JSON, two 32K-document slices), 2,040 held-out rows: pooled KL 0.00001 (one-ulp null 0.00001), top-1 0.9995, dNLL -0.00038 (se 0.00016), free route-flip ratio 1.07; every window passes; TURBO limits pass too.
 - **Exactness evidence:** FAST identity (new FP32 summation order). FAST gate v2 with MoE route replay, pair, 5 windows
   of 8,192 tokens (prose, JSON, two 32K-document slices), 1,275 held-out rows: pooled KL 0.00018 (one-ulp null
   0.00007), top-1 0.9969, dNLL -0.0013 (se 0.0009), free route-flip ratio 1.05; every window passes. Re-scored under the corrected gate on the held-out set tools/strix-gate/heldout/v1, no null floor: PASS in both classes, 2,304- and 8,192-token prompts, 9 windows, 2,295 rows; replay KL < 0.00001, top-1 0.9991; free-running KL 0.0039 / 0.0032, top-1 0.979 / 0.985 (one-ulp free null KL 0.0031 / 0.0026); two exact runs bitwise equal. The earlier free-running KL 0.363 came from two 11-19 windows where the exact arm's own one-ulp null reached KL 0.69 / 1.06: on such content free-running

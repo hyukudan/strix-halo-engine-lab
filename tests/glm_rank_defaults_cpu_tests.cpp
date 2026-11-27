@@ -416,7 +416,9 @@ void test_mtp_default() {
             return rd::select_prefill_wmma(request, e, getter(env), work);
         };
         const auto prompt = [](std::uint64_t n) { Work w; w.prompt = n; return w; };
-        CHECK(!band("fast", prompt(2048)));
+        CHECK(!band("fast", prompt(1020)));
+        CHECK(band("fast", prompt(1024)));
+        CHECK(band("fast", prompt(2048)));
         CHECK(band("fast", prompt(2049)));
         CHECK(band("fast", prompt(8192)));
         CHECK(!band("fast", prompt(8193)));

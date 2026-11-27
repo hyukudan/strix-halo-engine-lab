@@ -91,6 +91,11 @@ inline constexpr std::string_view kFastGatePfWmma =
     "(se 0.0026); pooled KL 0.0036, top-1 0.982 (one-ulp free null KL 0.0031 / 0.0026). Two exact runs bitwise equal "
     "(head dumps and routes, 10 of 10 windows). The earlier free-running KL 0.363 came from two windows of the 11-19 "
     "set (JSON, a 32K-document slice) where the exact arm's own one-ulp null reached KL 0.69 / 1.06 (route cascade).";
+// Short-prompt band gate (the same route-replay gate v2, windows of the band's own lengths).
+inline constexpr std::string_view kFastGatePfWmma2k =
+    "FAST gate v2 PASS, pair, 1K-2K with MoE route replay (glm_fast gate-fast2.json procedure): 8 held-out windows "
+    "(6 of 2,048 and 2 of 1,024 tokens, prose / JSON / two 32K-document slices), 2,040 rows, pooled KL 0.00001 "
+    "(null 0.00001), top-1 0.9995, dNLL -0.00038 (se 0.00016), free route-flip ratio 1.07; every window passes.";
 inline constexpr strix::profile::FastGate fast_gates[] = {{"pf_wmma", "1", kFastGatePfWmma}};
 
 // A prompt inside the FAST band: the startup pair vote asks whether this execution can run the bundle at all; each
@@ -107,11 +112,20 @@ inline constexpr strix::profile::LadderRow product_ladder_rows[] = {
      {{31258}, {}, "The TURBO quality citation is 8K, 512 scored rows (exact prompt length unspecified); no 32K gate cited."}},
     // FAST band receipt (LadderRow::band_bound: bound per run to its own reference by profile::bind_band_receipts, so it
     // decides only a known pair execution). Band: the gate windows are 8,192 tokens; the 8K band below them follows the
-    // shared band convention (2,049..8,192). Prompts of 2,048 or fewer tokens and above 8,192 keep the exact prefill
+    // shared band convention (2,049..8,192; 1,024..2,048 is the short row, with its own 1K-2K gate). Prompts of fewer than 1,024 tokens and above 8,192 keep the exact prefill
     // cores until a replay gate covers them (32K stays TURBO). Ratio: the lower observed 8K EXACT -> bundle ratio
     // (11-19 G1 cold 12.319 -> 8.227 s x1.497; warm 655 -> 1,000 tok/s x1.53; glm_fast SE2/SF2 cold 604.1 -> 991.8
     // tok/s x1.64), 10 % margin. Lower edge timed on the pair CLI (ABBA, cold prefill): 2,049 x1.37, 4,096 x1.47
     // (both above 1 + noise) -> the edge stays at 2,049.
+    // Short band 1,024..2,048: pair CLI, one load per arm, product route, cold and warm prefill (exact cores
+    // STRIX_GLM_PF_WMMA unset vs the bundle forced): 1,024 tokens 2.17 / 2.17 s -> 1.66 / 1.67 s (x1.31), 2,048 tokens
+    // 3.52 / 3.54 s -> 2.62 / 2.64 s (x1.34); same argmax ids. The ratio is the lower one.
+    {.lever = "pf_wmma", .value = "1", .tier = strix::profile::Name::fast, .phase = strix::profile::Phase::prefill,
+     .device = kTurboPrefillDevice, .min_context = 1024, .max_context = 2048, .min_lanes = 1, .max_lanes = 1,
+     .speedup = 1.31, .noise = 0.10,
+     .receipt = "GLM pair 1K-2K FAST bundle vs EXACT cores (gate v2 1K-2K route replay PASS), docs/optimizations.md#glm-pf-wmma-x; "
+                "1,024: EXACT 2.17 s, FAST 1.66 s (x1.31); 2,048: EXACT 3.52 s, FAST 2.62 s (x1.34)",
+     .identity = "v1", .band_bound = true, .band_evidence = {{1024, 2048}, {1024, 2048}, kFastGatePfWmma2k, false}},
     {.lever = "pf_wmma", .value = "1", .tier = strix::profile::Name::fast, .phase = strix::profile::Phase::prefill,
      .device = kTurboPrefillDevice, .min_context = 2049, .max_context = 8192, .min_lanes = 1, .max_lanes = 1,
      .speedup = 1.37, .noise = 0.10,  // the lower measured ratio of the band (2,049; 8,192 gave x1.50)

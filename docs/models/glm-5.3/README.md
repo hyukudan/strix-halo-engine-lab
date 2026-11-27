@@ -247,7 +247,7 @@ workspace, install/staging, late safety and startup reserve terms in GiB.
 The HIP WMMA prefill bundle uses X3 linears, MLA GEMMs, KDA projections and sparse
 attention with 16-key blocks. `--profile fast` (and TURBO, which nests it) admits it
 automatically on the measured Radeon 8060S USB4 host pair (two 40 Gb/s cables and four
-streams) for one fresh text prompt of 2,049-8,192 tokens, an admitted 8,192-row chunk,
+streams) for one fresh text prompt of 1,024-8,192 tokens, an admitted 8,192-row chunk,
 one lane, and the EXL3 R1b/MTP route. FAST gate v2 with MoE route replay passed on 5
 windows of 8,192 tokens (1,275 rows): pooled KL 0.00018 (null 0.00007), top-1 0.9969,
 dNLL -0.0013 (se 0.0009), route-flip ratio 1.05. The band receipt is the lower observed
