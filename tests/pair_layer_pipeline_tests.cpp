@@ -2,6 +2,8 @@
 // sequence state (a recurrence like a GDN layer and a causal history like an attention layer), ranks run in threads
 // connected by in-memory ordered links carrying the real shared seam pipe (strix/pair/pipe.hpp). Invariant: for any
 // number of ranks and any cuts, the composed prefill logits and every decoded id equal the single-rank run byte for byte.
+#include <atomic>
+#include <chrono>
 #include <cmath>
 #include <condition_variable>
 #include <cstdio>
@@ -253,6 +255,7 @@ Shared run_share(const Weights& m, const std::vector<std::uint32_t>& prompt, uns
     const auto wins = layers::windows(prompt.size(), width);
     const auto count = wins.size();
     const std::size_t row_bytes = H * 4U;
+    std::atomic<bool> head_done{false};
     std::vector<std::thread> threads;
     for (unsigned s = 0; s < 2U; ++s)
         threads.emplace_back([&, s] {
@@ -284,6 +287,10 @@ Shared run_share(const Weights& m, const std::vector<std::uint32_t>& prompt, uns
                 layers::Link up, down;
                 if (s == 1U) { up.send = [&](std::span<const std::byte> b) { link.send(1, b); }; up.receive = [&](std::span<std::byte> b) { link.receive(0, b); }; }
                 else { down.send = [&](std::span<const std::byte> b) { link.send(0, b); }; down.receive = [&](std::span<std::byte> b) { link.receive(1, b); }; }
+                // the hand-off waits for BOTH stages: the head finishes late, stage 0 must not pass the barrier before that
+                if (p.head()) { std::this_thread::sleep_for(std::chrono::milliseconds(60)); head_done.store(true); }
+                layers::line_barrier(s ? &up : nullptr, s ? nullptr : &down);
+                if (!p.head() && !head_done.load()) out.res[s].error = "hand-off started before the head stage finished";
                 const std::uint32_t first = p.head() ? t.top() : 0U;
                 layers::RelayOps r;
                 r.save = [&](std::uint32_t layer) { return t.save(layer, layer + 1U); };

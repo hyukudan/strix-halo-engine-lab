@@ -381,10 +381,34 @@ inline RelayStats relay_state(const Placement& p, std::uint32_t decoder, std::ui
     return out;
 }
 
+// When the layer-split prefill beats every rank prefilling the whole prompt alone (the replicated prefill a tensor-parallel
+// decode otherwise starts from). Equal ranks, one half-window time t / 2 per stage: the flow shop wall is (W + 1) t / 2
+// against W t, a saving of (W - 1) t / 2 for W windows; the hand-off moves the state of the layers each rank lacks once
+// (about 0.12 s per 8K positions of the 27B model on the USB4 link). From three windows the saving is at least one full
+// window time, longer than that hand-off for every window width the engine runs (>= 64 rows). Below, the replicated
+// prefill stays.
+[[nodiscard]] constexpr bool pipeline_prefill_wins(std::size_t windows) noexcept { return windows >= 3U; }
+
+// Line barrier of a stage chain over its links: returns on a stage only after every stage has entered it. The head stage
+// speaks first (up), each stage forwards to the next one down the line only after hearing from below; so no rank sends or
+// reads anything but these words until all stages are here. Run it after the prefill pipes are gone (a stage that finished
+// first must not start the state hand-off while another stage's pipe progress thread still reads the shared transport:
+// that corrupts the stream and shows as a checksum mismatch) and before the first timed phase.
+inline void line_barrier(const Link* up, const Link* down) {
+    std::uint64_t word = 0x52524142ULL;
+    const auto out = [](const Link* l, std::uint64_t& w) { l->send(std::as_bytes(std::span(&w, 1))); };
+    const auto in = [](const Link* l, std::uint64_t& w) { l->receive(std::as_writable_bytes(std::span(&w, 1))); };
+    if (down) in(down, word);            // everything below has arrived
+    if (up) { out(up, word); in(up, word); }   // report up, wait for the release
+    if (down) out(down, word);           // release below
+}
+
 // End-of-prefill hand-off of a layer-split prefill to a decode that runs on EVERY rank (tensor-parallel decode: each rank
 // holds the whole model and the whole sequence state). Every stage is the decoder once, in stage order, over the same
 // per-layer messages as relay_state(): afterwards every rank holds the state of every layer, bit for bit what a whole
 // prefill on that rank leaves (the layer ranges run the same launches as the whole range, so the state bytes are equal).
+// The caller runs a line barrier after the prefill pipes are gone (a stage that finished first must not send while the
+// other stage's pipe progress thread still reads the shared transport: the corruption shows as a checksum mismatch).
 // The first token (known on the head stage) reaches the other stages with the relay to them. One round per stage, so the
 // two directions of a link do not overlap: the wall is the sum of the rounds.
 inline RelayStats share_state(const Placement& p, std::uint32_t first_token, const Link* up, const Link* down,
