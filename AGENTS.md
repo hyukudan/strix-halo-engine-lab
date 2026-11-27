@@ -262,7 +262,7 @@ These controls are server-level only; changing a shared prefill plan or prefix-s
 cache identity requires a server restart. See the
 [option catalog](docs/optimizations.md#bit-changing-prefill-options).
 
-Qwen `hc_output_wmma` is default ON. `hc_output_wmma` passed a pre-declared confirmation held-out set; its NLL endpoint is measured against a rounding-equivalent control whose per-case movement is capped at +-0.02 nats/token (a bounded control allowance, not an unbiased estimate of the uncapped difference); the absolute NLL change vs the exact reference also passed (-0.37 % NLL/token, upper bound +0.38 %). The off switch restores the exact output path.
+Qwen `hc_output_wmma` is ON under `--profile fast` and `--profile turbo`; `--profile exact` (the word used when no profile is given) resolves it off together with the FP16 WMMA prefill. `hc_output_wmma` passed a pre-declared confirmation held-out set; its NLL endpoint is measured against a rounding-equivalent control whose per-case movement is capped at +-0.02 nats/token (a bounded control allowance, not an unbiased estimate of the uncapped difference); the absolute NLL change vs the exact reference also passed (-0.37 % NLL/token, upper bound +0.38 %). The off switch restores the exact output path.
 Controls are server-level only: `STRIX_PREFILL_HC_OUTPUT_WMMA=0`,
 `--prefill-disable hc_output_wmma`, or config `prefill_disable = ["hc_output_wmma"]`;
 master `STRIX_PREFILL_EXACT_FP16=1`, `--prefill-exact-fp16`, or config
@@ -286,7 +286,7 @@ T16384 must fall back to T8192 when its full UMA/GTT reservation does not fit.
 opt in with `STRIX_PREFILL_INDEX_PROJ_WMMA=1`. It uses tag `idxproj16` and the standard
 individual/master OFF controls. This explicit draft exception stays OFF until compiler,
 native execution, model fidelity and complete-workload gates pass. Existing
-`hc_output_wmma` behavior and the default/exact prefill hashes remain unchanged.
+`hc_output_wmma` behavior and the FAST prefill hashes remain unchanged.
 See the [native bundle gates](docs/engine/prefill/hc-output-wmma-qualification.md#bundle-native-gates).
 
 HC low-band layout defaults to mode 3 through decoder qpf2k defaults;
