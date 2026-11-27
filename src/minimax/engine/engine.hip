@@ -3777,27 +3777,34 @@ struct Engine::Impl {
         });
     }
 
-    std::array<std::uint32_t, 2> peer2(std::uint32_t a, std::uint32_t b) {
-        std::uint32_t mine[2] = {a, b};
-        std::array<std::uint32_t, 2> theirs{};
-        hip_ok(hipMemcpy(am_local, mine, 8, hipMemcpyHostToDevice), "ctl");
+    // One host control message each way. When the route table puts this size on the host transport (no device
+    // exchange, or the table's host band: both ranks the same answer), the communicator moves it straight from host
+    // memory (exchange_host: the same message on the wire as exchange(), so a peer may use either); otherwise it
+    // crosses the device buffers as before (H2D, exchange, D2H).
+    void control_exchange(const void* out, void* in, std::size_t bytes, void* local_dev, void* remote_dev) {
         dist::Tag tag;
         tag.kind = static_cast<std::uint32_t>(dist::TagKind::control);
         tag.request = controls++;
-        comm.exchange(nullptr, am_local, am_remote, 8, tag);
-        hip_ok(hipMemcpy(theirs.data(), am_remote, 8, hipMemcpyDeviceToHost), "ctl r");
+        if (comm.host_routed(bytes)) {
+            comm.exchange_host({static_cast<const std::byte*>(out), bytes}, {static_cast<std::byte*>(in), bytes}, tag);
+            return;
+        }
+        hip_ok(hipMemcpy(local_dev, out, bytes, hipMemcpyHostToDevice), "ctl");
+        comm.exchange(nullptr, local_dev, remote_dev, bytes, tag);
+        hip_ok(hipMemcpy(in, remote_dev, bytes, hipMemcpyDeviceToHost), "ctl r");
+    }
+
+    std::array<std::uint32_t, 2> peer2(std::uint32_t a, std::uint32_t b) {
+        const std::uint32_t mine[2] = {a, b};
+        std::array<std::uint32_t, 2> theirs{};
+        control_exchange(mine, theirs.data(), 8, am_local, am_remote);
         return theirs;
     }
 
     // Control channel (serve): `bytes` <= kControlBytes of host memory each way, same size on both ranks.
     void exchange_bytes(const void* out, void* in, std::size_t bytes) {
         if (bytes == 0 || bytes > kControlBytes) throw std::invalid_argument("exchange_bytes: 1..65536 bytes");
-        hip_ok(hipMemcpy(ctl_local, out, bytes, hipMemcpyHostToDevice), "ctl");
-        dist::Tag tag;
-        tag.kind = static_cast<std::uint32_t>(dist::TagKind::control);
-        tag.request = controls++;
-        comm.exchange(nullptr, ctl_local, ctl_remote, bytes, tag);
-        hip_ok(hipMemcpy(in, ctl_remote, bytes, hipMemcpyDeviceToHost), "ctl r");
+        control_exchange(out, in, bytes, ctl_local, ctl_remote);
     }
 
     void exchange_device(const void* src_dev, void* dst_dev, std::size_t bytes, hipStream_t on) {
