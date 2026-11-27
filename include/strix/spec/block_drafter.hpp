@@ -244,6 +244,10 @@ public:
     // path: verify rows of a tree's accepted path (empty: rows 0..emitted.size()-1 of a linear block).
     void observe(const Block& block, std::uint32_t accepted, double verify_ms, std::span<const std::uint32_t> emitted,
                  std::uint64_t context, std::span<const std::uint32_t> path = {});
+    // An idle arm of an ArmSelector: another drafter ran the pass that emitted `emitted` (path: its accepted tree rows,
+    // empty = linear). Keeps the copy stream and the chain in step (accept / accept_path) and drops unresolved copy
+    // proposals; learns nothing (no acceptance, no wall) from a pass it did not draft.
+    void follow(std::span<const std::uint32_t> emitted, std::span<const std::uint32_t> path = {});
     [[nodiscard]] const Arbiter& arbiter() const { return arbiter_; }
     [[nodiscard]] const SpecStats& stats() const { return stats_; }
     [[nodiscard]] double now_ms() const;
@@ -422,10 +426,15 @@ inline void report_prelaunch_all_on(bool requested, std::uint64_t steps, std::ui
     (void)::strix::profile::all_on::engaged("--prelaunch", prelaunched != 0, prelaunch_decline_reason(steps, sampled, tree), out);
 }
 
+class ArmSelector;  // strix/spec/arm_selector.hpp
+
 class BlockSpeculator {
 public:
     BlockSpeculator(BlockDrafter& drafter, VerifyTarget& target, const RowRule& rule = {})
-        : drafter_(drafter), target_(target) { set_row_rule(rule); }
+        : drafter_(&drafter), target_(target) { set_row_rule(rule); }
+    // Several drafters (arms) over one target: the selector picks the arm of every pass and the idle arms follow the
+    // stream. Same rows contract and ids as one drafter; not owned.
+    BlockSpeculator(ArmSelector& arms, VerifyTarget& target, const RowRule& rule = {});
     void set_row_rule(const RowRule& rule);
     // anchor = last emitted token (already committed to the drafter's stream, NOT in the target).
     void start(std::uint32_t anchor) { anchor_ = anchor; }
@@ -442,7 +451,8 @@ public:
     void set_round_sink(RoundSink* sink) { sink_ = sink; }
 
 private:
-    BlockDrafter& drafter_;
+    BlockDrafter* drafter_;          // the drafter of the current pass (the selector's pick when arms_ is set)
+    ArmSelector* arms_ = nullptr;
     VerifyTarget& target_;
     RowRule row_rule_;
     RoundSink* sink_ = nullptr;

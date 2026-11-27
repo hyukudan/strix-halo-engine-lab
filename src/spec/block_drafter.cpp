@@ -1,4 +1,6 @@
 #include "strix/spec/block_drafter.hpp"
+
+#include "strix/spec/arm_selector.hpp"
 #include "strix/spec/draft_depth.hpp"
 #include "strix/spec/greedy_prefix.hpp"
 
@@ -458,6 +460,15 @@ void BlockDrafter::observe(const Block& b, std::uint32_t accepted, double verify
     }
 }
 
+void BlockDrafter::follow(std::span<const std::uint32_t> emitted, std::span<const std::uint32_t> path) {
+    arbiter_.reset_pending();
+    proposer_.commit(emitted);
+    if (chain_) {
+        if (path.empty()) chain_->accept(emitted);
+        else chain_->accept_path(emitted, path);
+    }
+}
+
 namespace {
 void put_u32(std::vector<unsigned char>& b, std::uint32_t v) {
     for (int i = 0; i < 4; ++i) b.push_back(static_cast<unsigned char>((v >> (8 * i)) & 0xFFU));
@@ -500,8 +511,14 @@ void RoundTraceWriter::round(const RoundRecord& r) {
     ++records_;
 }
 
+BlockSpeculator::BlockSpeculator(ArmSelector& arms, VerifyTarget& target, const RowRule& rule)
+    : drafter_(&arms.drafter(arms.active())), arms_(&arms), target_(target) {
+    set_row_rule(rule);
+}
+
 void BlockSpeculator::set_row_rule(const RowRule& rule) {
-    drafter_.set_row_rule(rule);
+    if (arms_) arms_->set_row_rule(rule);
+    else drafter_->set_row_rule(rule);
     target_.set_row_rule(rule);
     row_rule_ = rule;
 }
@@ -520,6 +537,14 @@ StepRecord BlockSpeculator::step(std::vector<std::uint32_t>& out, const StepPara
     if (sampled) target_.set_first_position(params.context + 1);
     StepParams p = params;
     p.tree_rows = serial_sampled ? 0 : target_.tree_rows();
+    // Several arms: this pass's drafter and the start of its wall (draft + verify + commit + the idle arms' follow).
+    std::size_t arm = 0;
+    double pass_t0 = 0.0;
+    if (arms_) {
+        arm = arms_->begin_pass(p.context, p.max_rows);
+        drafter_ = &arms_->drafter(arm);
+        pass_t0 = arms_->now_ms();
+    }
     // Verify pre-launch: the target enqueues the verify of [anchor, host prefix, device drafts] inside the chain call,
     // before the drafted ids are read back (the host launch overlaps the GPU draft). launched_rows = its row count.
     // A tree target (p.tree_rows > 0) is not pre-launched: the drafter places sibling rows only after the chain ids are
@@ -532,7 +557,7 @@ StepRecord BlockSpeculator::step(std::vector<std::uint32_t>& out, const StepPara
         if (target_.verify_launch_fed(host_rows_, feed)) launched_rows = host_rows_.size() + feed.k;
     };
     // Pre-launch currently carries engine-owned argmax ids. Sampled verification uses the host row hook.
-    auto block = serial_sampled ? Block{} : drafter_.next(p, (prelaunch_ && !sampled && p.tree_rows == 0) ? &launch : nullptr);
+    auto block = serial_sampled ? Block{} : drafter_->next(p, (prelaunch_ && !sampled && p.tree_rows == 0) ? &launch : nullptr);
     if (block.decision.rows == 0) {
         if (launched_rows != 0) throw std::logic_error("block speculator: verify pre-launched for an empty block");
         return r;
@@ -546,7 +571,7 @@ StepRecord BlockSpeculator::step(std::vector<std::uint32_t>& out, const StepPara
     if (block.siblings == 0) {  // linear block: the original rows and commit, bitwise
         rows_.assign(1, anchor_);
         rows_.insert(rows_.end(), block.drafts.begin(), block.drafts.end());
-        const double t0 = drafter_.now_ms();
+        const double t0 = drafter_->now_ms();
         if (serial_sampled) {
             const auto logits = target_.verify_serial_logits(anchor_);
             if (logits.empty()) throw std::logic_error("block speculator: sampled serial decode requires target host logits");
@@ -566,23 +591,25 @@ StepRecord BlockSpeculator::step(std::vector<std::uint32_t>& out, const StepPara
         }
         accepted = static_cast<std::uint32_t>(matches);
         target_.commit(accepted + 1);
-        verify_ms = drafter_.now_ms() - t0;
+        verify_ms = drafter_->now_ms() - t0;
         emitted.assign(block.drafts.begin(), block.drafts.begin() + accepted);
         emitted.push_back(greedy_[accepted]);
-        drafter_.observe(block, accepted, verify_ms, emitted, params.context);
+        drafter_->observe(block, accepted, verify_ms, emitted, params.context);
+        if (arms_) arms_->end_pass(arm, emitted, arms_->now_ms() - pass_t0);
     } else {
         if (launched_rows != 0) throw std::logic_error("block speculator: verify pre-launched for a tree block");
         block.tree_rows(anchor_, tree_);
-        const double t0 = drafter_.now_ms();
+        const double t0 = drafter_->now_ms();
         target_.verify_tree(tree_, greedy_);
         if (greedy_.size() != tree_.tokens.size()) throw std::runtime_error("block speculator: target returned the wrong row count");
         auto acc = accept_tree(tree_, greedy_, p.eos);
         target_.commit_path(acc.path);
-        verify_ms = drafter_.now_ms() - t0;
+        verify_ms = drafter_->now_ms() - t0;
         accepted = acc.main;
         emitted = std::move(acc.emitted);
         r.sibling_taken = acc.sibling;
-        drafter_.observe(block, accepted, verify_ms, emitted, params.context, acc.path);
+        drafter_->observe(block, accepted, verify_ms, emitted, params.context, acc.path);
+        if (arms_) arms_->end_pass(arm, emitted, arms_->now_ms() - pass_t0, acc.path);
     }
     r.siblings = block.siblings;
     if (sink_) {

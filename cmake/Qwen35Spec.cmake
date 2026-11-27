@@ -6,7 +6,7 @@ if(NOT TARGET strix_spec)
     target_compile_features(strix_lookup PUBLIC cxx_std_20)
     include("${CMAKE_CURRENT_LIST_DIR}/StrixTokenSampling.cmake")
     add_library(strix_spec STATIC ${_cc_root}/src/spec/drafting.cpp ${_cc_root}/src/spec/block_drafter.cpp
-        ${_cc_root}/src/spec/draft_rows.cpp ${_cc_root}/src/spec/row_rule.cpp)
+        ${_cc_root}/src/spec/draft_rows.cpp ${_cc_root}/src/spec/row_rule.cpp ${_cc_root}/src/spec/arm_selector.cpp)
     target_link_libraries(strix_spec PUBLIC strix_lookup strix_token_sampling)
 endif()
 if(NOT TARGET strix-spec-block-drafter-tests)
