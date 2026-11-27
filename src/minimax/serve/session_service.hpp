@@ -76,6 +76,5 @@ void install_session_service(strix::serve::ServiceFactories&, SessionAssetLoader
 void install_session_service(strix::serve::ServiceFactories&);
 // The registry root of the legacy entry point: the compiled source tree when it holds models/registry.toml, else
 // `shipped_root` (the launcher's data directory, strix::cli::data_directory) when given.
-std::string serve_registry_root(const std::filesystem::path& compiled_root, const std::filesystem::path& shipped_root);
 int legacy_serve(int argc, char** argv, const std::filesystem::path& shipped_root = {});
 } // namespace strix::minimax::serve

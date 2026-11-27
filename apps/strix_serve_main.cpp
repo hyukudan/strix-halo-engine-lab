@@ -4,6 +4,7 @@
 
 #if defined(STRIX_SERVE_NATIVE_LAUNCH) || defined(STRIX_SERVE_CLI_ONLY)
 #include "strix/cli/cli.hpp"
+#include "strix/cli/registry_root.hpp"
 #if defined(STRIX_SERVE_NATIVE_LAUNCH)
 #include "strix/serve/native_handoff.hpp"
 #endif
@@ -24,8 +25,7 @@ int main(int argc, char** argv) {
     sv::install_service_factories(factories);
     sv::ServeShell shell;
 #if defined(_WIN32) || defined(__linux__)
-    if (!std::filesystem::exists("models/registry.toml"))
-        shell.registry_root = cli::data_directory(cli::executable_directory()).string();
+    shell.registry_root = cli::registry_root(".", cli::data_directory(cli::executable_directory())).string();
 #endif
     shell.launch = [](const sv::ServiceSelection& selection, const sv::ServeShell::NativeRequest& request, std::ostream& out) {
         return cli::launch_native(sv::native_serve_request(selection, request), selection.model, selection.description,

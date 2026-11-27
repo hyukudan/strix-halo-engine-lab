@@ -95,23 +95,9 @@ void deploy_check(const std::string& root, const std::filesystem::path& fixture,
     std::filesystem::remove(spec);
 }
 }
-// The legacy entry point's registry root: the build tree when it holds the registry, else the shipped data directory.
-void registry_root_fallback() {
-    namespace fs = std::filesystem;
-    const auto base = fs::temp_directory_path() / "strix-minimax-registry-root";
-    fs::remove_all(base);
-    fs::create_directories(base / "build/models");
-    fs::create_directories(base / "shipped/models");
-    { std::ofstream(base / "build/models/registry.toml") << "# registry"<<char(10); }
-    CHECK(ms::serve_registry_root(base / "build", base / "shipped") == (base / "build").string());
-    CHECK(ms::serve_registry_root(base / "gone", base / "shipped") == (base / "shipped").string());
-    CHECK(ms::serve_registry_root(base / "gone", {}) == (base / "gone").string());
-    fs::remove_all(base);
-}
 int main(int argc,char** argv) {
     try {
         CHECK(argc==2);const std::string root=argv[1];
-        registry_root_fallback();
         Counts c;bool setup_fail=false,follow_fail=false,owner_fail=false,invalid_assets=false;
         sv::ServiceFactories factories;
         ms::install_session_service(factories,[&](const ms::ServePreparation& p)->std::unique_ptr<ms::ServiceAssets>{
