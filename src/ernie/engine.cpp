@@ -52,14 +52,6 @@ hc::Spec hc_spec(unsigned hidden, hc::Site site, bool checkpoint = false) {
     return spec;
 }
 
-std::vector<float> feature_order(std::span<const float> streams, unsigned hidden) {
-    std::vector<float> ordered(streams.size());
-    for (unsigned d = 0; d < hidden; ++d)
-        for (unsigned c = 0; c < kStreams; ++c)
-            ordered[std::size_t{d} * kStreams + c] = streams[std::size_t{c} * hidden + d];
-    return ordered;
-}
-
 struct RouteMath {
     static float exp(float x) { return std::exp(x); }
 };
@@ -193,9 +185,6 @@ LayerResult FirstRowReference::block(unsigned layer, std::span<const float> stre
     if (layer >= kLayerCount || !attend)
         throw std::invalid_argument("ERNIE: invalid target block binding");
     auto site = hc_spec(shape_.hidden, hc::Site::sublayer, shape_.contracts.checkpoint_hc);
-    const auto residual_contract = shape_.contracts.residual;
-    if (residual_contract == ResidualContract::half_post) site.post_magnitude = 1.0F;
-    if (residual_contract == ResidualContract::bf16) site.store = hc::Store::bf16;
     const auto epsilon = shape_.contracts.rms_epsilon > 0 ? shape_.contracts.rms_epsilon : kRmsEps;
     const auto prefix = target_layer_prefix(layer);
     const auto run_site = [&](const char* name, const char* norm, std::span<const float> residual,
@@ -205,14 +194,7 @@ LayerResult FirstRowReference::block(unsigned layer, std::span<const float> stre
                                read(hp + "alpha_res", 1).front()};
         const auto fn = read(hp + "mapping_proj.weight", site.flat() * site.mix_rows());
         const auto base = read(hp + "bias", site.mix_rows());
-        const auto ordered = residual_contract == ResidualContract::feature_interleave
-            ? feature_order(residual, shape_.hidden) : std::vector<float>{};
-        auto mix = hc::mixes(site, ordered.empty() ? residual : std::span<const float>(ordered),
-                            {{}, fn, base, scale, hc::FnLayout::feature_major});
-        if (residual_contract == ResidualContract::transpose)
-            for (unsigned i = 0; i < kStreams; ++i)
-                for (unsigned j = 0; j < i; ++j)
-                    std::swap(mix.comb[i * kStreams + j], mix.comb[j * kStreams + i]);
+        auto mix = hc::mixes(site, residual, {{}, fn, base, scale, hc::FnLayout::feature_major});
         std::vector<float> normalized(shape_.hidden);
         const auto variance = shape_.contracts.checkpoint_hc
             ? hc::CollapseVariance::before_store : hc::CollapseVariance::after_store;
@@ -244,14 +226,10 @@ std::vector<float> FirstRowReference::embed(std::uint32_t token) const {
 
 std::vector<float> FirstRowReference::head_input(std::span<const float> streams) const {
     auto site = hc_spec(shape_.hidden, hc::Site::head, shape_.contracts.checkpoint_hc);
-    if (shape_.contracts.residual == ResidualContract::bf16) site.store = hc::Store::bf16;
     const auto fn = read("model.mhc_contract.hc_head_fn", site.flat() * site.mix_rows());
     const auto base = read("model.mhc_contract.hc_head_base", site.mix_rows());
     const auto scale = read("model.mhc_contract.hc_head_scale", 1);
-    const auto ordered = shape_.contracts.residual == ResidualContract::feature_interleave
-        ? feature_order(streams, shape_.hidden) : std::vector<float>{};
-    const auto mix = hc::mixes(site, ordered.empty() ? streams : std::span<const float>(ordered),
-                              {{}, fn, base, scale, hc::FnLayout::feature_major});
+    const auto mix = hc::mixes(site, streams, {{}, fn, base, scale, hc::FnLayout::feature_major});
     std::vector<float> row(shape_.hidden);
     hc::collapse(site, streams, mix.pre, row);
     const auto epsilon = shape_.contracts.rms_epsilon > 0 ? shape_.contracts.rms_epsilon : kRmsEps;

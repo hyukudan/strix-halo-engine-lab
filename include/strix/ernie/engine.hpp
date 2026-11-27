@@ -8,18 +8,13 @@
 namespace strix::ernie {
 
 using RouterContract = moe::SplitRouteMode;
-enum class VhaContract { residual, swapped, off, non_residual };
-enum class KeyNormContract { candidate, value_before_head_norm, weighted_only, none };
-enum class ResidualContract { candidate, transpose, half_post, feature_interleave, bf16 };
+enum class VhaContract { residual, swapped };
+enum class KeyNormContract { candidate, weighted_only };
 
 struct HostContracts {
     RouterContract router{};
     VhaContract vha{};
     KeyNormContract key_norm{};
-    ResidualContract residual{};
-    bool global_kv_split = false;
-    bool gate_before_vha = false;
-    bool no_hca_inverse_rope = false;
     bool norm_routed_output = false;
     bool checkpoint_attention = false;
     bool hca_fp8_epilogue = false;

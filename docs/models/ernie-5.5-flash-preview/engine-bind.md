@@ -36,7 +36,7 @@ logit measurements. These options do not enter runtime tiers.
 strix-ernie-cpu CHECKPOINT_DIR TEXT.txt BASE --oracle --limit 64 --save-layers \
   --threads 12 --cache-mib 8192 --ordered-simd --table-mxfp4 --profile-host
 strix-ernie-cpu CHECKPOINT_DIR TEXT.txt PROBE --oracle --limit 64 --resume BASE \
-  --start-layer 7 --end-layer 8 --variant mla-global-kv --threads 12 --cache-mib 8192 \
+  --start-layer 7 --end-layer 8 --threads 12 --cache-mib 8192 \
   --ordered-simd --table-mxfp4
 ```
 

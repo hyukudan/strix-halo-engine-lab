@@ -52,7 +52,6 @@ struct Options {
 void set_variant(Options& opts, std::string_view name) {
     auto& c = opts.contracts;
     using ernie::RouterContract;
-    using ernie::ResidualContract;
     using ernie::VhaContract;
     using ernie::KeyNormContract;
     if (name == "router-unit") c.router = RouterContract::unit_gain;
@@ -65,21 +64,10 @@ void set_variant(Options& opts, std::string_view name) {
     else if (name == "checkpoint-stores") c.checkpoint_stores = true;
     else if (name == "router-swap") c.router = RouterContract::swapped_planes;
     else if (name == "router-one-plane") c.router = RouterContract::single_plane;
-    else if (name == "mla-global-kv") c.global_kv_split = true;
-    else if (name == "mla-gate-first") c.gate_before_vha = true;
     else if (name == "vha-swap") c.vha = VhaContract::swapped;
-    else if (name == "vha-off") c.vha = VhaContract::off;
-    else if (name == "vha-no-residual") c.vha = VhaContract::non_residual;
-    else if (name == "mhc-transpose") c.residual = ResidualContract::transpose;
-    else if (name == "mhc-half-post") c.residual = ResidualContract::half_post;
-    else if (name == "mhc-interleave") c.residual = ResidualContract::feature_interleave;
-    else if (name == "mhc-bf16") c.residual = ResidualContract::bf16;
-    else if (name == "hca-v-no-head-norm") c.key_norm = KeyNormContract::value_before_head_norm;
     else if (name == "kv-no-head-norm") c.key_norm = KeyNormContract::weighted_only;
-    else if (name == "qk-no-head-norm") c.key_norm = KeyNormContract::none;
     else if (name == "rope-position-one") c.position_offset = 1;
     else if (name == "rope-base-160k") c.rope_base = 160000;
-    else if (name == "hca-no-inverse-rope") c.no_hca_inverse_rope = true;
     else if (name == "rms-eps-1e-5") c.rms_epsilon = 1e-5F;
     else if (name == "mxfp4-nibble-swap") opts.decode.high_nibble_first = true;
     else if (name == "mxfp4-transposed-experts") opts.decode.transpose_experts = true;
