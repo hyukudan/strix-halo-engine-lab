@@ -54,8 +54,11 @@ inline constexpr std::array<strix::profile::Lever, 11> product_profile_table{{
 inline constexpr std::string_view kTurboPrefillDevice = "gfx1151/Radeon-8060S";
 // Pair link layouts (strix::dist::LinkLayout::key()) the FAST band receipt was timed on. The first entry is the layout
 // of every literal row below (USB4 layout 1: data0 + data1 host streams on both 40 Gb/s cables). A layout outside the
-// list declines in the startup pair vote and runs the exact prefill cores.
-inline constexpr std::string_view kMeasuredPrefillLayouts[] = {"usb4-host-2x2x40"};
+// list declines in the startup pair vote and runs the exact prefill cores. USB4 layout 2bq through the host route
+// (data0 host, data1 gpu_direct on both cables), lower band edge 2,049 ABAB: exact cores 3.821 / 3.824 s, bundle
+// 2.777 / 2.775 s (x1.377; layout 1 x1.37); the same bundle and exchange bits, one host stream per cable. The GPU-direct
+// route (+direct) is not a measured layout.
+inline constexpr std::string_view kMeasuredPrefillLayouts[] = {"usb4-host-2x2x40", "usb4-host-2x1x40"};
 // The execution settings of a measured prefill: the link layout is part of the key, so a literal row decides only the
 // layout it was timed on. prefill_settings(kMeasuredPrefillLayouts[0], routed) spells the two constants below.
 inline std::string prefill_settings(std::string_view link, bool routed_scratch) {
