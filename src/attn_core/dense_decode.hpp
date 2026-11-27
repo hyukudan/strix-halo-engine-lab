@@ -131,7 +131,7 @@ __device__ __forceinline__ float acc_step(float acc, float corr, float w, float 
 
 // The main schedule (main's kernel; per-position arithmetic in online_step / acc_step): grid (rows, heads), block =
 // 32 * waves threads, one block walks the K/V prefix for one (row, q head). It is the off switch, the form for devices
-// and heads shapes without a measured table, rows past the table, and the table's (1, 1) choice. ctx [row][head][Dim].
+// and heads shapes without a measured table and the table's (1, 1) choice. ctx [row][head][Dim].
 template <unsigned Dim>
 __global__ void __launch_bounds__(32U * waves) attend_main_kernel(Params p, const float* q_n, const float* q_in,
                                                              const std::uint16_t* k_cache, const std::uint16_t* v_cache,
@@ -321,7 +321,7 @@ inline const attn_row_share::DeviceTable* device_table(unsigned group, unsigned 
 }
 
 // attend of a window whose prep has run: the device's measured plan (pairs per block and positions per walk step by
-// (walk length band, row count)); no table for the device or head shape, rows past the table, or
+// (walk length band, row count); rows past the table read its last row); no table for the device or head shape, or
 // STRIX_DECODE_ATTN_ROW_SHARE=0 launch the main schedule (attend_main_kernel). Same bits in every case. P = 6 (142 VGPR)
 // is never the fastest for <= 16 rows and P = 12 spills (253 VGPR + 400 B scratch), so neither is instantiated.
 template <unsigned Dim>

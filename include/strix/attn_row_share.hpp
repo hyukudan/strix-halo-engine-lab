@@ -55,14 +55,16 @@ struct Band {
     Choice by_rows[table_rows];
 };
 // Table form: the first band whose max_len >= len (len = positions walked by the window's last row), its choice for
-// `rows`; rows past the table, no band, or enabled = false -> one pair, one position per step.
+// `rows`; rows past the table (the 64-row EXACT prefill windows) take the band's last row choice (the CUDA walk cap
+// reads the same row); no band, or enabled = false -> one pair, one position per step.
 constexpr Plan plan_table(unsigned rows, unsigned group, unsigned len, const Band* bands, unsigned n_bands,
                           bool enabled = true) {
-    if (!enabled || rows >= table_rows || group == 0U)
+    if (!enabled || group == 0U)
         return Plan{1U, blocks_for(rows, group, 1U), 1U};
+    const unsigned row = rows < table_rows ? rows : table_rows - 1U;
     for (unsigned b = 0; b < n_bands; ++b)
         if (len <= bands[b].max_len) {
-            const Choice c = bands[b].by_rows[rows];
+            const Choice c = bands[b].by_rows[row];
             return Plan{c.pairs, blocks_for(rows, group, c.pairs), c.walk};
         }
     return Plan{1U, blocks_for(rows, group, 1U), 1U};
@@ -78,6 +80,10 @@ constexpr Plan plan_table(unsigned rows, unsigned group, unsigned len, const Ban
 //   up to 32K, 16K 1.49 vs 1.41 ms, and ties or loses at 48K, 4.54-5.17 vs 4.54-4.55; it wins 1-3 % at 64K, not
 //   enough to split a band), 2 pairs x 2 positions above (131K 12.7 vs 25.6); rows 7: 2 pairs, 2 positions; rows 8-11
 //   and 13: 2 pairs; rows 12 and 14-16: 3 pairs (one-pair blocks thrash the caches from about 7 rows up).
+// - rows 17-64 (the 64-row EXACT prefill windows; plan_table reads row 16): 3 pairs. ms per call vs the main schedule,
+//   64 rows: 512 0.422 vs 0.488, 2K 1.68 vs 4.49, 8K 7.21 vs 30.4, 32K 37.8 vs 283, 64K 145 vs 660; 17 / 24 / 32 / 48 rows
+//   at 8K and 32K 1.6-6.2x faster; at 512 and 2K within 2 % or faster (512 x 24 rows 0.180 vs 0.177). Bitwise to v0 at
+//   17 and 64 rows (1K, 33K).
 inline constexpr Band gfx1151_mp20_g6_kv4_d256[] = {
     {32768U,
      {{1U, 1U},

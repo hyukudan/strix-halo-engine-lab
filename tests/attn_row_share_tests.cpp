@@ -31,7 +31,7 @@ int main() {
     check(rs::plan(16U, G, KV, floor24, 12U, false).pairs == 1U, "off switch: one-pair form");
     check(rs::plan(16U, G, KV, 0U, 12U).blocks == 8U, "16 rows x 6 heads / 12 = 8 blocks per kv head");
     // Table form (gfx1151 measured choices by length band): every (band, rows 1..16) gets an instantiated form; the off
-    // switch and row counts past the table give the main schedule (one pair, one position).
+    // switch gives the main schedule (one pair, one position); row counts past the table read its last row.
     // Device key: the table holds for the device and head shape it was measured on; anything else -> main schedule.
     const rs::DeviceTable* dt = rs::find_table("gfx1151", 20U, G, KV, 256U);
     check(dt != nullptr, "gfx1151, 20 multiprocessors (40 CU), group 6 x 4 kv, Dim 256: measured table");
@@ -74,10 +74,23 @@ int main() {
           "6 rows, <= 32K: the main schedule (measured fastest with the unfused arithmetic)");
     check(rs::plan_table(6U, G, 65536U, tb, nb).pairs == 1U, "6 rows, 64K: the main schedule (no band split for 1-3 %)");
     check(rs::plan_table(6U, G, 131072U, tb, nb).pairs == 2U, "6 rows, 131K: 2 pairs");
-    check(rs::plan_table(17U, G, 1024U, tb, nb).pairs == 1U, "past the table: main schedule");
+    // Rows past the table (the 64-row EXACT prefill windows): the band's last row choice, its blocks for the real rows.
+    for (unsigned b = 0; b < nb; ++b)
+        for (unsigned rows = rs::table_rows; rows <= 64U; ++rows) {
+            const unsigned len = b == 0U ? tb[0].max_len : tb[b - 1U].max_len + 1U;
+            const auto pl = rs::plan_table(rows, G, len, tb, nb);
+            const auto last = tb[b].by_rows[rs::table_rows - 1U];
+            check(pl.pairs == last.pairs && pl.walk == last.walk, "past the table: the last row's choice");
+            check(pl.blocks == rs::blocks_for(rows, G, pl.pairs), "past the table: blocks for the real rows");
+            const auto off = rs::plan_table(rows, G, len, tb, nb, false);
+            check(off.pairs == 1U && off.walk == 1U && off.blocks == rows * G, "past the table, off switch: main schedule");
+        }
+    check(rs::plan_table(64U, G, 32768U, tb, nb).pairs == 3U && rs::plan_table(64U, G, 32768U, tb, nb).walk == 1U,
+          "64 rows, 32K: 3 pairs (measured 8.2x the main schedule)");
     check(rs::plan_table(4U, G, 1024U, tb, 0U).pairs == 1U, "no band: main schedule");
-    // Coverage, prefix property and the masked walk, for every rows 1..16 and compiled pair count.
-    for (unsigned rows = 1U; rows <= 16U; ++rows)
+    // Coverage, prefix property and the masked walk, for every rows 1..64 (the EXACT prefill windows) and compiled pair
+    // count.
+    for (unsigned rows = 1U; rows <= 64U; ++rows)
         for (const unsigned P : rs::candidates) {
             const unsigned blocks = rs::blocks_for(rows, G, P), total = rows * G, pos0 = 1000U;
             std::vector<unsigned> seen(std::size_t(total) * KV, 0U);
