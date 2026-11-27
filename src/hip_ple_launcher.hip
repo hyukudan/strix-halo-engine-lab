@@ -1,5 +1,6 @@
 #include "strix/hip/legacy_intrinsics.hpp"
 #include "strix/hip/legacy_launch.hpp"
+#include "core/gemv_tree.hpp"
 #include "strix/env_flags.hpp"
 #include "strix/profile/all_on_engaged.hpp"
 #include <iostream>
@@ -552,58 +553,18 @@ std::uint64_t small_weight_bytes(
 }
 
 template <WeightKind Kind>
-__global__ void project_bf16_to_fp32_kernel(
-    const std::uint16_t* input,
-    const void* weights,
-    std::uint32_t input_width,
-    std::uint32_t output_width,
-    float* output) {
-    const auto out =
-        static_cast<std::uint32_t>(
-            blockIdx.x);
-    if (out >= output_width) {
-        return;
+struct ProjectBf16ToFp32 {
+    using Input = std::uint16_t;
+    using Output = float;
+    static constexpr std::uint32_t threads = kThreads;
+    static __device__ __forceinline__ float activation(const Input* input, std::uint32_t feature) { return bf16_to_float(input[feature]); }
+    static __device__ __forceinline__ float weight(const void* weights, std::uint32_t width, std::uint32_t row, std::uint32_t feature) {
+        return load_weight<Kind>(weights, width, row, feature);
     }
+    static __device__ __forceinline__ Output finish(float sum) { return sum; }
+};
 
-    __shared__ float scratch[kThreads];
-    float sum = 0.0F;
-    for (std::uint32_t feature =
-             static_cast<std::uint32_t>(
-                 threadIdx.x);
-         feature < input_width;
-         feature += kThreads) {
-        sum +=
-            bf16_to_float(
-                input[feature]) *
-            load_weight<Kind>(
-                weights,
-                input_width,
-                out,
-                feature);
-    }
-    scratch[threadIdx.x] = sum;
-    __syncthreads();
-
-    for (std::uint32_t stride =
-             kThreads / 2U;
-         stride > 0;
-         stride >>= 1U) {
-        if (threadIdx.x < stride) {
-            scratch[threadIdx.x] +=
-                scratch[
-                    threadIdx.x +
-                    stride];
-        }
-        __syncthreads();
-    }
-
-    if (threadIdx.x == 0) {
-        output[out] =
-            scratch[0];
-    }
-}
-
-// Same 256-leaf DAG as project_bf16_to_fp32_kernel<q8_0> inside one wave per row:
+// Same 256-leaf DAG as rows_kernel<ProjectBf16ToFp32<q8_0>> (core/gemv_tree.hpp) inside one wave per row:
 // leaf t=8*lane+local accumulates features t, t+256, ... in order, then the
 // LDS tree (strides 128..8 are lane shuffles 16..1, strides 4..1 are local).
 __global__ __launch_bounds__(256) void project_wave8_q8_bf16_to_fp32_kernel(
@@ -1199,8 +1160,7 @@ void launch_projection(
     float* output) {
     STRIX_HIP_LAUNCH_GGL(Rdna3Layout,
         HIP_KERNEL_NAME(
-            project_bf16_to_fp32_kernel<
-                Kind>),
+            core::gemv_tree::rows_kernel<ProjectBf16ToFp32<Kind>>),
         dim3(output_width),
         dim3(kThreads),
         0, hip_execution_stream(),
@@ -2189,7 +2149,7 @@ void testing::enqueue_ple_q8_projection(bool wave8,const std::uint16_t* input,co
     std::uint32_t output_width,float* output,void* stream) {
     const auto s=static_cast<hipStream_t>(stream);
     if(wave8) STRIX_HIP_LAUNCH_GGL(Rdna3Layout, project_wave8_q8_bf16_to_fp32_kernel,dim3((output_width+7U)/8U),dim3(256),0,s,input,q8,input_width,output_width,output);
-    else STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(project_bf16_to_fp32_kernel<WeightKind::q8_0>),dim3(output_width),dim3(kThreads),0,s,
+    else STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(core::gemv_tree::rows_kernel<ProjectBf16ToFp32<WeightKind::q8_0>>),dim3(output_width),dim3(kThreads),0,s,
         input,q8,input_width,output_width,output);
     check_hip(hipGetLastError(),"PLE Q8 projection test launch");
 }

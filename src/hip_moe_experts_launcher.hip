@@ -1,5 +1,6 @@
 #include "strix/hip/legacy_intrinsics.hpp"
 #include "strix/hip/legacy_launch.hpp"
+#include "core/gemv_tree.hpp"
 #include "strix/env_flags.hpp"
 #include "core/row_layout.hpp"
 #include "strix/hip_qwen_dpp_reduce.hpp"
@@ -491,41 +492,17 @@ __global__ void selected_projection_kernel(
     }
 
     __shared__ float scratch[kThreads];
-    float sum = 0.0F;
     const auto row =
         static_cast<std::uint64_t>(expert) *
             output_width +
         out;
 
-    for (std::uint32_t feature =
-             static_cast<std::uint32_t>(
-                 threadIdx.x);
-         feature < input_width;
-         feature += kThreads) {
-        sum +=
-            load_activation(
-                &input[feature]) *
-            load_weight<Kind>(
-                weights,
-                input_width,
-                row,
-                feature);
-    }
-    scratch[threadIdx.x] = sum;
-    __syncthreads();
-
-    for (std::uint32_t stride =
-             kThreads / 2U;
-         stride > 0;
-         stride >>= 1U) {
-        if (threadIdx.x < stride) {
-            scratch[threadIdx.x] +=
-                scratch[
-                    threadIdx.x +
-                    stride];
-        }
-        __syncthreads();
-    }
+#define GEMV_TREE_THREADS kThreads
+#define GEMV_TREE_SCRATCH scratch
+#define GEMV_TREE_WIDTH input_width
+#define GEMV_TREE_ACTIVATION(feature) load_activation(&input[feature])
+#define GEMV_TREE_WEIGHT(feature) load_weight<Kind>(weights, input_width, row, feature)
+#include "core/gemv_tree.inc"
 
     if (threadIdx.x == 0) {
         output[out] =
@@ -634,40 +611,17 @@ __global__ void selected_down_accumulate_kernel(
     }
 
     __shared__ float scratch[kThreads];
-    float sum = 0.0F;
     const auto row =
         static_cast<std::uint64_t>(expert) *
             hidden_size +
         out;
 
-    for (std::uint32_t feature =
-             static_cast<std::uint32_t>(
-                 threadIdx.x);
-         feature < intermediate_size;
-         feature += kThreads) {
-        sum +=
-            intermediate[feature] *
-            load_weight<Kind>(
-                weights,
-                intermediate_size,
-                row,
-                feature);
-    }
-    scratch[threadIdx.x] = sum;
-    __syncthreads();
-
-    for (std::uint32_t stride =
-             kThreads / 2U;
-         stride > 0;
-         stride >>= 1U) {
-        if (threadIdx.x < stride) {
-            scratch[threadIdx.x] +=
-                scratch[
-                    threadIdx.x +
-                    stride];
-        }
-        __syncthreads();
-    }
+#define GEMV_TREE_THREADS kThreads
+#define GEMV_TREE_SCRATCH scratch
+#define GEMV_TREE_WIDTH intermediate_size
+#define GEMV_TREE_ACTIVATION(feature) intermediate[feature]
+#define GEMV_TREE_WEIGHT(feature) load_weight<Kind>(weights, intermediate_size, row, feature)
+#include "core/gemv_tree.inc"
 
     if (threadIdx.x == 0) {
         const float current =

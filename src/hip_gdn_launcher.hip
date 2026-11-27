@@ -3,6 +3,7 @@
 #include <hip/hip_runtime.h>
 #include "strix/hip/legacy_intrinsics.hpp"
 #include "strix/hip/legacy_launch.hpp"
+#include "core/gemv_tree.hpp"
 #include "strix/profile/all_on_engaged.hpp"
 #include <iostream>
 #include "core/short_convolution.hpp"
@@ -533,57 +534,16 @@ std::uint64_t small_weight_bytes(
 
 
 template <WeightKind Kind>
-__global__ void project_bf16_to_fp32_kernel(
-    const std::uint16_t* input,
-    const void* weights,
-    std::uint32_t input_width,
-    std::uint32_t output_width,
-    float* output) {
-    const auto out =
-        static_cast<std::uint32_t>(
-            blockIdx.x);
-    if (out >= output_width) {
-        return;
+struct ProjectBf16ToFp32 {
+    using Input = std::uint16_t;
+    using Output = float;
+    static constexpr std::uint32_t threads = kProjectionThreads;
+    static __device__ __forceinline__ float activation(const Input* input, std::uint32_t feature) { return bf16_to_float(input[feature]); }
+    static __device__ __forceinline__ float weight(const void* weights, std::uint32_t width, std::uint32_t row, std::uint32_t feature) {
+        return load_weight<Kind>(weights, width, row, feature);
     }
-
-    __shared__ float scratch[kProjectionThreads];
-    float sum = 0.0F;
-    for (std::uint32_t feature =
-             static_cast<std::uint32_t>(
-                 threadIdx.x);
-         feature < input_width;
-         feature += kProjectionThreads) {
-        sum +=
-            bf16_to_float(
-                input[feature]) *
-            load_weight<Kind>(
-                weights,
-                input_width,
-                out,
-                feature);
-    }
-    scratch[threadIdx.x] = sum;
-    __syncthreads();
-
-    for (std::uint32_t stride =
-             kProjectionThreads / 2U;
-         stride > 0;
-         stride >>= 1U) {
-        if (threadIdx.x < stride) {
-            scratch[threadIdx.x] +=
-                scratch[
-                    threadIdx.x +
-                    stride];
-        }
-        __syncthreads();
-    }
-
-    if (threadIdx.x == 0) {
-        output[out] =
-            round_bf16(
-                scratch[0]);
-    }
-}
+    static __device__ __forceinline__ Output finish(float sum) { return round_bf16(sum); }
+};
 
 // Eight ascending virtual leaves per physical lane preserve the original
 // 256-leaf tree, including its operand order and BF16-in-FP32 epilogue.
@@ -722,56 +682,16 @@ void project_prefetch8_wave8_q8_bf16_to_fp32_kernel(
 
 
 template <WeightKind Kind>
-__global__ void project_fp32_to_bf16_kernel(
-    const float* input,
-    const void* weights,
-    std::uint32_t input_width,
-    std::uint32_t output_width,
-    std::uint16_t* output) {
-    const auto out =
-        static_cast<std::uint32_t>(
-            blockIdx.x);
-    if (out >= output_width) {
-        return;
+struct ProjectFp32ToBf16 {
+    using Input = float;
+    using Output = std::uint16_t;
+    static constexpr std::uint32_t threads = kProjectionThreads;
+    static __device__ __forceinline__ float activation(const Input* input, std::uint32_t feature) { return input[feature]; }
+    static __device__ __forceinline__ float weight(const void* weights, std::uint32_t width, std::uint32_t row, std::uint32_t feature) {
+        return load_weight<Kind>(weights, width, row, feature);
     }
-
-    __shared__ float scratch[kProjectionThreads];
-    float sum = 0.0F;
-    for (std::uint32_t feature =
-             static_cast<std::uint32_t>(
-                 threadIdx.x);
-         feature < input_width;
-         feature += kProjectionThreads) {
-        sum +=
-            input[feature] *
-            load_weight<Kind>(
-                weights,
-                input_width,
-                out,
-                feature);
-    }
-    scratch[threadIdx.x] = sum;
-    __syncthreads();
-
-    for (std::uint32_t stride =
-             kProjectionThreads / 2U;
-         stride > 0;
-         stride >>= 1U) {
-        if (threadIdx.x < stride) {
-            scratch[threadIdx.x] +=
-                scratch[
-                    threadIdx.x +
-                    stride];
-        }
-        __syncthreads();
-    }
-
-    if (threadIdx.x == 0) {
-        output[out] =
-            float_to_bf16(
-                scratch[0]);
-    }
-}
+    static __device__ __forceinline__ Output finish(float sum) { return float_to_bf16(sum); }
+};
 
 // One wave simulates the same256 original leaves: virtual t=8*lane+j.
 // Ascending per-leaf FMA chains and the128..1 tree are unchanged.
@@ -2416,12 +2336,11 @@ void launch_projection(
     std::uint32_t input_width,
     std::uint32_t output_width,
     float* output, hipStream_t stream, GdnKernelLedger* ledger) {
-    record_gdn_kernel(ledger, reinterpret_cast<const void*>(project_bf16_to_fp32_kernel<Kind>),
+    record_gdn_kernel(ledger, reinterpret_cast<const void*>(core::gemv_tree::rows_kernel<ProjectBf16ToFp32<Kind>>),
         dim3(output_width), dim3(kProjectionThreads));
     STRIX_HIP_LAUNCH_GGL(Rdna3Layout,
         HIP_KERNEL_NAME(
-            project_bf16_to_fp32_kernel<
-                Kind>),
+            core::gemv_tree::rows_kernel<ProjectBf16ToFp32<Kind>>),
         dim3(output_width),
         dim3(kProjectionThreads),
         0,
@@ -2523,12 +2442,11 @@ void launch_output_projection(
     std::uint32_t input_width,
     std::uint32_t output_width,
     std::uint16_t* output, hipStream_t stream, GdnKernelLedger* ledger) {
-    record_gdn_kernel(ledger, reinterpret_cast<const void*>(project_fp32_to_bf16_kernel<Kind>),
+    record_gdn_kernel(ledger, reinterpret_cast<const void*>(core::gemv_tree::rows_kernel<ProjectFp32ToBf16<Kind>>),
         dim3(output_width), dim3(kProjectionThreads));
     STRIX_HIP_LAUNCH_GGL(Rdna3Layout,
         HIP_KERNEL_NAME(
-            project_fp32_to_bf16_kernel<
-                Kind>),
+            core::gemv_tree::rows_kernel<ProjectFp32ToBf16<Kind>>),
         dim3(output_width),
         dim3(kProjectionThreads),
         0,
@@ -6417,13 +6335,13 @@ void require_island_d1_scope(const HipLaunchContext& scope, std::uint64_t identi
 }
 const void* wave8_island_input_symbol(std::uint32_t ggml_type) {
     switch (weight_kind(ggml_type)) {
-    case WeightKind::f32: return reinterpret_cast<const void*>(project_bf16_to_fp32_kernel<WeightKind::f32>);
-    case WeightKind::f16: return reinterpret_cast<const void*>(project_bf16_to_fp32_kernel<WeightKind::f16>);
-    case WeightKind::bf16: return reinterpret_cast<const void*>(project_bf16_to_fp32_kernel<WeightKind::bf16>);
+    case WeightKind::f32: return reinterpret_cast<const void*>(core::gemv_tree::rows_kernel<ProjectBf16ToFp32<WeightKind::f32>>);
+    case WeightKind::f16: return reinterpret_cast<const void*>(core::gemv_tree::rows_kernel<ProjectBf16ToFp32<WeightKind::f16>>);
+    case WeightKind::bf16: return reinterpret_cast<const void*>(core::gemv_tree::rows_kernel<ProjectBf16ToFp32<WeightKind::bf16>>);
     case WeightKind::q8_0: return reinterpret_cast<const void*>(project_prefetch8_wave8_q8_bf16_to_fp32_kernel);
-    case WeightKind::iq4_nl: return reinterpret_cast<const void*>(project_bf16_to_fp32_kernel<WeightKind::iq4_nl>);
-    case WeightKind::iq4_xs: return reinterpret_cast<const void*>(project_bf16_to_fp32_kernel<WeightKind::iq4_xs>);
-#define STRIX_GGML_KIND_CASE(KIND, type) case WeightKind::KIND: return reinterpret_cast<const void*>(project_bf16_to_fp32_kernel<WeightKind::KIND>);
+    case WeightKind::iq4_nl: return reinterpret_cast<const void*>(core::gemv_tree::rows_kernel<ProjectBf16ToFp32<WeightKind::iq4_nl>>);
+    case WeightKind::iq4_xs: return reinterpret_cast<const void*>(core::gemv_tree::rows_kernel<ProjectBf16ToFp32<WeightKind::iq4_xs>>);
+#define STRIX_GGML_KIND_CASE(KIND, type) case WeightKind::KIND: return reinterpret_cast<const void*>(core::gemv_tree::rows_kernel<ProjectBf16ToFp32<WeightKind::KIND>>);
     STRIX_GGML_KINDS_K(STRIX_GGML_KIND_CASE) STRIX_GGML_KINDS_GSQ(STRIX_GGML_KIND_CASE)
 #undef STRIX_GGML_KIND_CASE
     }

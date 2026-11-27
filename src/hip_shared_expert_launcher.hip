@@ -1,5 +1,6 @@
 #include "strix/hip/legacy_intrinsics.hpp"
 #include "strix/hip/legacy_launch.hpp"
+#include "core/gemv_tree.hpp"
 #include "strix/cohort_step_plan.hpp"
 #include "strix/env_flags.hpp"
 #include "core/row_layout.hpp"
@@ -332,59 +333,17 @@ std::uint64_t required_weight_bytes(
         "unreachable shared-expert weight kind");
 }
 
-template <
-    typename Input,
-    WeightKind Kind>
-__global__ void projection_to_fp32_kernel(
-    const Input* input,
-    const void* weights,
-    std::uint32_t input_width,
-    std::uint32_t output_width,
-    float* output) {
-    const auto out =
-        static_cast<std::uint32_t>(
-            blockIdx.x);
-    if (out >= output_width) {
-        return;
+template <typename Storage, WeightKind Kind>
+struct ProjectionToFp32 {
+    using Input = Storage;
+    using Output = float;
+    static constexpr std::uint32_t threads = kThreads;
+    static __device__ __forceinline__ float activation(const Input* input, std::uint32_t feature) { return load_activation(&input[feature]); }
+    static __device__ __forceinline__ float weight(const void* weights, std::uint32_t width, std::uint32_t row, std::uint32_t feature) {
+        return load_weight<Kind>(weights, width, row, feature);
     }
-
-    __shared__ float scratch[kThreads];
-    float sum = 0.0F;
-    for (std::uint32_t feature =
-             static_cast<std::uint32_t>(
-                 threadIdx.x);
-         feature < input_width;
-         feature += kThreads) {
-        sum +=
-            load_activation(
-                &input[feature]) *
-            load_weight<Kind>(
-                weights,
-                input_width,
-                out,
-                feature);
-    }
-    scratch[threadIdx.x] = sum;
-    __syncthreads();
-
-    for (std::uint32_t stride =
-             kThreads / 2U;
-         stride > 0;
-         stride >>= 1U) {
-        if (threadIdx.x < stride) {
-            scratch[threadIdx.x] +=
-                scratch[
-                    threadIdx.x +
-                    stride];
-        }
-        __syncthreads();
-    }
-
-    if (threadIdx.x == 0) {
-        output[out] =
-            scratch[0];
-    }
-}
+    static __device__ __forceinline__ Output finish(float sum) { return sum; }
+};
 
 __global__ void gated_activation_kernel(
     float* workspace,
@@ -418,36 +377,12 @@ __global__ void scalar_projection_kernel(
     std::uint32_t input_width,
     float* output) {
     __shared__ float scratch[kThreads];
-    float sum = 0.0F;
-    for (std::uint32_t feature =
-             static_cast<std::uint32_t>(
-                 threadIdx.x);
-         feature < input_width;
-         feature += kThreads) {
-        sum +=
-            load_activation(
-                &input[feature]) *
-            load_weight<Kind>(
-                weights,
-                input_width,
-                0,
-                feature);
-    }
-    scratch[threadIdx.x] = sum;
-    __syncthreads();
-
-    for (std::uint32_t stride =
-             kThreads / 2U;
-         stride > 0;
-         stride >>= 1U) {
-        if (threadIdx.x < stride) {
-            scratch[threadIdx.x] +=
-                scratch[
-                    threadIdx.x +
-                    stride];
-        }
-        __syncthreads();
-    }
+#define GEMV_TREE_THREADS kThreads
+#define GEMV_TREE_SCRATCH scratch
+#define GEMV_TREE_WIDTH input_width
+#define GEMV_TREE_ACTIVATION(feature) load_activation(&input[feature])
+#define GEMV_TREE_WEIGHT(feature) load_weight<Kind>(weights, input_width, 0, feature)
+#include "core/gemv_tree.inc"
     if (threadIdx.x == 0) {
         *output =
             1.0F /
@@ -578,35 +513,12 @@ __global__ void down_projection_kernel(
     }
 
     __shared__ float scratch[kThreads];
-    float sum = 0.0F;
-    for (std::uint32_t feature =
-             static_cast<std::uint32_t>(
-                 threadIdx.x);
-         feature < intermediate_size;
-         feature += kThreads) {
-        sum +=
-            intermediate[feature] *
-            load_weight<Kind>(
-                weights,
-                intermediate_size,
-                out,
-                feature);
-    }
-    scratch[threadIdx.x] = sum;
-    __syncthreads();
-
-    for (std::uint32_t stride =
-             kThreads / 2U;
-         stride > 0;
-         stride >>= 1U) {
-        if (threadIdx.x < stride) {
-            scratch[threadIdx.x] +=
-                scratch[
-                    threadIdx.x +
-                    stride];
-        }
-        __syncthreads();
-    }
+#define GEMV_TREE_THREADS kThreads
+#define GEMV_TREE_SCRATCH scratch
+#define GEMV_TREE_WIDTH intermediate_size
+#define GEMV_TREE_ACTIVATION(feature) intermediate[feature]
+#define GEMV_TREE_WEIGHT(feature) load_weight<Kind>(weights, intermediate_size, out, feature)
+#include "core/gemv_tree.inc"
     if (threadIdx.x == 0) {
         store_activation(
             &output[out],
@@ -862,7 +774,7 @@ void launch_projection_by_kind(
             return;
         }
     if(prefetch && kind==WeightKind::q8_0 && input_width%32U==0){STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(shared_q8_virtual_projection_kernel<Input,true,8>),dim3(output_width/8U+(output_width%8U!=0U)),dim3(256),0,hip_execution_stream(),input,reinterpret_cast<const void*>(weights.address),input_width,output_width,output);check_hip(hipGetLastError(),"HIP shared prefetch8 gate/up launch");if(stats)stats->dispatched_projections.fetch_add(1,std::memory_order_relaxed);return;}
-#define STRIX_LAUNCH_CASE(kind_name)     STRIX_HIP_LAUNCH_GGL(Rdna3Layout,          HIP_KERNEL_NAME(             projection_to_fp32_kernel<                 Input, WeightKind::kind_name>),         dim3(output_width),         dim3(kThreads),         0, hip_execution_stream(),         input,         reinterpret_cast<const void*>(weights.address),         input_width,         output_width,         output)
+#define STRIX_LAUNCH_CASE(kind_name)     STRIX_HIP_LAUNCH_GGL(Rdna3Layout,          HIP_KERNEL_NAME(             core::gemv_tree::rows_kernel<ProjectionToFp32<Input, WeightKind::kind_name>>),         dim3(output_width),         dim3(kThreads),         0, hip_execution_stream(),         input,         reinterpret_cast<const void*>(weights.address),         input_width,         output_width,         output)
     switch (kind) {
     case WeightKind::f32: STRIX_LAUNCH_CASE(f32); break;
     case WeightKind::f16: STRIX_LAUNCH_CASE(f16); break;
@@ -1242,7 +1154,7 @@ template<typename Storage>
 void shared_projection_probe_typed(HipSharedQ8ProjectionRole role,HipSharedQ8ProjectionMode mode,HipSharedQ8ProjectionView input,HipSharedQ8ProjectionView weights,HipSharedQ8ProjectionView gate,HipSharedQ8ProjectionView output,unsigned width,unsigned outputs,hipStream_t stream){
     const auto* w=reinterpret_cast<const void*>(weights.address);const auto* g=reinterpret_cast<const float*>(gate.address);
     if(role==HipSharedQ8ProjectionRole::gate_up){const auto* in=reinterpret_cast<const Storage*>(input.address);auto* out=reinterpret_cast<float*>(output.address);
-        if(mode==HipSharedQ8ProjectionMode::legacy256)STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(projection_to_fp32_kernel<Storage,WeightKind::q8_0>),dim3(outputs),dim3(256),0,stream,in,w,width,outputs,out);
+        if(mode==HipSharedQ8ProjectionMode::legacy256)STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(core::gemv_tree::rows_kernel<ProjectionToFp32<Storage,WeightKind::q8_0>>),dim3(outputs),dim3(256),0,stream,in,w,width,outputs,out);
         else if(mode==HipSharedQ8ProjectionMode::virtual256)STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(shared_q8_virtual_projection_kernel<Storage,false,1>),dim3(outputs),dim3(32),0,stream,in,w,width,outputs,out);
         else STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(shared_q8_virtual_projection_kernel<Storage,true,8>),dim3(outputs/8U+(outputs%8U!=0U)),dim3(256),0,stream,in,w,width,outputs,out);
     }else{const auto* in=reinterpret_cast<const float*>(input.address);auto* out=reinterpret_cast<Storage*>(output.address);
@@ -2788,10 +2700,10 @@ void launch_hip_mtp_shared_expert(const MtpNativeContext& c,void* raw_stream){
 void enqueue_hip_mtp_shared_expert_q8(const std::uint16_t* input,const void* gate,const void* up_weights,const void* down,
     const void* scalar,float* workspace,std::uint16_t* output,void* raw_stream) {
     const auto stream=static_cast<hipStream_t>(raw_stream);auto* up=workspace+640U;
-    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(projection_to_fp32_kernel<std::uint16_t,WeightKind::q8_0>),dim3(640U),dim3(kThreads),0,stream,
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(core::gemv_tree::rows_kernel<ProjectionToFp32<std::uint16_t,WeightKind::q8_0>>),dim3(640U),dim3(kThreads),0,stream,
         input,gate,2560U,640U,workspace);
     check_hip(hipGetLastError(),"MTP shared Q8 gate projection");
-    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(projection_to_fp32_kernel<std::uint16_t,WeightKind::q8_0>),dim3(640U),dim3(kThreads),0,stream,
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(core::gemv_tree::rows_kernel<ProjectionToFp32<std::uint16_t,WeightKind::q8_0>>),dim3(640U),dim3(kThreads),0,stream,
         input,up_weights,2560U,640U,up);
     check_hip(hipGetLastError(),"MTP shared Q8 up projection");
     STRIX_HIP_LAUNCH_GGL(Rdna3Layout, gated_activation_kernel,dim3(3U),dim3(kThreads),0,stream,workspace,640U);

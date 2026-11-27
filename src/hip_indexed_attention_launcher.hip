@@ -1,5 +1,6 @@
 #include "strix/hip/legacy_intrinsics.hpp"
 #include "strix/hip/legacy_launch.hpp"
+#include "core/gemv_tree.hpp"
 #include "strix/hip_mtp_prime_rows.hpp"
 #include "strix/attn/kv_int8_token.hpp"
 #include <type_traits>
@@ -715,57 +716,16 @@ std::uint64_t required_small_weight_bytes(
 }
 
 template <WeightKind Kind>
-__global__ void linear_to_float_kernel(
-    const std::uint16_t* input,
-    const void* weights,
-    std::uint32_t input_width,
-    std::uint32_t output_width,
-    float* output) {
-    const auto out =
-        static_cast<std::uint32_t>(
-            blockIdx.x);
-    if (out >= output_width) {
-        return;
+struct LinearToFloat {
+    using Input = std::uint16_t;
+    using Output = float;
+    static constexpr std::uint32_t threads = kThreads;
+    static __device__ __forceinline__ float activation(const Input* input, std::uint32_t feature) { return load_activation(&input[feature]); }
+    static __device__ __forceinline__ float weight(const void* weights, std::uint32_t width, std::uint32_t row, std::uint32_t feature) {
+        return load_weight<Kind>(weights, width, row, feature);
     }
-
-    __shared__ float scratch[kThreads];
-    float sum = 0.0F;
-    for (std::uint32_t feature =
-             static_cast<std::uint32_t>(
-                 threadIdx.x);
-         feature < input_width;
-         feature += kThreads) {
-        sum +=
-            load_activation(
-                &input[feature]) *
-            load_weight<Kind>(
-                weights,
-                input_width,
-                out,
-                feature);
-    }
-    scratch[threadIdx.x] = sum;
-    __syncthreads();
-
-    for (std::uint32_t stride =
-             kThreads / 2U;
-         stride > 0;
-         stride >>= 1U) {
-        if (threadIdx.x < stride) {
-            scratch[threadIdx.x] +=
-                scratch[
-                    threadIdx.x +
-                    stride];
-        }
-        __syncthreads();
-    }
-
-    if (threadIdx.x == 0) {
-        output[out] =
-            round_bf16(
-                scratch[0]);
-    }
-}
+    static __device__ __forceinline__ Output finish(float sum) { return round_bf16(sum); }
+};
 
 // Preserve the actual legacy LDS-tree operand priority: upper/partner src0,
 // lower/self src1. Ordinary commutative lowering can select another NaN payload.
@@ -864,56 +824,16 @@ void linear_prefetch8_q8_qsa_input_kernel(
 }
 
 template <WeightKind Kind>
-__global__ void linear_float_to_bf16_kernel(
-    const float* input,
-    const void* weights,
-    std::uint32_t input_width,
-    std::uint32_t output_width,
-    std::uint16_t* output) {
-    const auto out =
-        static_cast<std::uint32_t>(
-            blockIdx.x);
-    if (out >= output_width) {
-        return;
+struct LinearFloatToBf16 {
+    using Input = float;
+    using Output = std::uint16_t;
+    static constexpr std::uint32_t threads = kThreads;
+    static __device__ __forceinline__ float activation(const Input* input, std::uint32_t feature) { return input[feature]; }
+    static __device__ __forceinline__ float weight(const void* weights, std::uint32_t width, std::uint32_t row, std::uint32_t feature) {
+        return load_weight<Kind>(weights, width, row, feature);
     }
-
-    __shared__ float scratch[kThreads];
-    float sum = 0.0F;
-    for (std::uint32_t feature =
-             static_cast<std::uint32_t>(
-                 threadIdx.x);
-         feature < input_width;
-         feature += kThreads) {
-        sum +=
-            input[feature] *
-            load_weight<Kind>(
-                weights,
-                input_width,
-                out,
-                feature);
-    }
-    scratch[threadIdx.x] = sum;
-    __syncthreads();
-
-    for (std::uint32_t stride =
-             kThreads / 2U;
-         stride > 0;
-         stride >>= 1U) {
-        if (threadIdx.x < stride) {
-            scratch[threadIdx.x] +=
-                scratch[
-                    threadIdx.x +
-                    stride];
-        }
-        __syncthreads();
-    }
-
-    if (threadIdx.x == 0) {
-        output[out] =
-            float_to_bf16(
-                scratch[0]);
-    }
-}
+    static __device__ __forceinline__ Output finish(float sum) { return float_to_bf16(sum); }
+};
 
 // Actual original Q8 output LDS tree uses upper/partner src0 and lower/self
 // src1 at every 128..1 stage. Keep this output-specific evidence and helper
@@ -2325,7 +2245,7 @@ void launch_linear_to_float_typed(
     float* output) {
     STRIX_HIP_LAUNCH_GGL(Rdna3Layout,
         HIP_KERNEL_NAME(
-            linear_to_float_kernel<Kind>),
+            core::gemv_tree::rows_kernel<LinearToFloat<Kind>>),
         dim3(output_width),
         dim3(kThreads),
         0,
@@ -2429,7 +2349,7 @@ void launch_linear_float_to_bf16_typed(
     const ExecutionBufferAddress& output) {
     STRIX_HIP_LAUNCH_GGL(Rdna3Layout,
         HIP_KERNEL_NAME(
-            linear_float_to_bf16_kernel<Kind>),
+            core::gemv_tree::rows_kernel<LinearFloatToBf16<Kind>>),
         dim3(output_width),
         dim3(kThreads),
         0,
@@ -8343,7 +8263,7 @@ void launch_hip_qsa_input_projection_probe(HipQsaInputProjectionMode mode,HipQsa
     if(overlap(output,input)||overlap(output,weights))throw std::invalid_argument("QSA input projection probe writable alias");
     check_hip(hipPeekAtLastError(),"QSA projection probe stale error");
     auto hip_stream=static_cast<hipStream_t>(stream);auto* in=reinterpret_cast<const std::uint16_t*>(input.address);auto* w=reinterpret_cast<const void*>(weights.address);auto* out=reinterpret_cast<float*>(output.address);
-    if(mode==HipQsaInputProjectionMode::legacy256)STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(linear_to_float_kernel<WeightKind::q8_0>),dim3(outputs),dim3(256),0,hip_stream,in,w,width,outputs,out);
+    if(mode==HipQsaInputProjectionMode::legacy256)STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(core::gemv_tree::rows_kernel<LinearToFloat<WeightKind::q8_0>>),dim3(outputs),dim3(256),0,hip_stream,in,w,width,outputs,out);
     else if(mode==HipQsaInputProjectionMode::virtual256)STRIX_HIP_LAUNCH_GGL(Rdna3Layout, linear_virtual256_q8_qsa_input_kernel,dim3(outputs),dim3(32),0,hip_stream,in,w,width,outputs,out);
     else STRIX_HIP_LAUNCH_GGL(Rdna3Layout, linear_prefetch8_q8_qsa_input_kernel,dim3(outputs),dim3(32),0,hip_stream,in,w,width,outputs,out);
     check_hip(hipGetLastError(),"QSA input projection probe launch");
@@ -8613,7 +8533,7 @@ void launch_hip_qsa_output_projection_probe(HipQsaOutputProjectionMode mode,
     const auto* weight = reinterpret_cast<const void*>(weights.address);
     const auto owned_stream = static_cast<hipStream_t>(stream);
     if (mode == HipQsaOutputProjectionMode::legacy256)
-        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(linear_float_to_bf16_kernel<WeightKind::q8_0>),
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(core::gemv_tree::rows_kernel<LinearFloatToBf16<WeightKind::q8_0>>),
             dim3(outputs), dim3(256), 0, owned_stream, in, weight, width, outputs, out);
     else
         STRIX_HIP_LAUNCH_GGL(Rdna3Layout, linear_prefetch8_wave8_q8_float_to_bf16_kernel,
@@ -9459,7 +9379,7 @@ void require_mtp_attention_stream(const MtpNativeContext& c,void* stream) {
 }
 template<WeightKind Kind> void mtp_project(const MtpDeviceView& input,const TensorPair& tensor,
     std::uint32_t width,std::uint32_t outputs,float* output,hipStream_t stream) {
-    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(linear_to_float_kernel<Kind>),dim3(outputs),dim3(kThreads),0,stream,
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(core::gemv_tree::rows_kernel<LinearToFloat<Kind>>),dim3(outputs),dim3(kThreads),0,stream,
         reinterpret_cast<const std::uint16_t*>(input.address),reinterpret_cast<const void*>(tensor.runtime->address),width,outputs,output);
     check_hip(hipGetLastError(),"MTP attention projection enqueue");
 }
@@ -9612,13 +9532,13 @@ void launch_hip_mtp_indexer(const MtpNativeContext& c,void* raw_stream) {
 }
 void enqueue_hip_mtp_attention_q8_linear(const std::uint16_t* input,const void* q8,std::uint32_t width,
     std::uint32_t rows,float* output,void* stream) {
-    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(linear_to_float_kernel<WeightKind::q8_0>),dim3(rows),dim3(kThreads),0,static_cast<hipStream_t>(stream),
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(core::gemv_tree::rows_kernel<LinearToFloat<WeightKind::q8_0>>),dim3(rows),dim3(kThreads),0,static_cast<hipStream_t>(stream),
         input,q8,width,rows,output);
     check_hip(hipGetLastError(),"MTP attention projection enqueue");
 }
 void enqueue_hip_mtp_attention_bf16_linear(const std::uint16_t* input,const void* bf16,std::uint32_t width,
     std::uint32_t rows,float* output,void* stream) {
-    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(linear_to_float_kernel<WeightKind::bf16>),dim3(rows),dim3(kThreads),0,static_cast<hipStream_t>(stream),
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(core::gemv_tree::rows_kernel<LinearToFloat<WeightKind::bf16>>),dim3(rows),dim3(kThreads),0,static_cast<hipStream_t>(stream),
         input,bf16,width,rows,output);
     check_hip(hipGetLastError(),"MTP attention BF16 projection enqueue");
 }
@@ -9728,7 +9648,7 @@ void mtp_sparse_attention(const MtpNativeContext& c,void* raw_stream,bool draft)
             p.attention_width,p.hidden,reinterpret_cast<void*>(p.output.address),true,stream);
         return;
     }
-    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(linear_float_to_bf16_kernel<WeightKind::q8_0>),dim3(p.hidden),dim3(kThreads),0,stream,
+    STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(core::gemv_tree::rows_kernel<LinearFloatToBf16<WeightKind::q8_0>>),dim3(p.hidden),dim3(kThreads),0,stream,
         w.attention_output,reinterpret_cast<const void*>(p.tensors.out.runtime->address),p.attention_width,p.hidden,
         reinterpret_cast<std::uint16_t*>(p.output.address));
     check_hip(hipGetLastError(),"MTP attention output projection enqueue");
