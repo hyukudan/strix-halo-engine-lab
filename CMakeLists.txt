@@ -7730,7 +7730,8 @@ if(STRIX_FAMILY_MINIMAX)
             endif()
             if(STRIX_LEGACY_MAINS)
                 add_executable(strix-minimax-serve apps/minimax_serve_main.cpp)
-                target_link_libraries(strix-minimax-serve PRIVATE strix_session_shell strix_minimax_session_service strix_cli)
+                target_link_libraries(strix-minimax-serve PRIVATE strix_session_shell strix_minimax_session_service strix_cli
+                    strix_cli_inspection_bindings)
                 # The registry root falls back to the shipped data directory the launcher uses (strix::cli::data_directory).
                 target_compile_definitions(strix-minimax-serve PRIVATE STRIX_MINIMAX_SERVE_SHIPPED_DATA=1)
                 target_compile_features(strix-minimax-serve PRIVATE cxx_std_20)
