@@ -173,6 +173,15 @@ public:
         return decoder_.max_verify_rows();
     }
 
+    // Explicitly binding both drafters puts the MTP sidecar (arm 0) and the block drafter under the shared selector.
+    // The block arm wins ties and has no minimum acceptance threshold for an initial probe.
+    std::vector<ChainArm> chain_arms(std::uint32_t anchor, std::uint32_t position) override {
+        if (!dflash_ || !drafter_) return {};
+        drafter_->start(anchor, position);
+        dflash_->start(anchor, position);
+        return {{&*drafter_, "dspark", 0.0, false}, {dflash_.get(), "dflash2", 0.0, true}};
+    }
+
     spec::ChainDrafter* chain_drafter(std::uint32_t anchor, std::uint32_t position) override {
         if (dflash_) {
             dflash_->start(anchor, position);
@@ -390,7 +399,7 @@ int main(int argc, char** argv) {
         std::cerr << "usage: " << executable
                   << " MODEL.safetensors (TOKEN [TOKEN ...] | --prompt TEXT | --messages FILE) [--tokenizer FILE]"
                      " [--prefill-chunk N] [--packed-decode | --grouped-decode] [--generate N] [--logits FILE]"
-                     " [--speculation off|auto|verify|lookup] [--dspark FILE] [--dflash DIR]"
+                     " [--speculation off|auto|verify|lookup] [--dspark FILE|off] [--dflash DIR|off]"
                      " [--step-graph | --no-step-graph"
 #if defined(STRIX_INKLING2_STEP_PROGRAM)
                      " | --step-program (default for decode)"
@@ -498,10 +507,11 @@ int main(int argc, char** argv) {
         // MTP block schema before anything is reserved for it: a file the loader would refuse is declined with its
         // reason and the run keeps its context drafts (source absent / rejected = context drafts only); an explicit
         // --dspark file is never declined (its loader error stands).
+        // An explicit block alone selects that arm. Name both sidecars to use the shared selector.
         const auto drafter = [&] {
             auto found = strix::spec::resolve_drafter_file(
                 {.file = options.dspark ? std::string_view(options.dspark) : std::string_view{},
-                 .off = options.dspark_off || options.dflash != nullptr,
+                 .off = options.dspark_off || (options.dflash && !options.dspark),
                  .speculating = options.generation.speculation == serve::CliSpeculation::automatic &&
                                 !options.gate_manifest && !options.generation.tokenize_file &&
                                 !token_sampling_enabled(options.generation.sampling)},

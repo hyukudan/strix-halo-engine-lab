@@ -54,7 +54,8 @@ inline Options parse(int argc, char** argv, const serve::SerialGenerationFamily&
                 return true;
             }
             if (argument == "--dflash" && native) {
-                options.dflash = value();
+                const char* dir = value();
+                options.dflash = std::string_view(dir) == "off" ? nullptr : dir;
                 return true;
             }
             if (!native) {
@@ -119,8 +120,6 @@ inline Options parse(int argc, char** argv, const serve::SerialGenerationFamily&
             throw std::invalid_argument("logits output must differ from the DSpark sidecar");
     }
     if (options.dflash) {
-        if (options.dspark || options.dspark_off)
-            throw std::invalid_argument("--dflash and --dspark name one drafter: choose one");
         if (gate || generation.tokenize_file || generation.speculation != serve::CliSpeculation::automatic ||
             token_sampling_enabled(generation.sampling))
             throw std::invalid_argument("--dflash requires greedy --speculation auto with model generation");
