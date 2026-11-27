@@ -152,7 +152,12 @@ Options parse_options(int argc, char** argv) {
         else if (arg == "--bind") o.bind = value();
         else if (arg == "--port") o.port = std::uint16_t(number(65535));
         else if (arg == "--threads") o.threads = std::uint32_t(number(16));
-        else if (arg == "--streams") o.streams = std::uint32_t(number(8));
+        else if (arg == "--streams" || arg == "--slots") o.streams = std::uint32_t(number(8)); // --slots: the name every server takes
+        else if (arg == "--context") {
+            // The shared serving name for the context capacity: positions of KV one request may hold (the native limit when absent).
+            o.deployment_context = std::uint32_t(number(UINT32_MAX));
+            if (!o.deployment_context) throw std::invalid_argument("--context must be positive");
+        }
         else if (arg == "--max-tokens" || arg == "--generate") o.request.max_tokens = std::size_t(number(65536));
         else if (arg == "--temperature") o.request.sampling.temperature = std::stof(value());
         else if (arg == "--top-p") o.request.sampling.top_p = std::stof(value());
@@ -244,7 +249,7 @@ Runtime::Runtime(const Options& o) {
         o.model.extension() == ".gguf" ? load_gguf_model(o.model) : load_safetensors_model(o.model);
     rope = load_rope_tables(o.rope); manifest.rope_hash = rope.view.hash;
     if (o.deployment_context) {
-        if (o.deployment_context > manifest.config.max_positions) throw std::invalid_argument("deployment context exceeds native limit");
+        if (o.deployment_context > manifest.config.max_positions) throw std::invalid_argument("context exceeds native limit");
         manifest.config.max_positions = o.deployment_context;
     }
     if (o.backend == "host") backend = std::make_unique<HostBackend>(manifest,rope.view,o.threads);
@@ -394,7 +399,7 @@ ServePreparation prepare_serve(int argc,char** argv) {
         // Up to serve_slots() requests decode together: session-fixed choices (the EXL3 core identity) see that
         // stream count unless --streams sets it.
         bool streams_given = false;
-        for (int i = 1; i < argc; ++i) streams_given |= std::string_view(argv[i]) == "--streams";
+        for (int i = 1; i < argc; ++i) streams_given |= std::string_view(argv[i]) == "--streams" || std::string_view(argv[i]) == "--slots";
         for (int i = 1; i < argc; ++i) {
             prepared.bind_given |= std::string_view(argv[i]) == "--bind";
             prepared.port_given |= std::string_view(argv[i]) == "--port";
@@ -409,6 +414,7 @@ ServePreparation prepare_serve(int argc,char** argv) {
                 "  STRIX_G4_MTP_Q8=1 (Q8_0 assistant matrices), STRIX_G4_MTP_GRAPHS=0 (no HIP graph replay), STRIX_G4_DFLASH=0 (no drafting)\n"
                 "profiles: --profile exact|fast|turbo|quality (default: exact; explicit options and env win); the MTP drafter is found at\n"
                 "  <model dir>/drafter-mtp unless --draft-mtp DIR is given; --draft off or STRIX_G4_DRAFT=0 disables it\n"
+                "common: --slots N (alias of --streams, 1..8), --context N (context capacity in positions, default the native limit)\n"
                 "deployment: --deploy FILE|auto [--deploy-check] [--deploy-node INDEX for replica inventory]\n";
             prepared.exit_code=0;prepared.output=report.str();return prepared;
         }
@@ -428,7 +434,8 @@ ServePreparation prepare_serve(int argc,char** argv) {
                     throw std::invalid_argument("deployment pending profile execution is not admitted");
             if (!strix::deploy::pinned(spec,"slots") && streams_given) spec.slots = options.streams;
             const auto model = deployment_model(options.model);
-            if (!strix::deploy::pinned(spec,"context")) spec.context = model.max_context;
+            // --context (options.deployment_context before the plan replaces it) pins the context like --streams pins the slots.
+            if (!strix::deploy::pinned(spec,"context")) spec.context = options.deployment_context ? options.deployment_context : model.max_context;
             // Replicas are independent launches. The spec supplies measured peer
             // facts; each process (and its inspection) replaces its own indexed observation.
             const auto facts = strix::deploy::inspection_devices(spec,options.deploy_node,strix::deploy::probe_device());
