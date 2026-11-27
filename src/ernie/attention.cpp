@@ -20,6 +20,7 @@ constexpr auto kCompression = narrow<unsigned>(a::compress_ratios[0]);
 constexpr auto kIndexDim = narrow<unsigned>(a::indexer::index_head_dim);
 constexpr auto kIndexHeads = narrow<unsigned>(a::indexer::index_n_heads);
 constexpr auto kTopK = narrow<unsigned>(a::indexer::index_topk);
+constexpr auto kIndexPrefillHeads = narrow<unsigned>(a::indexer::prefill_head_topk);
 constexpr auto kOutputFp8Block = narrow<unsigned>(data::weights::checkpoint::weight_block_size[1]);
 constexpr auto kPackedIndex = kIndexDim / 2U + kIndexDim / 32U;
 constexpr attn::HybridYarn kYarn{static_cast<double>(a::rope_scaling::original_max_position_embeddings),
@@ -27,6 +28,7 @@ constexpr attn::HybridYarn kYarn{static_cast<double>(a::rope_scaling::original_m
 static_assert(a::rope_interleave && a::qk_norm == "per_head" && a::use_fast_hadamard &&
               a::use_attn_merger && a::add_full_attention_sink_bias && a::mla::split_kv_b_projection);
 static_assert(kWindow > 0 && kCompression >= 2 && kIndexDim % 32U == 0 && kTopK > 0);
+static_assert(kIndexPrefillHeads > 0 && kIndexPrefillHeads <= kIndexHeads);
 
 attn_core::RotaryReferenceRow rotary_row(unsigned dim, unsigned position, bool compressed,
                                         const HostContracts& contract) {
@@ -167,7 +169,7 @@ std::vector<std::uint32_t> select_mla_rows(const LayerWeights& w, const attn_cor
             std::vector<float> logits(kIndexHeads);
             core::linear_reference(gate, input, logits);
             const auto bias = w.tensor(std::string(prefix) + "flashindexer_bias", kIndexHeads);
-            weights = attn_core::index_head_weights_reference(weights, logits, bias, 8);
+            weights = attn_core::index_head_weights_reference(weights, logits, bias, kIndexPrefillHeads);
         }
         auto selected = attn_core::weighted_index_top_k_reference(query, weights, kIndexDim, window.history, kTopK, key_at);
         window.append_window(selected);

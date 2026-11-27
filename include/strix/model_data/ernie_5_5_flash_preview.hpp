@@ -25,6 +25,7 @@ namespace indexer {
 inline constexpr std::int64_t index_head_dim = 128;
 inline constexpr std::int64_t index_n_heads = 64;
 inline constexpr std::int64_t index_topk = 2048;
+inline constexpr std::int64_t prefill_head_topk = 8;
 inline constexpr std::string_view sidecar = "flashindexer/flashindexer.safetensors";
 } // namespace indexer
 inline constexpr std::string_view kind = "dsv4_hybrid";
@@ -92,6 +93,7 @@ inline constexpr std::int64_t dspark_noise_token_id = 1024;
 inline constexpr bool dspark_shared_lm_head = true;
 inline constexpr double hc_eps = 0x1.0c6f7a0b5ed8dp-20 /* 1e-06 */;
 inline constexpr std::int64_t hc_mult = 4;
+inline constexpr double hc_post_magnitude = 0x1p+1 /* 2 */;
 inline constexpr std::int64_t hc_sinkhorn_iters = 20;
 inline constexpr std::string_view head_logit_transform = "linear_quadratic_hinges";
 inline constexpr std::int64_t multimax_parameters = 4;

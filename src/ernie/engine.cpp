@@ -42,6 +42,7 @@ hc::Spec hc_spec(unsigned hidden, hc::Site site, bool checkpoint = false) {
     spec.streams = kStreams;
     spec.site = site;
     spec.sinkhorn_iters = kSinkhornIters;
+    spec.post_magnitude = nearest_float(x::hc_post_magnitude);
     spec.pre_eps = spec.comb_eps = spec.norm_eps = kHcEps;
     if (checkpoint) {
         spec.norm_eps = kRmsEps;
