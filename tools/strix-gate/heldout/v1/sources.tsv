@@ -1,0 +1,136 @@
+doc	kind	source	row	id	title	sha256
+en32-a	wiki	train-00000-of-00041.parquet	20025	4173706	Shaligram	2a7cf0475ed94c7bca46cc2c5567bc4da1849dd7fb77641ea253ec55afca1b05
+en32-a	wiki	train-00000-of-00041.parquet	20026	4173711	History of molecular biology	5725feb3241afb815b0162a70d47beb32e5d08fe4bb5caa315ad82da062a0b75
+en32-a	wiki	train-00000-of-00041.parquet	20055	4174010	Port security	1b9a24b0dbeebb432245887fc991bacec88f049828faeea50ac4166714819403
+en32-a	wiki	train-00000-of-00041.parquet	20083	4174311	Cambodian campaign	a708303116ff5cc472d68ef23730d0b837f710da78a73ae63b935408ae5094a2
+en32-a	wiki	train-00000-of-00041.parquet	20106	4174431	Jerusalem (Mendelssohn book)	e8ee887a4351cd01b92bfed5295dd18528ec8c6237808db3a90f4ca6326f8ec3
+es32-a	wiki	train-00000-of-00013.parquet	20001	52331	PAL	3b124550f19837492877d7442dc333356a86a277fc39cf5979086c7cacb71aa6
+es32-a	wiki	train-00000-of-00013.parquet	20016	52411	Lucio Gutiérrez	d11761ea9b5a7009f3621d7ec0b277fc7f716f387a0e4dafd24aa05554faba98
+es32-a	wiki	train-00000-of-00013.parquet	20025	52433	Galba	e11e3ffbc0c4f514e4b5744d0f207ce6c14c87d83415661e96ab7b05ca6193e4
+es32-a	wiki	train-00000-of-00013.parquet	20030	52447	Diocleciano	9eea741fd33b84ad95d35b0a26e4b50f7490e2111c3999c2cf5276f7d9a51746
+en32-b	wiki	train-00000-of-00041.parquet	20121	4174517	Algaculture	697521934684344b6cff2c018eba7ab6003a243b01f8253dc6de8909209d82c0
+en32-b	wiki	train-00000-of-00041.parquet	20255	4175462	Theodore Tugboat	5f24920eb6615b04c1f8b06427903cbf39b3d19534c9182d5e67ce78af9ea4f9
+en32-b	wiki	train-00000-of-00041.parquet	20321	4175955	Freeman Freeman-Thomas, 1st Marquess of Willingdon	ceca6e7f4411a8ffd1b1432998def8788389f018af2f1b73b87fa495f6318cda
+en32-b	wiki	train-00000-of-00041.parquet	20355	4176189	Josiah Edward Spurr	d0a502107c53ac579740ff521ffceaf4facd6ebc9d71f4cd6b7f5883f7298ad4
+en32-b	wiki	train-00000-of-00041.parquet	20374	4176279	Carol Jackson	f91a201d1c7edb52036da77c41d2230995f2f86ea731d870697e696b0d8d0dc9
+en32-b	wiki	train-00000-of-00041.parquet	20398	4176378	Joaquín "El Chapo" Guzmán	2427cad6ba957124c84a50ec6a17270dad6e688a8f96286bdba7efcb908bcff4
+es32-b	wiki	train-00000-of-00013.parquet	20039	52489	Meryl Streep	95bc090fad69b0a23d6b8ddd025e43b1bb74303bc5e9bd694684e939c67a0339
+es32-b	wiki	train-00000-of-00013.parquet	20043	52493	Henry Fonda	672656f761087485119eedfdb1044f16cc20898ef9343281822114a8d791783f
+es32-b	wiki	train-00000-of-00013.parquet	20044	52494	Alejo Carpentier	43463c578dd95204631d33a6cb5af65c8f7a320af8eca12671936b51c5e00d00
+es32-b	wiki	train-00000-of-00013.parquet	20045	52495	Galeno	e6f8e280f23145bc68383563ed720171cdf43f691ba46778fc9f46d61d46c1fa
+es32-b	wiki	train-00000-of-00013.parquet	20047	52498	Blake Edwards	d584b3ff3737d91bfcc9529653637306c0773d911bc866b660ccf630114f3b24
+es32-b	wiki	train-00000-of-00013.parquet	20056	52545	Carlos Castaneda	a370cc7b1ebf9abc701ec3a393faf9ac8494b03c0c7df0bcbee2cd782f4a8052
+en32-c	wiki	train-00000-of-00041.parquet	20413	4176481	2006 New Orleans mayoral election	e4e972069736685ab10bc79eb2dd97674c7bd06e682f1b5934ba09e23ba0e896
+en32-c	wiki	train-00000-of-00041.parquet	20481	4177188	Thermal management (electronics)	b595e79eed740faa1c912cb55885724dcf1785b16d74e0ae7a390cbbf17639a2
+en32-c	wiki	train-00000-of-00041.parquet	20507	4177379	Dutch resistance	fc2cbfd1284b368d218802de6dc90f767cbdc4e06e286bc854151440613b7acf
+en32-c	wiki	train-00000-of-00041.parquet	20576	4177947	Aircraft diesel engine	4af02d8e635f43cefd622ca5a5f266b5f63022776fa19f43448d00a556defaf6
+en32-c	wiki	train-00000-of-00041.parquet	20590	4178047	Australia men's national basketball team	e3b212fd84d314a0e438765b7ee3a70bf7fb9093afb6feeb925055d8038a883e
+en32-c	wiki	train-00000-of-00041.parquet	20617	4178379	Andrey Arshavin	db9f2b96461ff22d63df989a7b0fcfe1ffea251e9980b7a1a1e23755b92b894e
+en32-c	wiki	train-00000-of-00041.parquet	20659	4178791	The Kiesha'ra Series	ad735d912daa3978549d3f94d0068051cd2e76fdbd7fdcc2b48051d6c75d685d
+es32-c	wiki	train-00000-of-00013.parquet	20072	52579	Logroño	3626b1729a4e435c09c556c6f7f72f728500ba0f653e8c593d6760662cec5cc7
+es32-c	wiki	train-00000-of-00013.parquet	20078	52601	Tabla hash	48e8ff43c615aad1849307ffc43147ac6d05d8bc7bda7a44fd19a098c5aa7046
+es32-c	wiki	train-00000-of-00013.parquet	20081	52616	Guerra de Independencia Irlandesa	3b1a78032364ff7e0661ced00a3fac6c58a8a6b100025e1348f36fa2ccbb2e8b
+es32-c	wiki	train-00000-of-00013.parquet	20087	52637	Giuseppe Garibaldi	c30f96ca2392414cb594c7e2ac170c792cbbf672aa5aa22da2999b4e4863270a
+en32-d	wiki	train-00000-of-00041.parquet	20705	4179247	Dave Gallaher	5a5a6657ffb071042da228f215f87fa951d49f12b9d3e940b55f6db05bd7d7ac
+en32-d	wiki	train-00000-of-00041.parquet	20713	4179300	Maximus (comics)	cdccfca05205a75be32c3251a4b35ebc54beb9c6e3f1e697d1aeaa8e2c9d8dc2
+en32-d	wiki	train-00000-of-00041.parquet	20746	4179702	Yelp	b9a7282bcfd934b8833ef5f12b01483a87a76105056bba44e275d37ad5ec637e
+en32-d	wiki	train-00000-of-00041.parquet	20786	4179999	2010 in sports	a95c455ef5b6a5349a921857831175df2f3282314b3bf3ec533eef7cbda66240
+en32-d	wiki	train-00000-of-00041.parquet	20842	4180286	Ricco Rodriguez	746066e320c413789b233782ff7b1cd3ba82072c539974d00fb58b59fdebbb5e
+en32-d	wiki	train-00000-of-00041.parquet	20856	4180369	Union Army Balloon Corps	fbfc622017efaac92aa752937a8f4259d0b773258945efb1b9d138e0799aed86
+en32-d	wiki	train-00000-of-00041.parquet	20917	4180619	St Joseph's College, Melbourne	9a5e27b93b12fa9aa32aaad8a5b65244ecfbff0ac3faad77f5063559cfc52a95
+es32-d	wiki	train-00000-of-00013.parquet	20088	52638	Juan Manuel de Rosas	22f6849e5a42833aea3bafc8bf3f1a70ff79f8728e98520a537b0fb93c984ed8
+es32-d	wiki	train-00000-of-00013.parquet	20098	52654	María I de Escocia	f2ead7ce1f1d62acdaa424c932c13cb806201cfac73e5c8880583292c0060045
+es32-d	wiki	train-00000-of-00013.parquet	20111	52721	Islas Feroe	072f573f2589126329fb69849609af7aea553eedbee901b74548cfdca9ec6848
+en32-e	wiki	train-00000-of-00041.parquet	20937	4180684	Witchboard	17051a44913ce44e8277b5812b86e40deb156eb24e074529e8077bdd647c7e5b
+en32-e	wiki	train-00000-of-00041.parquet	21019	4181037	Jamaal Charles	56527c7c3788bb4dcee1926e56791b6f6c7f742cc1db4b8c4260945c7c33068c
+en32-e	wiki	train-00000-of-00041.parquet	21115	4181583	Jesu, meine Freude, BWV 227	c8bda353c44da0e41db833acba5453a29eec6900c79c2ba1e67622445f367967
+en32-e	wiki	train-00000-of-00041.parquet	21116	4181588	John Watkins (diplomat)	3da1a8a2f7510c16baf51ee548372ba4df600c1a864d64f23a480cf4c560e354
+en32-e	wiki	train-00000-of-00041.parquet	21146	4181798	PLANS (non-profit)	3f0abd4cda6601978a9fa0bcfbf3b67d4c9eee565e69b6994dd532276ce659a1
+en32-e	wiki	train-00000-of-00041.parquet	21243	4182449	Tablet computer	1fe76345e8e2133bca2e5fa8b8ed260d71849fc852bd804be70caeca31e32323
+en32-e	wiki	train-00000-of-00041.parquet	21498	4184370	Frank Hawthorne	af945b4e04d3a058f41020ec8b1be20c45b029bc263beaa98323fa13b9267aa0
+en32-e	wiki	train-00000-of-00041.parquet	21515	4184506	Gwen Cooper	a15e05b82f5a37ff899e3c78ec1777237c0e9338087cebf440d17e5ae2cf2a53
+es32-e	wiki	train-00000-of-00013.parquet	20129	52827	Esteganografía	8ff9a66bf69fd4a9a8ffcb0c89a4ca34f6fb7a5d4dab6607271b4de17bf1955b
+es32-e	wiki	train-00000-of-00013.parquet	20133	52833	Fermoselle	880463cfd3513bfe2cd56e763a6db4fc1f9c5cd028dd222e3ef948b61b6d1dc9
+es32-e	wiki	train-00000-of-00013.parquet	20141	52877	Enguídanos	8321bf227d08cf2e305dfeb593a198b8c421c81d431ffe42bdda1365d93a45da
+es32-e	wiki	train-00000-of-00013.parquet	20142	52879	Historia de Aragón	9897ffecd05d9c2e4b2cdb2c57a78370a9edf80b9865a172ea9c9ee73f851eb6
+es32-e	wiki	train-00000-of-00013.parquet	20147	52889	Pierre Bourdieu	66e764280567fadf5bff5fe67b92bd21990092f410e906992d51db8bac5b4d00
+code32-a	file	usr/lib/python3.14/_pydecimal.py	-	-	-	5de15361bd6176f8605a7430afa88ffdd437dc83a7c5c33a9bed0b0952af8b27
+code32-b	file	usr/lib/python3.14/inspect.py	-	-	-	1da17a5ed9395af63cd76abf28967722d70341488e61f86d82634a659920ed73
+code32-b	file	usr/lib/python3.14/ast.py	-	-	-	5ea9a796353544bea0d706153516f04ef3d92be305d15a73238403837d77e34c
+code32-c	file	usr/lib/python3.14/tarfile.py	-	-	-	c0db1a21e56ccf002147bffd10d97f452ad842820963ef793117f92a0cdaaad4
+code32-c	file	usr/lib/python3.14/shutil.py	-	-	-	ab36f39f04e349020cdd13cf41b50905fc399150fb5e6a7cf73d69b22dd949cd
+code32-d	file	usr/share/perl/5.40.1/Math/BigInt.pm	-	-	-	f43ac7ebc0bc8afc44ee1abcdfbb8e9bee4306ebe0dd2b2708658be3712f2bd3
+code32-e	file	usr/lib/python3.14/doctest.py	-	-	-	3e1c718783b5d9b9b9e95ffa13c2ecc221b58f8a1651732ff4b3484a6bceca60
+code32-e	file	usr/lib/python3.14/imaplib.py	-	-	-	2bedbdbba602c1151484b6e25f0f5617175e03273dc751514b4fcc58d32cb293
+chat32-a	faq	usr/share/doc/chrony/FAQ.gz,usr/share/doc/dnsmasq-base/FAQ.gz,usr/share/doc/alsa-base/FAQ	0..20	-	-	1b504dde11c5e8383470efc2c6a67a1a302035c062d0518ed117bdb159518d50
+chat32-a	wiki-chat	train-00000-of-00041.parquet	21563	4184719	Drayton State School	ae704512ea04b12bee2d53c8a3081419b9590c52af52dddd53ce4b2ca9a617f7
+chat32-a	wiki-chat	train-00000-of-00013.parquet	20152	52899	Nicolás II de Rusia	365192e3e17cb46f9f25186f5037ff3d7bd0baa076cc0d8ab73126184e203817
+chat32-a	wiki-chat	train-00000-of-00041.parquet	21598	4184999	Big King	cb73abb683362ba978c014d1b31bad5fe80b0388c366ccfa5e14e2fef952837b
+chat32-a	wiki-chat	train-00000-of-00013.parquet	20160	52918	Edificio Chrysler	3a1b6c51fa0ef0ad29e2d178187615586f6343c90567ace817706116d4e19eda
+chat32-b	wiki-chat	train-00000-of-00013.parquet	20163	52931	Puerto Vallarta	5000a2206760124bb7ece617cfa1d4f3fa5b61c5a5898d265ffd0488a130b199
+chat32-b	wiki-chat	train-00000-of-00041.parquet	21611	4185088	Crazy Horse Too	51a86668a538448a657bd6251f1b4ef7359d49c636e1b286c77f63e7bbd6e28d
+chat32-b	wiki-chat	train-00000-of-00013.parquet	20165	52935	Selección de fútbol de Argentina	ded17f4fd550ce441be932d750d9e41e0830469231f65543472d9c14d25e49cf
+chat32-c	faq	usr/share/doc/chrony/FAQ.gz,usr/share/doc/dnsmasq-base/FAQ.gz,usr/share/doc/alsa-base/FAQ	0..15	-	-	a2522e6a37e477eaa9fdd7819330fc8b927dcb569179fde6afd9b138ae58920f
+chat32-c	wiki-chat	train-00000-of-00041.parquet	21671	4185496	Characters of the Star Wars: Knights of the Old Republic series	2dd6f05030f3d2f3d3cce901e404f9acabedb40e7071e08461ec59aed39c86d8
+chat32-c	wiki-chat	train-00000-of-00013.parquet	20168	52948	Ensenada (Baja California)	b7650e367334b5115f96dd92d7a6c97850a39e26a717b09ec8b4857df2edd347
+chat32-c	wiki-chat	train-00000-of-00041.parquet	21749	4186046	Glacier mass balance	b4a86b5cd0f79cb650e4313205ed04628b79cb46cc5fecc0de8d854a4649399f
+chat32-c	wiki-chat	train-00000-of-00013.parquet	20171	52955	Richard Strauss	d0744f8f2e4e82f65c5b8698941284a61af3b873c90ad3dff94c8789345d962b
+chat32-c	wiki-chat	train-00000-of-00041.parquet	21818	4186524	1945 in baseball	568e1d1bbf2450ab60516d86c4792c2ae2854b0258fc7e32632feb4a7f792da5
+chat32-d	wiki-chat	train-00000-of-00013.parquet	20173	52959	Philippe Pétain	02d0ad82a17b1c6e93f22720ece4e6950a4a3c11769880dcb3b98f6d4899bbe5
+chat32-d	wiki-chat	train-00000-of-00041.parquet	21898	4187004	Political families of India	9d5adae8b14975fdb23375d0e698bcc3d3cbe7ec646c12b0dc009b7b73c60f05
+chat32-d	wiki-chat	train-00000-of-00013.parquet	20175	52962	Aleksandr Pushkin	9508e717e1dd31067328f71d1c64c85838d0431d18a9c4ca1c275e877894bacf
+chat32-d	wiki-chat	train-00000-of-00041.parquet	21922	4187217	Homicide: Life on the Street (season 1)	5f0d006b350f086eacf0aee370ba0ed15146cbb470251a00b3f78707719f4341
+chat32-d	wiki-chat	train-00000-of-00013.parquet	20176	52964	Los Mochis	ddbd969c25de5dcbec5343172f2bd2281938479656010df1c07555e5f13aa8db
+chat32-d	wiki-chat	train-00000-of-00041.parquet	21931	4187252	Salvadoran Civil War	d63f29b5309f6cbe231422066115a25c52299ad50d5b0767d19294a8a3c36220
+en8-a	wiki	train-00000-of-00041.parquet	21935	4187283	Horatio Potter	edfff58740960108c90a41abcde24c3dbd45be619d3d8c29bf49d98b21242e6a
+en8-a	wiki	train-00000-of-00041.parquet	22005	4187903	The Watcher in the Woods (1980 film)	36bd3aeb4976b5b8046f1a5856284b0965be5569ae725ea3734191f4b06206fb
+en8-a	wiki	train-00000-of-00041.parquet	22035	4188183	Criollo people	dffb646d8f65b8eb1046f2d5fc684b6ab74066287fefd0f7fadb84ad714fadb6
+es8-a	wiki	train-00000-of-00013.parquet	20179	52976	Conservadurismo	af0105c02bb06f5f6337fdbddfa7df39f4bf3d243f5f870b2ddca3caef8dddfc
+en8-b	wiki	train-00000-of-00041.parquet	22061	4188548	Andrée's Arctic balloon expedition	17fe8a83e2c463f764114be24fe1be21582b0d11b622ac42d7d335ab899a60fc
+en8-b	wiki	train-00000-of-00041.parquet	22096	4188933	Route of the Lincoln Highway	3e6d11381e9a91c48b252443b64542fa5d143b463ef96d2558d4b0ba27800a83
+es8-b	wiki	train-00000-of-00013.parquet	20181	52982	Juan de Austria	cb3e223640775c72ffe15f155e7574d987c6f5e1d99e1d63c6c591a09251a477
+es8-b	wiki	train-00000-of-00013.parquet	20182	52987	Arthur Rimbaud	90c90e144350a475723c4fd4a5283bc4da0e6f40b7d3fdce9d516665b83cfe37
+en8-c	wiki	train-00000-of-00041.parquet	22116	4189127	River ecosystem	fbdfeae5c9da8fe667a998d8075a51658ce513abbff5ec9604be99339bd03e1b
+en8-c	wiki	train-00000-of-00041.parquet	22183	4189740	Plant defense against herbivory	7dbd6e2771e565c68adc5dfa0285253616cd2dd4f513619d70b3f04f4c3803a5
+es8-c	wiki	train-00000-of-00013.parquet	20184	52993	Molière	f2633f17abda1be878676f9b6e72bd69f97a1dc8e3070f10f32cd00767fa8b32
+es8-c	wiki	train-00000-of-00013.parquet	20188	53002	Honoré de Balzac	a005ab5214fe81d396ce3922c70bf9a39fa065a86ee55bb41b658bf416e3ca05
+en8-d	wiki	train-00000-of-00041.parquet	22242	4190331	Operation Auca	d1909afa493556bc8f0ed29a9cffed3d7b317bc3416ce83309f96f2090bec4d4
+en8-d	wiki	train-00000-of-00041.parquet	22254	4190413	Girls Under Glass	0d58a4f7087fc0b04089cfb32c04a3c32829a7dab33a5d86ee6aec7a0e51dbb2
+en8-d	wiki	train-00000-of-00041.parquet	22264	4190455	Siege of Delhi	91771df6fb88b2925fd458cdc75fe58dc5afd26e478895b5c90dc69149a8b775
+es8-d	wiki	train-00000-of-00013.parquet	20191	53015	Compromiso de Caspe	37b177650383262803a53b1dcecb2391e0025414259d75ebeeed0cdb405be003
+es8-d	wiki	train-00000-of-00013.parquet	20201	53030	Burdeos	e7c1c4d5dcea65ab880249aaea8894bbe672d5f18e7405877e70ab289d1d073c
+en8-e	wiki	train-00000-of-00041.parquet	22298	4190780	National Bicycle League	876e55fce0d64a5707a0e212a89189b45a1f6afd8fff78175323f6ec18352f65
+en8-e	wiki	train-00000-of-00041.parquet	22306	4190830	Muhyiddin Yassin	59bb22c430cfaec6c2c0dcd373214b97d088b73c2542ffc724854935991d7013
+code8-a	file	usr/lib/python3.14/fractions.py	-	-	-	7a95f1c506c9ac4b2277df5f2bdd9d61cc67b520c45021a5a961939770221ef6
+code8-b	file	usr/lib/python3.14/difflib.py	-	-	-	000f99f04cf8fd967753ed9929be6d5025e006437e0ef19b65e3303072538b74
+code8-c	file	usr/share/perl/5.40.1/Getopt/Long.pm	-	-	-	aa835b315b6d96506317f528c6b9e45762325833b1e6ee19d675667462309ab1
+code8-d	file	usr/lib/python3.14/email/_header_value_parser.py	-	-	-	4b474404dea14dc22c183429c0f55b5c085285397c660fce1f253d44f0e54e27
+code8-e	file	usr/lib/python3.14/enum.py	-	-	-	982843c2dd6dbec992bfed44abe9ef5464be81876a180d977ccd1a69e26ec16d
+chat8-a	faq	usr/share/doc/chrony/FAQ.gz,usr/share/doc/dnsmasq-base/FAQ.gz,usr/share/doc/alsa-base/FAQ	0..10	-	-	3b3f9193939badfad03677ce28d781f2609cba843433f3e344cb8a49990c1b63
+chat8-a	wiki-chat	train-00000-of-00041.parquet	22310	4190866	Corps of Royal Canadian Electrical and Mechanical Engineers	2deb62ba476a9b44dcbe32fa2d1f1e56da99a374c4dee374d1e384a7de65e90a
+chat8-a	wiki-chat	train-00000-of-00013.parquet	20206	53039	Boeing 747	ddc63f3f5f64e53cb9dac72f762302763add874d52727411c2fd790dbbd87c3f
+chat8-b	faq	usr/share/doc/chrony/FAQ.gz,usr/share/doc/dnsmasq-base/FAQ.gz,usr/share/doc/alsa-base/FAQ	0..10	-	-	b85d9dab80dcff607d415dbc4cb15867f0503b900af790d950514ca77e11b3c5
+chat8-b	wiki-chat	train-00000-of-00013.parquet	20215	53072	Claude Bernard	35a68196cb282cf376c470fd313d93fb132a520b67f3e7815ac4c87c95ebc0f5
+chat8-b	wiki-chat	train-00000-of-00041.parquet	22313	4190878	Effects of violence in mass media	41ac806638ac9688f8420e43792c77c08a6235703c3aa31dbb6f64679b430a86
+chat8-c	wiki-chat	train-00000-of-00041.parquet	22321	4190945	Stephanie Scully	c51ea1740fd528743f867eb73cf2ab01557caacf897691b8376697ef7c23fe97
+chat8-c	wiki-chat	train-00000-of-00013.parquet	20221	53085	Pablo VI	1cbde0472477aee8749b91a5269c2fd5b7af888e1649565ceb323152eccaa857
+en2-a	wiki	train-00000-of-00041.parquet	22330	4190992	Jefferson–Hemings controversy	391b91559a7d82e43fd45d3e98d6787421de4f5c68ff4b7a21029258366dc20d
+en2-b	wiki	train-00000-of-00041.parquet	22395	4191587	Operation Opera	23449d8968cfc9e917f9b8683c297bc6c0c0716dd877e6de118d087ab466294d
+es2-a	wiki	train-00000-of-00013.parquet	20222	53090	Lope de Vega	3045a7f95ce90b390487ae1a440c8eb2bb78fb4c6398ec506f6d7b1f8ccd01d7
+es2-b	wiki	train-00000-of-00013.parquet	20223	53094	Rodolfo Valentino	ca4bb9f6408ea0ae4964b1c73d7183e3ca2390812961980a55d8383a54a132a2
+code2-a	file	usr/lib/python3.14/statistics.py	-	-	-	b7558385a2005432c0ae74a222866316bf4f9c3ed448555659e7014b1077173a
+code2-b	file	usr/lib/python3.14/configparser.py	-	-	-	7ab0afca0fa85532a9c8846df2a93719d612610a0555a3bcbe9dd86e72f6abc8
+chat2-a	faq	usr/share/doc/chrony/FAQ.gz,usr/share/doc/dnsmasq-base/FAQ.gz,usr/share/doc/alsa-base/FAQ	0..5	-	-	f553c0b4af223c4ad59e14e5055d67a64ba7598994c9edbeab9f27d3cf49f846
+chat2-a	wiki-chat	train-00000-of-00013.parquet	20226	53103	Margaret Thatcher	046dd7080170d24ef9b978333284517aea48b8e91341886fb6fa899c387a73fc
+code32-f	file	usr/lib/python3/dist-packages/apport/ui.py	-	-	-	a7343680035f713e44e4ffcddba607727c39213e9d942ecb6bbde562ddaf5ef1
+code32-f	file	usr/lib/python3/dist-packages/apport/report.py	-	-	-	b78802131177866714e77bbc4d87065986000bf5c434a9d4953e3309909b30ce
+code32-g	file	usr/lib/python3/dist-packages/DistUpgrade/DistUpgradeController.py	-	-	-	50372254397afd91ff4b34485cf93673407047658f60dda85247e65e4aa0c3f7
+code32-g	file	usr/lib/python3/dist-packages/DistUpgrade/DistUpgradeCache.py	-	-	-	8f03de93277a12d2aaed630cb4df649a842995e25d57c7ab77940e12010db4f2
+code32-h	file	usr/lib/python3/dist-packages/apport/packaging_impl/apt_dpkg.py	-	-	-	33dc14469e93f942aff20ba230def244544a47a537d9c813e62827e6bd13b867
+code32-h	file	usr/lib/python3/dist-packages/apport/crashdb_impl/launchpad.py	-	-	-	ac8ce0758dfb965a8ef2866154c0b3e02b708f26a889bd980277e40b53f734a7
+code32-h	file	usr/lib/python3/dist-packages/amd_debug/prerequisites.py	-	-	-	d57c00df1c2078d5d26a5e105b1b3717184050e5d0126074c0b423d46c6811d5
+code8-f	file	usr/lib/python3/dist-packages/amd_debug/validator.py	-	-	-	e93f07752a43b5b5046637073477f59cde6bcf8eb18bcae9875eb7473c5bee7d
+code8-f	file	usr/lib/python3/dist-packages/amd_debug/failures.py	-	-	-	2be03b2be9eaca18df84739c06a4b0c1677136f4ff3759c8f354d70ec41257e8
+code8-g	file	usr/share/perl5/Dpkg/Source/Package/V2.pm	-	-	-	a40420b9ccc66d0f5776bb1ec484632cd8de06a2e3f5a1d2a01de54a1b1fa8f5
+code8-g	file	usr/share/perl5/Dpkg/Vendor/Debian.pm	-	-	-	cca18c612d54f656399a757cfd591a1afe2d0b8ed8d45bd7decee6e0e91ca811
+code2-c	file	usr/lib/python3/dist-packages/amd_debug/sleep_report.py	-	-	-	b58a1a5ba976f96f0fe5c98faed0cdd30760b83acddf730057d004fd9f6b05e5
