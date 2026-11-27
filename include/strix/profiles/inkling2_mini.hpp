@@ -55,8 +55,8 @@ inline constexpr std::string_view kMiniLowBitTurbo = "inkling2-mini-lowbit-turbo
 inline constexpr std::string_view kMiniLowBitPackFile = "inkling2-mini-q4.lowbit-pack";
 // Head in Strix pack SP4 (fixed table) from an explicit calibrated pack (STRIX_LOWBIT_PACK, strix-lowbit-calib-pack
 // --storage unembed.weight=sp4 --table fixed): the decode-only head arm (BF16 image kept for prefill, verify and the
-// widths outside the band). The FAST column (TURBO inherits it) selects the attention projections + head arm
-// ("sp4t-attn") with the governed pack below; the head-alone arm ("sp4t") stays explicit.
+// widths outside the band). The FAST column (TURBO inherits it) targets the attention projections + head arm ("sp4t-attn")
+// with the governed pack below, pending its decode ladder row; the head-alone arm ("sp4t") stays explicit.
 inline constexpr std::string_view kMiniLowBitHead = "inkling2-mini-lowbit-head@1";
 // The SP4 attention + head pack the FAST column was gated and timed with (strix-lowbit-calib-pack, technique both,
 // damp 0.1, 97 matrices: q/k/v/o x 24 + head), read beside the model unless STRIX_LOWBIT_PACK names another one.
@@ -301,8 +301,8 @@ inline constexpr std::array<profile::Lever, 19> kMiniLevers{{
     weight::kLowBitRowsSelectLever,
     {.name = kMiniLowBitHead, .env = "STRIX_INK_LOWBIT_HEAD", .option = "",
      .value = {"", "sp4t-attn", "", ""}, .builtin = "0", .kind = profile::Kind::bit_changing,
-     .ready = {false, true, false, true}, .runnable = {false, true, false, true}, .target = "sp4t-attn", .off = "0",
-     .source = "FAST default (TURBO inherits), HIP gfx1151 only: SP4 fixed-table attention projections + head, decode-only "
+     .ready = {}, .runnable = {false, true, false, true}, .target = "sp4t-attn", .off = "0",
+     .source = "FAST target (TURBO inherits), pending its decode ladder row (the shared ladder has no decode-regime rows and this CLI resolves before the context is known), HIP gfx1151 only: SP4 fixed-table attention projections + head, decode-only "
                "(BF16 image prefills), governed pack beside the model (kMiniSp4AttnPackFile, pinned identity). Device "
                "gate v2 decode 2026-11-26, 39 held-out windows / 2457 rows, 8K / 32K / 64K: FAST PASS (KL 0.00207, "
                "top-1 0.981, dNLL -0.00014; 0 windows FAIL). CLI B=1 FAST with speculation, same binary, 6 prompts "

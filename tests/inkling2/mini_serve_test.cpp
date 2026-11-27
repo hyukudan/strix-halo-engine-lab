@@ -571,8 +571,8 @@ void profile_parity() {
             loaded.reset();
             const auto cli = parse_cli(tier, "hip");
             const auto service = factory->create(selection);
-            // Unset: the FAST column (TURBO inherits it) selects the SP4 attention + head arm on HIP.
-            const bool expected = std::string_view(tier) != "exact" && (!value || std::string_view(value) != "0");
+            // Unset: the FAST column (TURBO inherits it) targets the SP4 arm but stays pending until its decode ladder row.
+            const bool expected = std::string_view(tier) != "exact" && value && std::string_view(value) != "0";
             require(service && loaded && cli.weights.qualify_decode_only == expected &&
                         loaded->weight_options.qualify_decode_only == expected &&
                         loaded->weight_options.qualify == cli.weights.qualify &&
