@@ -643,6 +643,26 @@ void check_lowbit_policies() {
     const auto sp4_exact = resolve(wei::kAttentionHeadSP4TPolicy, strix::profile::Name::standard, sp4t);
     check(sp4_exact.storage == wei::kBf16WeightStorage && sp4_exact.head_storage == wei::kBf16WeightStorage,
           "SP4 attention + head row: EXACT stays BF16");
+    // The same row plus the attention output gate: the gate takes strix.sp4t only under its own policy (the first SP4
+    // row and every other policy leave it BF16), the receipt line names it only then, and EXACT stays BF16.
+    const auto gate_mix = resolve(wei::kAttentionGateHeadSP4TPolicy, strix::profile::Name::turbo, sp4t);
+    check(gate_mix.storage == wei::kSP4TWeightStorage && gate_mix.head_storage == wei::kSP4TWeightStorage &&
+              gate_mix.gate_storage == wei::kSP4TWeightStorage && gate_mix.roles().gate == wei::kSP4TWeightStorage &&
+              sp4_mix.gate_storage == wei::kBf16WeightStorage && sp4_mix.roles().gate == wei::kBf16WeightStorage,
+          "SP4 attention + gate + head row: strix.sp4t on the gate too; the first SP4 row keeps the gate BF16");
+    check(wei::weight_load_receipt(gate_mix).find(" gate strix.sp4t@1 ") != std::string::npos &&
+              wei::weight_load_receipt(sp4_mix).find(" gate ") == std::string::npos,
+          "the receipt names the gate storage only when the gate is converted");
+    const auto gate_none = resolve(wei::kAttentionGateHeadSP4TPolicy, strix::profile::Name::turbo, all);
+    const auto gate_exact = resolve(wei::kAttentionGateHeadSP4TPolicy, strix::profile::Name::standard, sp4t);
+    check(gate_none.gate_storage == wei::kBf16WeightStorage && gate_none.storage == wei::kBf16WeightStorage &&
+              gate_exact.gate_storage == wei::kBf16WeightStorage && gate_exact.storage == wei::kBf16WeightStorage,
+          "SP4 gate row without an SP4 consumer, or in EXACT, stays BF16");
+    for (const auto* policy : wei::kWeightLoadPolicies)
+        check(policy == &wei::kAttentionGateHeadSP4TPolicy || policy->gate_target() == wei::kBf16WeightStorage,
+              "only the gate row names a gate storage");
+    check(wei::find_weight_load_policy("weights.attention_gate_head.sp4t@1") == &wei::kAttentionGateHeadSP4TPolicy,
+          "SP4 gate key finds its shared row");
     check(wei::find_weight_load_policy("weights.attention_head.sp4t@1") == &wei::kAttentionHeadSP4TPolicy &&
               wei::find_weight_load_policy("weights.head.sp4t@1") == &wei::kHeadSP4TPolicy &&
               wei::find_weight_load_policy("weights.attention_head.sp4@1") == &wei::kAttentionHeadSP4Policy,

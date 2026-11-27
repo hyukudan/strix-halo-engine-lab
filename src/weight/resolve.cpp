@@ -60,9 +60,10 @@ WeightLoadPlan resolve_weight_load(const Registry& registry, const WeightLoadPol
                (find_format(registry, format) &&
                 std::ranges::find(request.consumer_formats, format) != request.consumer_formats.end());
     };
-    const bool compact = policy.target != kBf16WeightStorage || policy.head_target() != kBf16WeightStorage;
+    const bool compact = policy.target != kBf16WeightStorage || policy.head_target() != kBf16WeightStorage ||
+        policy.gate_target() != kBf16WeightStorage;
     const bool runnable = !policy.id.name.empty() && policy.id.revision && compact && consumed(policy.target) &&
-        consumed(policy.head_target());
+        consumed(policy.head_target()) && consumed(policy.gate_target());
     // TURBO inherits the actual FAST image. The current policy has one alternative storage per role class,
     // so when FAST already chose it there is no further storage change to qualify.
     auto lower = plan;
@@ -71,7 +72,9 @@ WeightLoadPlan resolve_weight_load(const Registry& registry, const WeightLoadPol
         fast.tier = profile::Name::fast;
         fast.allow_pending = false;
         lower = resolve_weight_load(registry, policy, fast, decisions);
-        if (lower.storage == policy.target && lower.head_storage == policy.head_target()) return lower;
+        if (lower.storage == policy.target && lower.head_storage == policy.head_target() &&
+            lower.gate_storage == policy.gate_target())
+            return lower;
     }
     // A fixed image must be faster in every regime that will consume it.
     const std::string_view single[] = {request.scope.regime};
@@ -118,6 +121,7 @@ WeightLoadPlan resolve_weight_load(const Registry& registry, const WeightLoadPol
     }
     plan.storage = policy.target;
     plan.head_storage = policy.head_target();
+    plan.gate_storage = policy.gate_target();
     plan.reason = "unqualified weight load arm";
     if (decision) {
         plan.gate_v2_pass = decision->gate_v2_pass;

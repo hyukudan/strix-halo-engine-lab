@@ -33,7 +33,11 @@ struct WeightLoadPolicy {
     // The output head's storage when it differs from the other tagged roles' (empty name: `target`). The per-role
     // format map of a mix is data of the shared policy row, never a model code path.
     FormatId head{};
+    // The attention output gate's storage (the projection of the attention input whose sigmoid scales the attended
+    // value; a model names that tensor as data). Empty name: the gate is not a tagged role of this policy and stays BF16.
+    FormatId gate{};
     [[nodiscard]] constexpr FormatId head_target() const noexcept { return head.name.empty() ? target : head; }
+    [[nodiscard]] constexpr FormatId gate_target() const noexcept { return gate.name.empty() ? kBf16WeightStorage : gate; }
 };
 
 // Attention projections and the output head stored as Q8_0, converted from BF16 at load.
@@ -60,6 +64,10 @@ inline constexpr WeightLoadPolicy kHeadSP4TPolicy{
 // fixed table, from a calibrated pack; the projections of one input run as one grouped launch
 // (core/resident_q8_rows.hpp enqueue_resident_q8_projections).
 inline constexpr WeightLoadPolicy kAttentionHeadSP4TPolicy{{"weights.attention_head.sp4t", 1}, kSP4TWeightStorage};
+// The same roles plus the attention output gate (WeightLoadPolicy::gate) in Strix pack SP4 with the fixed table, from a
+// calibrated pack; the gate shares the query input, so it runs in that input's grouped low-bit launch.
+inline constexpr WeightLoadPolicy kAttentionGateHeadSP4TPolicy{
+    {"weights.attention_gate_head.sp4t", 1}, kSP4TWeightStorage, {}, {}, kSP4TWeightStorage};
 // Every attention projection matrix (query, key, value, output and any auxiliary projection of the attention input,
 // such as an output gate, relative or sink projection) stored as Q8_0, converted from BF16 at load; the output head
 // stays BF16 (per-role: `head`), so an exact head (full or screened) keeps its bits. Router and normalisation weights
@@ -68,10 +76,10 @@ inline constexpr WeightLoadPolicy kAttentionQ8Policy{{"weights.attention.q8_0", 
 inline constexpr WeightLoadPolicy kAttentionHeadSP4Policy{{"weights.attention_head.sp4", 1}, kSP4WeightStorage};
 inline constexpr WeightLoadPolicy kAttentionHeadSP3Policy{{"weights.attention_head.sp3", 1}, kSP3WeightStorage};
 inline constexpr WeightLoadPolicy kAttentionHeadSP2Policy{{"weights.attention_head.sp2", 1}, kSP2WeightStorage};
-inline constexpr std::array<const WeightLoadPolicy*, 13> kWeightLoadPolicies{
+inline constexpr std::array<const WeightLoadPolicy*, 14> kWeightLoadPolicies{
     &kAttentionHeadQ8Policy, &kHeadQ8Policy, &kAttentionQ8Policy, &kAttentionHeadQ6Policy, &kAttentionQ4HeadQ6Policy,
     &kAttentionHeadQ4Policy, &kHeadQ6Policy, &kHeadQ4Policy, &kHeadSP4TPolicy, &kAttentionHeadSP4TPolicy,
-    &kAttentionHeadSP4Policy, &kAttentionHeadSP3Policy, &kAttentionHeadSP2Policy};
+    &kAttentionGateHeadSP4TPolicy, &kAttentionHeadSP4Policy, &kAttentionHeadSP3Policy, &kAttentionHeadSP2Policy};
 
 // Both columns nominate the same implementation. A receipt decides the tier and measured regime.
 // Pending opt-in remains unavailable until there is a loader.
@@ -242,14 +250,16 @@ struct WeightLoadRequest {
     WeightLoadExtent first{};  // lower endpoint of the resident image; 0 uses the corresponding extent value
 };
 
-// Resolved storage of the two tagged role classes (the output head, every other tagged role). One FormatId converts to
-// the same storage for both.
+// Resolved storage of the tagged role classes (the output head, every other tagged role) and of the attention output
+// gate (BF16 unless the policy names it: WeightLoadPolicy::gate). One FormatId converts to the same storage for the head
+// and the other tagged roles; the gate stays BF16.
 struct RoleStorage {
-    FormatId attention = kBf16WeightStorage, head = kBf16WeightStorage;
+    FormatId attention = kBf16WeightStorage, head = kBf16WeightStorage, gate = kBf16WeightStorage;
     constexpr RoleStorage() noexcept = default;
     constexpr RoleStorage(FormatId all) noexcept : attention(all), head(all) {}  // NOLINT(google-explicit-constructor)
-    constexpr RoleStorage(FormatId attention_storage, FormatId head_storage) noexcept
-        : attention(attention_storage), head(head_storage) {}
+    constexpr RoleStorage(FormatId attention_storage, FormatId head_storage,
+                          FormatId gate_storage = kBf16WeightStorage) noexcept
+        : attention(attention_storage), head(head_storage), gate(gate_storage) {}
 };
 
 // What one regime contributed to a plan: a full row (gate v2 PASS + measured gain), a gate-only row, or nothing.
@@ -293,6 +303,7 @@ struct WeightLoadPlan {
     std::string_view reason;
     Digest256 gate_v2_pass{}, measured_gain{};
     FormatId head_storage = kBf16WeightStorage;
+    FormatId gate_storage = kBf16WeightStorage;  // the attention output gate (WeightLoadPolicy::gate_target)
     std::string_view turbo_quality{};  // non-empty: admitted by a TURBO-only row (quality below the FAST gate, stated)
     std::array<RegimeWeightLoad, kMaxWeightLoadRegimes> regimes{};  // per regime, in request order
     std::size_t regime_count = 0;
@@ -305,7 +316,7 @@ struct WeightLoadPlan {
     [[nodiscard]] FormatId storage_for(std::optional<Role> role) const {
         return !role ? kBf16WeightStorage : *role == Role::head ? head_storage : storage;
     }
-    [[nodiscard]] RoleStorage roles() const { return {storage, head_storage}; }
+    [[nodiscard]] RoleStorage roles() const { return {storage, head_storage, gate_storage}; }
     [[nodiscard]] std::span<const RegimeWeightLoad> regime_rows() const { return std::span(regimes).first(regime_count); }
     // The step band of `regime` (its matched row's evidence.max_rows; 0: no row, or not banded).
     [[nodiscard]] std::uint32_t row_band(std::string_view regime) const {
@@ -427,6 +438,10 @@ WeightLoadPlan resolve_weight_load(const Registry&, const WeightLoadPolicy&,
     if (!(plan.head_storage == plan.storage)) {
         out += " head ";
         put(out, plan.head_storage);
+    }
+    if (!(plan.gate_storage == kBf16WeightStorage)) {
+        out += " gate ";
+        put(out, plan.gate_storage);
     }
     out += ' ';
     out += profile::status_name(plan.status);
