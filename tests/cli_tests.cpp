@@ -1,4 +1,5 @@
 #include "strix/cli/cli.hpp"
+#include "strix/cli/registry_root.hpp"
 #include "strix/deploy/route.hpp"
 #include "strix/serve/json.hpp"
 #include "../src/cli/detail.hpp"
@@ -678,27 +679,42 @@ void hy4_launcher_resolves_documented_drafter(const fs::path& data) {
         for (std::size_t i = 0; i < args.size(); ++i)
             require(args[i] != "--top" && args[i] != "--teacher" && args[i] != "--dump-logits" && args[i] != "--timing" &&
                     args[i] != "--gate-ref" && args[i] != "--mtp" && args[i] != "--no-mtp", "the launcher adds no route option");
-        auto run = strix::hy4::speculation_run_from_arguments(args);
-        run.environment = nullptr;  // the caller's environment is not the launcher's
+        auto run = strix::hy4::speculation_run_from_arguments(args, nullptr);  // the caller's environment is not the launcher's
         run.block_in_pack = true;   // the Hy4 pack ships its next-token block (GGUF nextn_predict_layers)
         const auto decision = strix::hy4::speculation(run);
         require(decision.enabled && decision.source == "default", "hy4 strix run resolves the MTP drafter");
     }
     // The rank's own spelling of a per-step or opted-out route still wins.
     auto classify = [](std::vector<std::string> args) {
-        auto run = strix::hy4::speculation_run_from_arguments(args);
-        run.environment = nullptr;
+        auto run = strix::hy4::speculation_run_from_arguments(args, nullptr);
         run.block_in_pack = true;
         return std::string(strix::hy4::speculation(run).source);
     };
     require(classify({"--top", "0", "--profile", "fast", "--kv", "bf16"}) == "default", "--top 0 is the production form");
+    require(classify({"--top", "00"}) == "default", "--top 00 is the number zero");
     require(classify({"--top", "5"}) == "explicit-route", "--top 5 keeps the per-step logits");
+    require(classify({"--top", "10"}) == "explicit-route", "--top 10 keeps the per-step logits");
+    require(classify({"--teacher", "t.ids"}) == "explicit-route", "--teacher keeps the per-step logits");
+    require(strix::hy4::speculation_run_from_arguments({"--no-mtp"}, "0").environment != nullptr, "the caller's environment is kept");
     require(classify({"--timing"}) == "explicit-route", "--timing keeps the plain steps");
     require(classify({"--no-mtp"}) == "cli-opt-out", "--no-mtp opts out");
     require(classify({"--mtp", "--timing"}) == "explicit", "--mtp wins over the per-step route");
 }
 } // namespace
 
+// The serving registry root (strix-serve, the MiniMax legacy server): the preferred root when it holds the registry,
+// else the shipped data directory, else the preferred root.
+void registry_root_fallback() {
+    const auto base = fs::temp_directory_path() / "strix-cli-registry-root";
+    fs::remove_all(base);
+    fs::create_directories(base / "build/models");
+    fs::create_directories(base / "shipped/models");
+    { std::ofstream(base / "build/models/registry.toml") << "# registry" << char(10); }
+    require(strix::cli::registry_root(base / "build", base / "shipped") == base / "build", "the build tree holds the registry");
+    require(strix::cli::registry_root(base / "gone", base / "shipped") == base / "shipped", "the shipped data directory");
+    require(strix::cli::registry_root(base / "gone", {}) == base / "gone", "no shipped directory: the preferred root");
+    fs::remove_all(base);
+}
 int main() {
     try {
         const Probes probes;
@@ -711,6 +727,7 @@ int main() {
         model_presets(STRIX_CLI_BUILD_DATA, [](const auto&) { return true; });
         qwen_launcher_keeps_speculation_default(STRIX_CLI_BUILD_DATA);
         hy4_launcher_resolves_documented_drafter(STRIX_CLI_BUILD_DATA);
+        registry_root_fallback();
         readme_commands_resolve(STRIX_CLI_README, STRIX_CLI_BUILD_DATA);
         return 0;
     } catch (const std::exception& error) {
