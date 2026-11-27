@@ -107,7 +107,22 @@ void test_plan() {
 
 }  // namespace
 
-int main() {
+// The catalogue row of the device sampler (docs/optimizations.md#inkling2-device-sampled-rows) states this boundary:
+// rows with at most 2,048 entries after cutoff and top-k take the host-equal sequential CDF; larger rows may pick an
+// adjacent token at a CDF boundary, so STRIX_SAMPLE_PATH=host is the off switch where the host CDF is required.
+static_assert(strix::device_top_p_candidates == 2048U, "update the device sampler catalogue row with this boundary");
+
+int main(int argc, char** argv) {
+    if (argc == 2 && std::string(argv[1]) == "--expect-host-path") {
+        // Run with STRIX_SAMPLE_PATH=host: the off switch of the device sampler selects the host transform.
+        const auto sampled = policy(0.7F, 0.9F, 7U);
+        expect(strix::token_sampling_path(sampled) == strix::TokenSamplingPath::host,
+               "STRIX_SAMPLE_PATH=host selects the host sampler");
+        expect(!strix::device_token_sampling_enabled(sampled), "the host path disables device sampling");
+        if (failures != 0) { std::cerr << failures << " failure(s)\n"; return EXIT_FAILURE; }
+        std::cout << "host sampling path selected\n";
+        return EXIT_SUCCESS;
+    }
     test_same_transform();
     test_host_boundary_oracle();
     test_plan();
