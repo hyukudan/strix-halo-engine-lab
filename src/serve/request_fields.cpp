@@ -131,4 +131,8 @@ double finite_number(const Json& value, const char* field, double low, double hi
     return v;
 }
 
+bool is_presentation_field(std::string_view key) noexcept {
+    return key == "return_token_ids" || key == "return_token_emissions";
+}
+
 }  // namespace strix::serve

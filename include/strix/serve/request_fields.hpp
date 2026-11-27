@@ -23,6 +23,10 @@ struct RequestFieldError : std::invalid_argument {
 // json_schema response formats; allow_selection = false also refuses penalties, logit_bias and logprobs.
 void refuse_unexecuted(const Json& body, bool allow_constraints = false, bool allow_selection = true);
 
+// Response-presentation fields the shared service reads on every generation route and answers the same way for every
+// server (token IDs, emission trace). A server that checks body keys against its own list admits these through here.
+[[nodiscard]] bool is_presentation_field(std::string_view key) noexcept;
+
 // The exact non-negative integer a JSON number spelling denotes, or nothing when it is fractional, negative (other than
 // zero) or above uint64.
 [[nodiscard]] std::optional<std::uint64_t> exact_integer(std::string_view text);
