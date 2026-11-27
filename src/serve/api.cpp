@@ -1699,6 +1699,22 @@ struct ApiService::Impl {
             config.timed_completion_envelope ? "invalid_request_error" : "server_error", o.error, "", o.stats.error_code);
     }
     // "return_token_ids": true adds the generated token IDs (stop token included) for exactness checks.
+    // The per-request timing split every engine already measures (GenerationStats), under `timings`.
+    static Json request_timings_json(const Outcome& o) {
+        const auto& st = o.stats;
+        const std::uint64_t reused = st.cached_tokens + st.imported_tokens;
+        const std::uint64_t computed = st.prompt_tokens - std::min(st.prompt_tokens, reused);
+        Json t = Json::object();
+        t.set("queue_ms", Json(st.queue_ms));
+        t.set("prompt_n", Json(st.prompt_tokens));
+        t.set("cache_n", Json(reused));
+        t.set("prompt_ms", Json(st.prefill_ms));
+        t.set("prompt_per_second", Json(st.prefill_ms > 0 ? 1000.0 * static_cast<double>(computed) / st.prefill_ms : 0.0));
+        t.set("predicted_n", Json(o.output_tokens));
+        t.set("predicted_ms", Json(st.decode_ms));
+        t.set("predicted_per_second", Json(st.decode_ms > 0 ? 1000.0 * static_cast<double>(o.output_tokens) / st.decode_ms : 0.0));
+        return t;
+    }
     Json engine_json(const Outcome& o, const std::string& note, const Json& body) const { return with_media(engine_json_text(o, note, body)); }
     Json engine_json_text(const Outcome& o, const std::string& note, const Json& body) const {
         Json e = Json::object();
@@ -1933,6 +1949,7 @@ struct ApiService::Impl {
             if (!config.compact_chat_envelope) out.set("system_fingerprint", Json("strix-" + outcome.stats.sampling));
             if (config.timed_completion_envelope) completion_data(out, outcome, body, note);
             else out.set("strix", (config.stream_receipts ? receipt(&outcome, note, body, limit, sampling_params) : engine_json(outcome, note, body)));
+            if (config.request_timings && !config.timed_completion_envelope) out.set("timings", request_timings_json(outcome));
             // Publish before the reply is visible on a different connection (e.g. GET /api/status).
             finish_entry(entry, outcome);
             response.send(200, "application/json", out.dump());
@@ -2042,6 +2059,7 @@ struct ApiService::Impl {
             out.set("usage", usage_json(outcome));
             if (config.timed_completion_envelope) completion_data(out, outcome, body, note, false);
             else if (!config.compact_chat_envelope) out.set("strix", (config.stream_receipts ? receipt(&outcome, note, body, limit, sampling_params) : engine_json(outcome, note, body)));
+            if (config.request_timings && !config.timed_completion_envelope) out.set("timings", request_timings_json(outcome));
             writer.write("data: " + out.dump() + "\n\n");
         }
         writer.write("data: [DONE]\n\n");
@@ -2439,6 +2457,7 @@ struct ApiService::Impl {
             Json choices = Json::array(); choices.push(std::move(choice));
             out.set("choices", std::move(choices));
             if (final_usage && outcome) { if (!stream || !config.timed_completion_envelope) out.set("usage", usage_json(*outcome)); if (config.timed_completion_envelope) completion_data(out,*outcome,body,note); else out.set("strix", (config.stream_receipts ? receipt(outcome, note, body, limit, sampling_params) : engine_json(*outcome, note, body))); }
+            if (final_usage && outcome && config.request_timings && !config.timed_completion_envelope) out.set("timings", request_timings_json(*outcome));
             if (stream && (config.stream_receipts || spec) && first_chunk && !outcome) out.set("strix", initial_receipt);
             first_chunk = false;
             return out;

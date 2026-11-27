@@ -214,6 +214,10 @@ struct ApiConfig {
     // Historical OpenAI convention: timings after usage, optional IDs only,
     // no role-only SSE event, content-only live chat, cancelled => stop.
     bool timed_completion_envelope = false;
+    // Adds `timings` {prompt_n, cache_n, prompt_ms, prompt_per_second, predicted_n, predicted_ms, predicted_per_second,
+    // queue_ms} (the plain per-request wall split of the generation queue) to the chat / completion replies that
+    // otherwise carry no timing block. Ignored when timed_completion_envelope already adds its own `timings`.
+    bool request_timings = false;
     bool exact_max_tokens = false; // exact integer spelling; clamp to full context
     bool minimal_metadata = false;
     std::optional<std::uint64_t> status_slots = {}; // capacity metadata without queue response headers

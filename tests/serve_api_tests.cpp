@@ -1248,6 +1248,21 @@ void test_sampled_api(const std::shared_ptr<const BpeTokenizer>& tokenizer) {
         const auto& error = at(doc, "error");
         return at(error, "param").as_string() == field && at(error, "message").as_string().find(message) != std::string::npos;
     };
+    {   // request_timings: the plain per-request split under `timings`, absent without the option.
+        auto timed_config = config;
+        timed_config.request_timings = true;
+        ApiService timed(timed_config, tokenizer, queue, engine.context_tokens(), engine.supports_sampling());
+        const auto request = parse_json(R"({"messages":[{"role":"user","content":"Hi"}],"max_tokens":4})");
+        const auto with = parse_json(post("/v1/chat/completions", request, timed).body);
+        const auto without = parse_json(post("/v1/chat/completions", request, enabled).body);
+        const auto* t = with.find("timings");
+        const auto* usage = with.find("usage");
+        check(t && t->is_object() && usage && t->find("prompt_n") && t->find("prompt_ms") && t->find("predicted_n") &&
+                  t->find("predicted_ms") && t->find("cache_n") && t->find("queue_ms") &&
+                  at(*t, "prompt_n").as_int() == at(*usage, "prompt_tokens").as_int() &&
+                  at(*t, "predicted_n").as_int() == at(*usage, "completion_tokens").as_int() && !without.find("timings"),
+              "request_timings adds prompt_n/prompt_ms/predicted_n/predicted_ms, off by default");
+    }
     const auto base = parse_json(R"({"messages":[{"role":"user","content":"Hi"}],"max_tokens":8,"temperature":1,"seed":37,"return_token_ids":true})");
     for (const auto& [field, capability, feature] : std::vector<std::tuple<const char*, const char*, const char*>>{
              {"response_format", "sampled_constraints", R"({"response_format":{"type":"json_object"},"enable_thinking":false,"max_tokens":1})"},

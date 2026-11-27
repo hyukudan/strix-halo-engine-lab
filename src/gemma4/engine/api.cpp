@@ -10,7 +10,9 @@
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
+#include <cstdio>
 #include <mutex>
+#include <set>
 #include <thread>
 
 namespace strix::gemma4::engine {
@@ -146,6 +148,20 @@ struct Api::Impl {
     const bool prefix_cache = batched && strix::env_flag_default_on("STRIX_G4_SERVE_PREFIX");
     const std::size_t prefix_bytes = env_count("STRIX_G4_SERVE_PREFIX_MB",4096,1U << 20U) << 20U;
     std::uint64_t steps=0;
+    // An optional field this server does not know is ignored with one warning per name (the other engines' shared
+    // API layer ignores them); STRIX_G4_SERVE_STRICT_FIELDS=1 restores the refusal. Fields that change sampling or
+    // output (refuse_unexecuted) are refused either way.
+    const bool strict_fields = strix::env_flag_default_off("STRIX_G4_SERVE_STRICT_FIELDS");
+    std::mutex warned_mutex;
+    std::set<std::string> warned_fields;
+    void warn_ignored_field(const std::string& key) {
+        {
+            std::lock_guard lock(warned_mutex);
+            if(!warned_fields.insert(key).second) return;
+        }
+        std::fprintf(stderr,"strix-gemma4-serve: ignoring unknown request field \"%s\" (STRIX_G4_SERVE_STRICT_FIELDS=1 refuses it)
+",key.c_str());
+    }
     std::unique_ptr<SessionEngine> session_engine;
     std::unique_ptr<strix::serve::SessionRuntime> session_runtime;
     std::thread worker;
@@ -296,7 +312,7 @@ struct Api::Impl {
         c.maximum_temperature=100.0;c.float_sampling_parameters=true;
         c.default_temperature=defaults.sampling.temperature;c.default_top_p=defaults.sampling.top_p;
         c.default_top_k=defaults.sampling.top_k;c.default_min_p=defaults.sampling.min_p;c.default_seed=defaults.sampling.seed;
-        c.strict_context_limit=true;c.strict_request_json=true;c.compact_chat_envelope=true;c.chat_id_prefix="chatcmpl-g4-";
+        c.request_timings=true;c.strict_context_limit=true;c.strict_request_json=true;c.compact_chat_envelope=true;c.chat_id_prefix="chatcmpl-g4-";
         c.sse_keepalive_seconds=0;c.sse_progress_seconds=0;
         c.capabilities_extra=[this](Json& out) {
             out.set("identity",*effective_config(backend,defaults,bool(drafts)).find("decode_identity"));
@@ -320,7 +336,8 @@ struct Api::Impl {
                 bool known=is_route_field(request.path,key) || is_presentation_field(key);
                 for(const auto* name:{"enable_thinking","preserve_thinking","conversational_mode","thinking_budget",
                     "chat_template_kwargs","dflash"})known|=key==name;
-                if(!known)throw RequestFieldError(key,"unsupported field: "+key);
+                if(!known && strict_fields)throw RequestFieldError(key,"unsupported field: "+key);
+                if(!known)warn_ignored_field(key);
             }
             if (const auto* v=body.find("temperature"); v && v->is_number()) {
                 const auto value=finite_number(*v,"temperature",0,100,false,false);
