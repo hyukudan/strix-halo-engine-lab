@@ -256,6 +256,7 @@ Shared run_share(const Weights& m, const std::vector<std::uint32_t>& prompt, uns
     const auto count = wins.size();
     const std::size_t row_bytes = H * 4U;
     std::atomic<bool> head_done{false};
+    const std::size_t chunk = 40;   // = the message header: every payload (64 B per layer, 96+ B per window) needs several calls
     std::vector<std::thread> threads;
     for (unsigned s = 0; s < 2U; ++s)
         threads.emplace_back([&, s] {
@@ -285,8 +286,12 @@ Shared run_share(const Weights& m, const std::vector<std::uint32_t>& prompt, uns
                 (void)layers::prefill(p, prompt, width, 1U, p.embeds() ? nullptr : pipe.get(), p.head() ? nullptr : pipe.get(), ops);
                 pipe.reset();
                 layers::Link up, down;
-                if (s == 1U) { up.send = [&](std::span<const std::byte> b) { link.send(1, b); }; up.receive = [&](std::span<std::byte> b) { link.receive(0, b); }; }
-                else { down.send = [&](std::span<const std::byte> b) { link.send(0, b); }; down.receive = [&](std::span<std::byte> b) { link.receive(1, b); }; }
+                // after the pipes no single transport call may exceed the chunk (a transport that corrupts big writes)
+                const auto capped = [&](int dir) { return [&, dir](std::span<const std::byte> b) {
+                    if (b.size() > chunk) throw std::runtime_error("a single write above the chunk size");
+                    link.send(dir, b); }; };
+                if (s == 1U) { up.send = capped(1); up.receive = [&](std::span<std::byte> b) { link.receive(0, b); }; }
+                else { down.send = capped(0); down.receive = [&](std::span<std::byte> b) { link.receive(1, b); }; }
                 // the hand-off waits for BOTH stages: the head finishes late, stage 0 must not pass the barrier before that
                 if (p.head()) { std::this_thread::sleep_for(std::chrono::milliseconds(60)); head_done.store(true); }
                 layers::line_barrier(s ? &up : nullptr, s ? nullptr : &down);
@@ -295,10 +300,12 @@ Shared run_share(const Weights& m, const std::vector<std::uint32_t>& prompt, uns
                 layers::RelayOps r;
                 r.save = [&](std::uint32_t layer) { return t.save(layer, layer + 1U); };
                 r.load = [&](std::uint32_t layer, std::span<const std::byte> b) { t.load(layer, layer + 1U, b); };
+                r.chunk_bytes = chunk;
                 const auto rs = layers::share_state(p, first, s ? &up : nullptr, s ? nullptr : &down, r);
                 out.state_bytes[s] = rs.bytes;
                 layers::TailOps tail;
                 tail.row_bytes = row_bytes;
+                tail.chunk_bytes = chunk;
                 tail.save = [&](std::uint32_t w, std::span<std::byte> b) {
                     std::size_t at = 0;
                     for (std::uint32_t i = 0; i < w; ++i) at += std::size_t(wins[i].rows) * H;

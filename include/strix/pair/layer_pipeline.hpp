@@ -296,6 +296,20 @@ inline DecodeStats decode(const Placement& p, std::uint32_t first_token, std::ui
     return out;
 }
 
+// A bulk payload crosses a link in pieces of at most `chunk` bytes (the byte stream is the same; only the transport
+// calls are bounded). A multi-cable host transport corrupted single writes of 32 MiB (the KV of one attention layer at
+// 8K positions) while 10 MiB pipe frames were intact, so the layer-state and tail-row messages never ask a transport for
+// more than the pipe frames already prove (8 MiB).
+inline constexpr std::size_t link_chunk_bytes = std::size_t{8} << 20;
+inline void send_chunked(const Link& link, std::span<const std::byte> bytes, std::size_t chunk = link_chunk_bytes) {
+    if (chunk == 0) throw std::invalid_argument("link chunk must be positive");
+    for (std::size_t at = 0; at < bytes.size(); at += chunk) link.send(bytes.subspan(at, std::min(chunk, bytes.size() - at)));
+}
+inline void receive_chunked(const Link& link, std::span<std::byte> bytes, std::size_t chunk = link_chunk_bytes) {
+    if (chunk == 0) throw std::invalid_argument("link chunk must be positive");
+    for (std::size_t at = 0; at < bytes.size(); at += chunk) link.receive(bytes.subspan(at, std::min(chunk, bytes.size() - at)));
+}
+
 // End-of-prefill relay of every stage's layer state to ONE decoder stage (the planner's handoff plan: the decoder owns
 // the whole model, decode then runs there alone at single-rank cost instead of crossing every cut per token).
 // Messages travel along the line towards `decoder`: a stage below it forwards what arrives from below plus its own
@@ -308,6 +322,7 @@ struct RelayOps {
     // Checksum of one message's bytes; empty = SeamCrc (bytewise table). A binder with a hardware CRC32C passes it:
     // the relay moves the whole KV + recurrent state once, a few hundred MB at long contexts.
     std::function<std::uint32_t(std::span<const std::byte>)> checksum;
+    std::size_t chunk_bytes = link_chunk_bytes;   // largest single transport call of a message's payload
 };
 struct RelayStats { std::uint32_t token = 0; std::uint64_t bytes = 0, messages = 0; double ms = 0; };
 inline RelayStats relay_state(const Placement& p, std::uint32_t decoder, std::uint32_t first_token, const Link* up,
@@ -331,11 +346,12 @@ inline RelayStats relay_state(const Placement& p, std::uint32_t decoder, std::ui
         from->receive(std::as_writable_bytes(std::span(m.words)));
         if (m.words[0] != state_magic) throw std::runtime_error("state relay: bad message header");
         m.bytes.resize(static_cast<std::size_t>(m.words[2]));
-        from->receive(m.bytes);
-        if (check_sum(m.bytes) != m.words[3]) throw std::runtime_error("state relay: checksum mismatch");
+        receive_chunked(*from, m.bytes, ops.chunk_bytes);
+        if (check_sum(m.bytes) != m.words[3])
+            throw std::runtime_error("state relay: checksum mismatch (layer " + std::to_string(m.words[1]) + ", " + std::to_string(m.bytes.size()) + " bytes)");
         return m;
     };
-    const auto put_msg = [&](const Link* to, const Message& m) { to->send(std::as_bytes(std::span(m.words))); to->send(m.bytes); };
+    const auto put_msg = [&](const Link* to, const Message& m) { to->send(std::as_bytes(std::span(m.words))); send_chunked(*to, m.bytes, ops.chunk_bytes); };
     const auto own = [&](std::uint32_t layer) {
         Message m;
         m.bytes = ops.save(layer);
@@ -435,6 +451,7 @@ struct TailOps {
     std::function<void(std::uint32_t window, std::span<std::byte> out)> save;                   // head stage
     std::function<void(std::uint32_t window, const Window&, std::span<const std::byte>)> load;  // first stage
     std::function<std::uint32_t(std::span<const std::byte>)> checksum;                          // empty: SeamCrc
+    std::size_t chunk_bytes = link_chunk_bytes;
 };
 inline std::uint64_t return_rows(const Placement& p, std::size_t prompt_tokens, std::uint32_t width, const Link* up,
                                  const Link* down, const TailOps& ops) {
@@ -456,14 +473,14 @@ inline std::uint64_t return_rows(const Placement& p, std::size_t prompt_tokens, 
             ops.save(w, bytes);
             words[0] = tail_magic; words[1] = w; words[2] = ws[w].rows; words[3] = bytes.size(); words[4] = check_sum(bytes);
             up->send(std::as_bytes(std::span(words)));
-            up->send(bytes);
+            send_chunked(*up, bytes, ops.chunk_bytes);
         } else {
             if (!down) throw std::invalid_argument("tail rows: the first stage needs its downstream link");
             down->receive(std::as_writable_bytes(std::span(words)));
             if (words[0] != tail_magic || words[1] != w || words[2] != ws[w].rows || words[3] != bytes.size())
                 throw std::runtime_error("tail rows: message does not match the window");
-            down->receive(bytes);
-            if (check_sum(bytes) != words[4]) throw std::runtime_error("tail rows: checksum mismatch");
+            receive_chunked(*down, bytes, ops.chunk_bytes);
+            if (check_sum(bytes) != words[4]) throw std::runtime_error("tail rows: checksum mismatch (window " + std::to_string(w) + ", " + std::to_string(bytes.size()) + " bytes)");
             ops.load(w, ws[w], bytes);
         }
         moved += bytes.size();
