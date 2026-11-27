@@ -61,6 +61,16 @@ namespace {
 constexpr std::uint32_t kThreads = 256;
 constexpr std::uint32_t kMaxHc = 8;
 constexpr std::uint32_t kMaxLowrank = 512;
+// Wide HC geometry of the flash-next model, derived from its description (models/qwen3.8-flash-next.toml).
+using HcwGeometry = ::strix::core::hc::WideGeometry<
+    ::strix::model::narrow<unsigned>(::strix::model_data::qwen3_8_flash_next::dims::hidden),
+    ::strix::model::narrow<unsigned>(::strix::model_data::qwen3_8_flash_next::hc::count),
+    ::strix::model::narrow<unsigned>(::strix::model_data::qwen3_8_flash_next::hc::lowrank)>;
+// The specialised fast paths below take exactly this geometry (their admission checks name it):
+// hidden, streams, low rank, flattened width, and the Q8 blocks of one width-long weight row.
+constexpr std::uint32_t kHcHidden = HcwGeometry::hidden, kHcStreams = HcwGeometry::streams,
+                        kHcRank = HcwGeometry::rank, kHcWidth = HcwGeometry::width,
+                        kHcWidthBlocks = HcwGeometry::width / 32U;
 constexpr std::uint32_t kStagedThreads = 128;
 constexpr std::uint32_t kStagedOutputs = 8;
 constexpr std::uint32_t kStagedPitch = kStagedThreads + 1;
@@ -114,20 +124,20 @@ void validate_config(
     if (config.splitk_deferred_norm && (!config.splitk_projection || config.splitk_projection_fp64 ||
         !config.lane_chain_output || !config.fused_injection || !config.typed_projection ||
         !config.staged_projections || !config.parallel || config.prefetch_hc_projection_next_tile ||
-        config.hidden_size != 2560U || config.hc_count != 4U || config.lowrank != 320U ||
+        config.hidden_size != kHcHidden || config.hc_count != kHcStreams || config.lowrank != kHcRank ||
         config.activation != HipActivationStorage::bf16))
         throw std::invalid_argument("deferred HC RMS requires canonical eager FP32 split-K lane-chain execution");
     if (config.prefetch_hc_projection_next_tile &&
         (!config.parallel || !config.staged_projections || !config.fused_injection ||
          !config.typed_projection || !config.prefetch_rows || config.splitk_projection ||
-         config.splitk_projection_fp64 || config.hidden_size != 2560U || config.hc_count != 4U ||
-         config.lowrank != 320U || config.activation != HipActivationStorage::bf16))
+         config.splitk_projection_fp64 || config.hidden_size != kHcHidden || config.hc_count != kHcStreams ||
+         config.lowrank != kHcRank || config.activation != HipActivationStorage::bf16))
         throw std::invalid_argument("next-tile HC requires canonical BF16 typed prefetched eager projection");
     if (config.splitk_projection_fp64 && !config.splitk_projection)
         throw std::invalid_argument("FP64 HC diagnostic requires split-K projection");
     if (config.splitk_projection && (!config.parallel || !config.staged_projections ||
         !config.fused_injection || !config.typed_projection || !config.prefetch_rows ||
-        static_cast<std::uint64_t>(config.hidden_size) * config.hc_count != 10240U))
+        static_cast<std::uint64_t>(config.hidden_size) * config.hc_count != kHcWidth))
         throw std::invalid_argument("split-K HC projection requires the admitted typed width10240 path");
     if (config.staged_projections && !config.parallel)
         throw std::invalid_argument("staged hyper projections require parallel hyper-mix");
@@ -894,7 +904,7 @@ __device__ __forceinline__ void splitk_hyper_lane_dots(
             for(unsigned s=0;s<5U;++s)
                 w[r][s]=*reinterpret_cast<const float4*>(
                     static_cast<const float*>(weights)+
-                    static_cast<std::uint64_t>(first+r)*10240U+tile*640U+s*128U+lane*4U);
+                    static_cast<std::uint64_t>(first+r)*kHcWidth+tile*640U+s*128U+lane*4U);
         }
 #pragma unroll
         for(unsigned r=0;r<R;++r) {
@@ -929,8 +939,8 @@ __device__ __forceinline__ void splitk_hyper_lane_dots(
 #pragma unroll
                 for(unsigned s=0;s<5U;++s) {
                     const unsigned b=tile*20U+4U*s+lane/8U;
-                    const auto o=q6p::chunk_offsets(10240U,b/8U);
-                    const auto* row=static_cast<const unsigned char*>(weights)+static_cast<std::uint64_t>(first+r)*q6p::row_bytes(10240U);
+                    const auto o=q6p::chunk_offsets(kHcWidth,b/8U);
+                    const auto* row=static_cast<const unsigned char*>(weights)+static_cast<std::uint64_t>(first+r)*q6p::row_bytes(kHcWidth);
                     qs[r][s]=*reinterpret_cast<const unsigned*>(row+o.qs+16U*(b%8U)+4U*(m/2U));
                     qh[r][s]=*reinterpret_cast<const unsigned*>(row+o.qh+8U*(b%8U)+4U*(m/4U));
                     bits[r][s]=*reinterpret_cast<const unsigned short*>(row+o.d+2U*(b%8U));
@@ -950,7 +960,7 @@ __device__ __forceinline__ void splitk_hyper_lane_dots(
 #pragma unroll
             for(unsigned s=0;s<5U;++s) {
                 const auto* block=static_cast<const unsigned char*>(weights)+
-                    static_cast<std::uint64_t>(first+r)*320U*34U+
+                    static_cast<std::uint64_t>(first+r)*kHcWidthBlocks*34U+
                     static_cast<std::uint64_t>(tile*20U+4U*s+lane/8U)*34U;
                 // Original 34-byte blocks are only 2-aligned. Never issue an
                 // incorrectly aligned 32-bit load for this packed code quartet.
@@ -1011,7 +1021,7 @@ __device__ __forceinline__ void deferred_hyper_lane_dots(
             for(unsigned s=0;s<5U;++s)
                 w[r][s]=*reinterpret_cast<const float4*>(
                     static_cast<const float*>(weights)+
-                    static_cast<std::uint64_t>(first+r)*10240U+tile*640U+s*128U+lane*4U);
+                    static_cast<std::uint64_t>(first+r)*kHcWidth+tile*640U+s*128U+lane*4U);
         }
 #pragma unroll
         for(unsigned r=0;r<R;++r) {
@@ -1041,7 +1051,7 @@ __device__ __forceinline__ void deferred_hyper_lane_dots(
 #pragma unroll
             for(unsigned s=0;s<5U;++s) {
                 const auto* block=static_cast<const unsigned char*>(weights)+
-                    static_cast<std::uint64_t>(first+r)*320U*34U+
+                    static_cast<std::uint64_t>(first+r)*kHcWidthBlocks*34U+
                     static_cast<std::uint64_t>(tile*20U+4U*s+lane/8U)*34U;
                 // Original 34-byte blocks are only 2-aligned. Never issue an
                 // incorrectly aligned 32-bit load for this packed code quartet.
@@ -1092,7 +1102,7 @@ __global__ __launch_bounds__(512) void deferred_hyper_projection_kernel(
     __shared__ float square[16];
     __shared__ float inverse[4];
     const unsigned lane=threadIdx.x%32U,tile=threadIdx.x/32U;
-    const auto* input=raw+static_cast<std::uint64_t>(blockIdx.y)*10240U;
+    const auto* input=raw+static_cast<std::uint64_t>(blockIdx.y)*kHcWidth;
     float sum=0.0F;
 #pragma unroll
     for(unsigned part=0;part<5U;++part) {
@@ -1178,7 +1188,7 @@ __global__ __launch_bounds__(256) void splitk_hyper_partial_kernel(
     const unsigned limit=is_inject?streams:rank;
     if(first>=limit)return; // Whole wave; this kernel has no block barrier.
     const unsigned valid=is_inject?1U:((limit-first)<4U?(limit-first):4U);
-    const auto* input=normalized+static_cast<std::uint64_t>(blockIdx.z)*10240U;
+    const auto* input=normalized+static_cast<std::uint64_t>(blockIdx.z)*kHcWidth;
     const unsigned pitch=rank+(inject?streams:0U);
     const auto base=(static_cast<std::uint64_t>(blockIdx.z)*16U+tile)*pitch;
     if(is_inject) {
@@ -1698,7 +1708,7 @@ struct InjectNormRows {
     const float* gates[kWindowRows];  // inject: per-stream gates
     void* combined[kWindowRows];      // combine: output row
 };
-constexpr std::uint32_t kInjectNormHidden = 2560U, kInjectNormStreams = 4U;
+constexpr std::uint32_t kInjectNormHidden = kHcHidden, kInjectNormStreams = kHcStreams;
 // Without the combine, block (stream, row) does one stream (the normalisation kernel's grid).
 template <typename Storage, bool Combine>
 __global__ __launch_bounds__(kThreads * kInjectNormStreams) void rows_inject_hyper_norm_kernel(HyperRows rows, InjectNormRows in,
@@ -1844,8 +1854,8 @@ __device__ __forceinline__ void rows_splitk_hyper_lane_dots(const Rows& rows, un
 #pragma unroll
             for(unsigned s=0;s<5U;++s) {
                 const unsigned b=tile*20U+4U*s+lane/8U;
-                const auto o=q6p::chunk_offsets(10240U,b/8U);
-                const auto* row=static_cast<const unsigned char*>(weights)+static_cast<std::uint64_t>(first+r)*q6p::row_bytes(10240U);
+                const auto o=q6p::chunk_offsets(kHcWidth,b/8U);
+                const auto* row=static_cast<const unsigned char*>(weights)+static_cast<std::uint64_t>(first+r)*q6p::row_bytes(kHcWidth);
                 qs[r][s]=*reinterpret_cast<const unsigned*>(row+o.qs+16U*(b%8U)+4U*(m/2U));
                 qh[r][s]=*reinterpret_cast<const unsigned*>(row+o.qh+8U*(b%8U)+4U*(m/4U));
                 bits[r][s]=*reinterpret_cast<const unsigned short*>(row+o.d+2U*(b%8U));
@@ -1866,10 +1876,10 @@ __device__ __forceinline__ void rows_splitk_hyper_lane_dots(const Rows& rows, un
         for(unsigned s=0;s<5U;++s) {
             if constexpr (Injection) {
                 w[r][s]=*reinterpret_cast<const float4*>(static_cast<const float*>(weights)+
-                    static_cast<std::uint64_t>(first+r)*10240U+tile*640U+s*128U+lane*4U);
+                    static_cast<std::uint64_t>(first+r)*kHcWidth+tile*640U+s*128U+lane*4U);
             } else {
                 const auto* block=static_cast<const unsigned char*>(weights)+
-                    static_cast<std::uint64_t>(first+r)*320U*34U+static_cast<std::uint64_t>(tile*20U+4U*s+lane/8U)*34U;
+                    static_cast<std::uint64_t>(first+r)*kHcWidthBlocks*34U+static_cast<std::uint64_t>(tile*20U+4U*s+lane/8U)*34U;
                 const auto bits=*reinterpret_cast<const unsigned short*>(block);
                 const auto* codes=reinterpret_cast<const unsigned short*>(block+2U+4U*(lane%8U));
                 scales[r][s]=__half2float(__ushort_as_half(bits));
@@ -2211,7 +2221,7 @@ __global__ void rows_lane_chain_split_hyper_output_kernel(Rows rows, const void*
 template <typename Storage, std::uint32_t Count, class Rows = HyperRows, bool Q6 = false>
 __global__ void rows_lane_chain_hyper_output_regs_kernel(Rows rows, const void* up,
     std::uint32_t hidden, std::uint32_t streams) {
-    constexpr std::uint32_t kBlocks = 10U, kRowBytes = kBlocks * (Q6 ? 26U : 34U), kWords = kRowBytes / 4U;
+    constexpr std::uint32_t kBlocks = HcwGeometry::rank_blocks, kRowBytes = kBlocks * (Q6 ? 26U : 34U), kWords = kRowBytes / 4U;
     extern __shared__ __align__(16) unsigned char staging[];
     const auto lane = threadIdx.x & 31U, stream = threadIdx.x / 32U;
     const std::uint64_t first = static_cast<std::uint64_t>(blockIdx.x) * 32U;
@@ -2235,7 +2245,7 @@ __global__ void rows_lane_chain_hyper_output_regs_kernel(Rows rows, const void* 
     for (std::uint32_t block = 0; block < kBlocks; ++block) {
         float scale;
         if constexpr (Q6) {
-            const auto o = q6p::chunk_offsets(320U, block / 8U);
+            const auto o = q6p::chunk_offsets(kHcRank, block / 8U);
             scale = __half2float(__ushort_as_half(static_cast<unsigned short>(byte_at(o.d + 2U * (block % 8U)) |
                 (byte_at(o.d + 2U * (block % 8U) + 1U) << 8U))));
         } else {
@@ -2244,7 +2254,7 @@ __global__ void rows_lane_chain_hyper_output_regs_kernel(Rows rows, const void* 
         }
         const auto code = [&](std::uint32_t k) STRIX_HC_LANE_ACCESSOR -> signed char {
             if constexpr (Q6) {
-                const auto o = q6p::chunk_offsets(320U, block / 8U);
+                const auto o = q6p::chunk_offsets(kHcRank, block / 8U);
                 const std::uint32_t g = k / 8U;
                 const auto codes = q6p::codes8(words[(o.qs + 16U * (block % 8U) + 4U * g) / 4U],
                     words[(o.qh + 8U * (block % 8U) + 4U * (g / 2U)) / 4U], 4U * (g & 1U));
@@ -2279,7 +2289,7 @@ __global__ void rows_lane_chain_hyper_output_regs_kernel(Rows rows, const void* 
 // first at every level, as rows_prepare_hyper_norm_kernel), the normalised product and the stream mix are
 // operand-pinned to the separate kernels' instructions (qpf2k_add / qpf2k_fmac / qpf2k_mul), so NaN payloads
 // match them too.
-constexpr std::uint32_t kPersistBlocks = 40U, kPersistHidden = 2560U, kPersistStreams = 4U, kPersistRank = 320U;
+constexpr std::uint32_t kPersistBlocks = kHcHidden / 64U, kPersistHidden = kHcHidden, kPersistStreams = kHcStreams, kPersistRank = kHcRank;
 constexpr std::uint32_t kPersistWidth = kPersistHidden * kPersistStreams;
 constexpr std::uint32_t kPersistUnitOutputs = 2U; // low outputs per split-K work unit (4 spills at 8 rows)
 static_assert(kPersistHidden == kPersistBlocks * 64U && kPersistRank % kPersistUnitOutputs == 0U);
@@ -2328,7 +2338,7 @@ __global__ __launch_bounds__(512) __attribute__((amdgpu_waves_per_eu(8))) void r
     const void* __restrict__ norm, std::uint32_t norm_type, float epsilon, std::uint32_t hidden_size, const unsigned char* __restrict__ down,
     const float* __restrict__ inject, const unsigned char* __restrict__ up, unsigned* counter, unsigned base,
     unsigned* queue, unsigned queue_base, PersistInjectRows injected, unsigned long long* trace, bool up_late) {
-    constexpr std::uint32_t kBlocks = 10U, kRowBytes = kBlocks * 34U, kWords = kRowBytes / 4U;
+    constexpr std::uint32_t kBlocks = HcwGeometry::rank_blocks, kRowBytes = kBlocks * 34U, kWords = kRowBytes / 4U;
     constexpr std::uint32_t kLeaves = kPersistHidden / kThreads; // features per leaf
     __shared__ float leaf[2][kThreads];
     __shared__ float inverse_lds[2];
@@ -2606,7 +2616,7 @@ __global__ __launch_bounds__(512) __attribute__((amdgpu_waves_per_eu(8))) void r
     const float* __restrict__ inject, const unsigned char* __restrict__ up, unsigned* counter, unsigned base,
     PersistInjectRows injected, unsigned long long* trace) {
     static_assert(Prefetch >= 1U && Prefetch <= kStaticUnits);
-    constexpr std::uint32_t kBlocks = 10U, kRowBytes = kBlocks * 34U, kWords = kRowBytes / 4U;
+    constexpr std::uint32_t kBlocks = HcwGeometry::rank_blocks, kRowBytes = kBlocks * 34U, kWords = kRowBytes / 4U;
     constexpr std::uint32_t kLeaves = kPersistHidden / kThreads;
     constexpr unsigned kUnitOutputs = kPersistUnitOutputs, kGroup = Count < 4U ? Count : 4U;
     __shared__ float leaf[2][kThreads];
@@ -3051,10 +3061,10 @@ __device__ __forceinline__ void wide_splitk_projection_body(const HyperWideRows&
         for (unsigned o = 0; o < O; ++o) if (o < valid) {
             if constexpr (Injection) {
                 w[o] = *reinterpret_cast<const float4*>(static_cast<const float*>(weights) +
-                    static_cast<std::uint64_t>(first + o) * 10240U + tile * 640U + s * 128U + lane * 4U);
+                    static_cast<std::uint64_t>(first + o) * kHcWidth + tile * 640U + s * 128U + lane * 4U);
             } else {
                 const auto* block = static_cast<const unsigned char*>(weights) +
-                    static_cast<std::uint64_t>(first + o) * 320U * 34U + static_cast<std::uint64_t>(tile * 20U + 4U * s + lane / 8U) * 34U;
+                    static_cast<std::uint64_t>(first + o) * kHcWidthBlocks * 34U + static_cast<std::uint64_t>(tile * 20U + 4U * s + lane / 8U) * 34U;
                 const auto bits = *reinterpret_cast<const unsigned short*>(block);
                 const auto* codes = reinterpret_cast<const unsigned short*>(block + 2U + 4U * (lane % 8U));
                 scales[o] = __half2float(__ushort_as_half(bits));
@@ -3131,7 +3141,7 @@ __device__ __forceinline__ void wide_splitk_projection_body(const HyperWideRows&
         if (row0 + t >= rows.count || o >= valid) continue;
         const float scaled = total[i] / static_cast<float>(streams);
         if constexpr (Injection) wide_row(rows.injection, rows.injection_stride, row0 + t)[first + o] = 2.0F * sigmoid(scaled);
-        else wide_row(rows.normalized, rows.normalized_stride, row0 + t)[10240U + first + o] = scaled * sigmoid(scaled);
+        else wide_row(rows.normalized, rows.normalized_stride, row0 + t)[kHcWidth + first + o] = scaled * sigmoid(scaled);
     }
 }
 
@@ -3174,7 +3184,7 @@ __global__ __launch_bounds__(32) void wide2_pack_down_kernel(const unsigned char
     unsigned d[8];
 #pragma unroll
     for (unsigned p = 0; p < 8U; ++p) {
-        const auto* block = down + static_cast<std::uint64_t>(g * 8U + (p ^ flip)) * 320U * 34U + (first_block + l / 8U) * 34U;
+        const auto* block = down + static_cast<std::uint64_t>(g * 8U + (p ^ flip)) * kHcWidthBlocks * 34U + (first_block + l / 8U) * 34U;
         const auto* q = reinterpret_cast<const unsigned short*>(block + 2U + 4U * (l % 8U));
         d[p] = static_cast<unsigned>(q[0]) | (static_cast<unsigned>(q[1]) << 16U);
     }
@@ -3182,7 +3192,7 @@ __global__ __launch_bounds__(32) void wide2_pack_down_kernel(const unsigned char
     out[0] = make_uint4(d[0], d[1], d[2], d[3]);
     out[1] = make_uint4(d[4], d[5], d[6], d[7]);
     const unsigned j = lane / 8U, p = lane % 8U;
-    const auto* block = down + static_cast<std::uint64_t>(g * 8U + p) * 320U * 34U + (first_block + j) * 34U;
+    const auto* block = down + static_cast<std::uint64_t>(g * 8U + p) * kHcWidthBlocks * 34U + (first_block + j) * 34U;
     scales[((static_cast<std::uint64_t>(c) * kWide2Groups + g) * 4U + j) * 8U + p] =
         __half2float(__ushort_as_half(*reinterpret_cast<const unsigned short*>(block)));
 }
@@ -3217,7 +3227,7 @@ __device__ __forceinline__ void wide2_splitk_projection_body(const HyperWideRows
             for (unsigned p = 0; p < O; ++p) {
                 const unsigned out = first + p;
                 w[p] = out < total_outputs ? *reinterpret_cast<const float4*>(static_cast<const float*>(weights) +
-                    static_cast<std::uint64_t>(out) * 10240U + tile * 640U + s * 128U + l * 4U) : make_float4(0.0F, 0.0F, 0.0F, 0.0F);
+                    static_cast<std::uint64_t>(out) * kHcWidth + tile * 640U + s * 128U + l * 4U) : make_float4(0.0F, 0.0F, 0.0F, 0.0F);
             }
         } else {
             const std::uint64_t at = static_cast<std::uint64_t>(chunk) * kWide2Groups + first / O;
@@ -3312,7 +3322,7 @@ __device__ __forceinline__ void wide2_splitk_projection_body(const HyperWideRows
         if constexpr (Injection) wide_row(rows.injection, rows.injection_stride, row0 + t)[out] = 2.0F * sigmoid(scaled);
         else {
             const float low = scaled * sigmoid(scaled);
-            wide_row(rows.normalized, rows.normalized_stride, row0 + t)[10240U + out] = low;
+            wide_row(rows.normalized, rows.normalized_stride, row0 + t)[kHcWidth + out] = low;
             if (rows.low_t) rows.low_t[static_cast<std::uint64_t>(out) * rows.low_t_pitch + row0 + t] = low;
         }
     }
@@ -3360,16 +3370,11 @@ __global__ __launch_bounds__(32U * Waves) void wide_splitk_hyper_projection_kern
 // the rows' low values of that block sit in LDS (index-major, one broadcast read serves four rows
 // of every stream). Same chain (block, then code order), coefficient expression and stream mix
 // (in the lane, stream order) as the window kernel.
-// Wide HC geometry of the flash-next model, derived from its description (models/qwen3.8-flash-next.toml).
-using HcwGeometry = ::strix::core::hc::WideGeometry<
-    ::strix::model::narrow<unsigned>(::strix::model_data::qwen3_8_flash_next::dims::hidden),
-    ::strix::model::narrow<unsigned>(::strix::model_data::qwen3_8_flash_next::hc::count),
-    ::strix::model::narrow<unsigned>(::strix::model_data::qwen3_8_flash_next::hc::lowrank)>;
 constexpr unsigned kWideOutputWaves = 4U, kWideStreams = HcwGeometry::streams;
 template <typename Storage, unsigned Rows>
 __global__ __launch_bounds__(128) void wide_lane_chain_hyper_output_kernel(HyperWideRows rows, const void* __restrict__ up,
     std::uint32_t hidden) {
-    constexpr unsigned kBlocks = 10U, kRowBytes = kBlocks * 34U, Pitch = Rows + 4U, S = kWideStreams;
+    constexpr unsigned kBlocks = HcwGeometry::rank_blocks, kRowBytes = kBlocks * 34U, Pitch = Rows + 4U, S = kWideStreams;
     constexpr unsigned Staged = Rows * 32U / (32U * kWideOutputWaves);
     __shared__ __align__(16) float lows[2][32][Pitch];
     const unsigned lane = threadIdx.x % 32U, wave = threadIdx.x / 32U, row0 = blockIdx.y * Rows;
@@ -3377,7 +3382,7 @@ __global__ __launch_bounds__(128) void wide_lane_chain_hyper_output_kernel(Hyper
     const auto* up_rows = static_cast<const unsigned char*>(up) + feature * kRowBytes;
     const auto low_at = [&](unsigned block, unsigned index) {
         const unsigned t = index / 32U, k = index % 32U;
-        return row0 + t < rows.count ? wide_row(rows.normalized, rows.normalized_stride, row0 + t)[10240U + block * 32U + k] : 0.0F;
+        return row0 + t < rows.count ? wide_row(rows.normalized, rows.normalized_stride, row0 + t)[kHcWidth + block * 32U + k] : 0.0F;
     };
     float gate[S][Rows];
 #pragma unroll
@@ -3481,7 +3486,7 @@ constexpr unsigned kWide2OutputWaves = 4U, kWide2OutputRows = 32U;
 template <typename Storage, unsigned R, bool RowsFirst, bool Half = false, bool Recompute = false>
 __global__ __launch_bounds__(32U * kWide2OutputWaves) void wide2_hyper_output_kernel(HyperWideRows rows, const void* __restrict__ up,
     std::uint32_t hidden) {
-    constexpr unsigned kBlocks = 10U, kRowBytes = kBlocks * 34U, S = kWideStreams, Steps = 64U / R;
+    constexpr unsigned kBlocks = HcwGeometry::rank_blocks, kRowBytes = kBlocks * 34U, S = kWideStreams, Steps = 64U / R;
     static_assert(R == 16U || R == 32U);
     const unsigned lane = threadIdx.x % 32U, wave = threadIdx.x / 32U, row0 = (RowsFirst ? blockIdx.x : blockIdx.y) * R;
     const std::uint64_t feature = (static_cast<std::uint64_t>(RowsFirst ? blockIdx.y : blockIdx.x) * kWide2OutputWaves + wave) * 32U + lane;
@@ -3756,7 +3761,7 @@ void launch_typed(
                         // The registered Q6P32 copy of the down tensor replaces it (same bits).
                         const auto* q6_down = q6p::find(reinterpret_cast<const void*>(down_runtime.address));
                         const bool q6 = q6_down && q6_down->kind == q6p::Kind::q6p32 && q6_down->rows == config.lowrank &&
-                            q6_down->cols == 10240U && width == 10240U;
+                            q6_down->cols == kHcWidth && width == kHcWidth;
                         const auto launch = [&]<typename Acc>() {
                             if (q6 && std::is_same_v<Acc, float>)
                                 STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(splitk_hyper_projection_kernel<outputs,float,true>),
@@ -4200,7 +4205,7 @@ PreparedHyperMix prepare_hyper_mix(
     }
 
     if(config.splitk_deferred_norm && (norm_manifest.ggml_type!=0U ||
-        norm_manifest.dimensions!=std::vector<std::uint64_t>{10240U} || norm_manifest.byte_size!=40960U))
+        norm_manifest.dimensions!=std::vector<std::uint64_t>{kHcWidth} || norm_manifest.byte_size!=40960U))
         throw std::invalid_argument("deferred HC RMS requires its canonical F32 norm owner");
     if(config.lane_chain_output){
         if(!lane_chain_hyper_output_eligible(up_manifest,config.hidden_size,config.hc_count,config.lowrank,up_runtime.address%16U) || up_runtime.bytes<up_manifest.byte_size ||
@@ -4225,10 +4230,10 @@ PreparedHyperMix prepare_hyper_mix(
     if(config.prefetch_hc_projection_next_tile) {
         const auto temporary=resolve_dispatch_temporary(context,0);
         if(context.temporaries.size()!=1U || temporary.use.buffer.buffer_class!=ExecutionBufferClass::hyper_workspace ||
-           norm_manifest.dimensions.size()!=1U || norm_manifest.dimensions[0]!=10240U ||
-           down_manifest.dimensions.size()!=2U || down_manifest.dimensions[0]!=10240U || down_manifest.dimensions[1]!=320U || down_manifest.byte_size!=3481600U ||
-           up_manifest.dimensions.size()!=2U || up_manifest.dimensions[0]!=320U || up_manifest.dimensions[1]!=10240U ||
-           (inject_manifest && (inject_manifest->dimensions.size()!=2U || inject_manifest->dimensions[0]!=10240U ||
+           norm_manifest.dimensions.size()!=1U || norm_manifest.dimensions[0]!=kHcWidth ||
+           down_manifest.dimensions.size()!=2U || down_manifest.dimensions[0]!=kHcWidth || down_manifest.dimensions[1]!=kHcRank || down_manifest.byte_size!=3481600U ||
+           up_manifest.dimensions.size()!=2U || up_manifest.dimensions[0]!=kHcRank || up_manifest.dimensions[1]!=kHcWidth ||
+           (inject_manifest && (inject_manifest->dimensions.size()!=2U || inject_manifest->dimensions[0]!=kHcWidth ||
                                inject_manifest->dimensions[1]!=4U || inject_manifest->byte_size!=163840U)))
             throw std::invalid_argument("next-tile HC actual tensor/workspace geometry differs");
         if(!temporary.address || temporary.address%16U || temporary.bytes<42240U ||
@@ -4720,7 +4725,7 @@ void launch_hyper_rows(const PreparedHyperRows& prepared, const Rows& rows, cons
             // The registered Q6P32 copy of the down tensor replaces it (same bits).
             const auto* q6_down = q6p::find(reinterpret_cast<const void*>(p.down_runtime->address));
             const bool q6 = q6_down && q6_down->kind == q6p::Kind::q6p32 && q6_down->rows == config.lowrank &&
-                q6_down->cols == 10240U && width == 10240U;
+                q6_down->cols == kHcWidth && width == kHcWidth;
             const auto launch = [&]<unsigned outputs>() {
                 const auto blocks = (config.lowrank + outputs - 1U) / outputs;
                 if (q6)
@@ -4776,7 +4781,7 @@ void launch_hyper_rows(const PreparedHyperRows& prepared, const Rows& rows, cons
                     return;
                 }
                 // Register form only up to 4 rows: at 8 rows it runs out of registers (32.1 -> 37.3 us).
-                if constexpr (Count != 0U && Count <= 4U) if (regs && config.lowrank == 320U) {
+                if constexpr (Count != 0U && Count <= 4U) if (regs && config.lowrank == kHcRank) {
                     STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(rows_lane_chain_hyper_output_regs_kernel<Storage, Count, Rows, Q6>),
                         dim3(config.hidden_size / 32U, 1U, tiles), dim3(32U * config.hc_count),
                         static_cast<std::size_t>(Count) * config.hc_count * 32U * sizeof(float), hip_execution_stream(),
@@ -5100,7 +5105,7 @@ bool wide_hyper_rows(const PreparedHyperRows& prepared, const HipHyperMixLaunche
     static const bool enabled = strix::envcfg::flag("STRIX_HC_WIDE", true);
     static const bool fused_norm = std::getenv("STRIX_HC_ROWS_FUSED_NORM") != nullptr;
     if (!enabled || fused_norm || !config.splitk_projection || !config.lane_chain_output ||
-        config.hidden_size * config.hc_count != 10240U || config.lowrank != 320U ||
+        config.hidden_size * config.hc_count != kHcWidth || config.lowrank != kHcRank ||
         config.hc_count != kWideStreams || config.hidden_size % (32U * kWideOutputWaves) ||
         config.hc_count > kWideProjectionOutputs || prepared.count != kWindowRows)
         return false;
@@ -5119,7 +5124,7 @@ bool wide_hyper_rows(const PreparedHyperRows& prepared, const HipHyperMixLaunche
         !uniform(rows.low, rows.tile_normalized, low_stride) || low_stride != wide.normalized_stride ||
         !uniform(rows.injection, rows.tile_injection, wide.injection_stride) ||
         !uniform(rows.output, rows.tile_output, wide.output_stride) ||
-        wide.normalized_stride % 16U || at(rows.normalized[0]) % 16U || at(rows.low[0]) != at(rows.normalized[0]) + 10240U * sizeof(float) ||
+        wide.normalized_stride % 16U || at(rows.normalized[0]) % 16U || at(rows.low[0]) != at(rows.normalized[0]) + kHcWidth * sizeof(float) ||
         (prepared.first.inject_runtime && !rows.injection[0]) || prepared.first.up_runtime->address % 4U)
         return false;
     wide.normalized = rows.normalized[0];
@@ -5140,7 +5145,7 @@ constexpr std::uint32_t kWide2LowRows = known_prefill_max_rows;
 float* wide2_low_scratch(std::uint32_t rows = 8192U, bool setup = false) {
     static HipPrefillPool pool;
     const auto capacity = hc_prefill_pool_owner().rows((rows + kWide2OutputRows - 1U) / kWide2OutputRows * kWide2OutputRows);
-    return static_cast<float*>(pool.get(std::uint64_t{320U} * capacity * sizeof(float),
+    return static_cast<float*>(pool.get(std::uint64_t{kHcRank} * capacity * sizeof(float),
         "HC wide rows: transposed low scratch",setup));
 }
 // Host-only producer receipt policy. A generation covers one ordered submission,
@@ -5193,7 +5198,7 @@ void launch_wide_hyper_kernels_impl(const HyperWideRows& wide_in, const void* do
     const bool reuse_explicit = output_kernel == 15U;
     const bool reuse_auto = output_kernel == 1U && qpf2k_hc_inverse_reuse_requested();
     const bool out16 = output_kernel == 15U || output_kernel == 14U || (output_kernel == 1U && qpf2k_hc_out16() &&
-        config.fast_prefill_wmma && config.hidden_size == 2560U && config.hc_count == 4U &&
+        config.fast_prefill_wmma && config.hidden_size == kHcHidden && config.hc_count == kHcStreams &&
         projection_kernel == 2U && !wide.normalized16 && !wide.inverse);
     const bool inverse_reuse = hc_inverse_reuse::admitted(Recompute, out16, reuse_explicit, reuse_auto);
     if (!inverse_reuse && !reuse_explicit && qpf2k_hc_inverse_reuse_requested()) {
@@ -5206,7 +5211,7 @@ void launch_wide_hyper_kernels_impl(const HyperWideRows& wide_in, const void* do
         (void)noted;
     }
     if (output_kernel == 14U || output_kernel == 15U) output_kernel = 1U;
-    if (out16 && (config.hidden_size != 2560U || config.hc_count != 4U || wide.normalized16 || wide.inverse ||
+    if (out16 && (config.hidden_size != kHcHidden || config.hc_count != kHcStreams || wide.normalized16 || wide.inverse ||
         (projection_kernel != 2U && projection_kernel != 4U && projection_kernel != kSkipKernel)))
         throw std::invalid_argument("HC out16 requires FP32 normalized rows and the WMMA low image");
     const unsigned qpf2k_output_form = output_kernel >= 3U && output_kernel <= 6U ? output_kernel : 0U;
@@ -5240,7 +5245,7 @@ void launch_wide_hyper_kernels_impl(const HyperWideRows& wide_in, const void* do
     unsigned low_mode = 0U;
     {
         const bool output3_route = output_kernel == 1U && wide.low_t && !output_rows16 && !wide.normalized16 && !wide.inverse &&
-            config.hidden_size == 2560U && (qpf2k_output3 || (!qpf2k_output && output_rows_first && config.fast_prefill_wmma && qpf2k_hc_output3()));
+            config.hidden_size == kHcHidden && (qpf2k_output3 || (!qpf2k_output && output_rows_first && config.fast_prefill_wmma && qpf2k_hc_output3()));
         const bool qpf2k_projection_route = projection_kernel == 2U && !wide.normalized16 && !wide.inverse && !qpf2k_hc_check() &&
             (qpf2k_projection ? qpf2k_projection_form == 4U : (qpf2k_hc_mask() & 8U) != 0U);
         if (!out16 && output3_route && qpf2k_projection_route && output3_band_used == 16U && !output3_zero_low_rank_stride)
@@ -5269,7 +5274,7 @@ void launch_wide_hyper_kernels_impl(const HyperWideRows& wide_in, const void* do
     // output kernel 2 reads the FP16 low values projection kernel 2 writes; output kernel 1 (the FP32 lane-chain
     // output) reads the transposed FP32 low values it also writes.
     if (projection_kernel == 2U || output_kernel == 2U || out16) {
-        if (wide.count > kHcwLowRows || config.hc_count != 4U)
+        if (wide.count > kHcwLowRows || config.hc_count != kHcStreams)
             throw std::invalid_argument("HC WMMA rows: row count or stream count unsupported");
         const auto scratch = hcw_scratch(wide.count);
         if (projection_kernel == 2U) {
@@ -5325,7 +5330,7 @@ void launch_wide_hyper_kernels_impl(const HyperWideRows& wide_in, const void* do
                     qpf2k();
                     // Census seam (STRIX_QPF2K_HC_LOW32_POISON=1): NaN over the FP32 tail; a matching hash is workload evidence only.
                     if (out16 && qpf2k_hc_low32_poison())
-                        check_hip(hipMemset2DAsync(wide.normalized + 10240U, wide.normalized_stride, 0xff, 320U * 4U, wide.count, stream),
+                        check_hip(hipMemset2DAsync(wide.normalized + kHcWidth, wide.normalized_stride, 0xff, kHcRank * 4U, wide.count, stream),
                             "qpf2k HC low32 poison");
                 }
                 else {
@@ -5333,20 +5338,20 @@ void launch_wide_hyper_kernels_impl(const HyperWideRows& wide_in, const void* do
                         static_cast<const float*>(inject), config.hc_count, scratch.low16);
                     const auto snap = [&] {
                         std::vector<std::vector<unsigned char>> v;
-                        v.push_back(qpf2k_snapshot_rows(wide.normalized + 10240U, wide.normalized_stride, 320U * 4U, wide.count, stream));
+                        v.push_back(qpf2k_snapshot_rows(wide.normalized + kHcWidth, wide.normalized_stride, kHcRank * 4U, wide.count, stream));
                         if (wide.injection) v.push_back(qpf2k_snapshot_rows(wide.injection, wide.injection_stride, config.hc_count * 4U, wide.count, stream));
-                        if (wide.low_t) v.push_back(qpf2k_snapshot_rows(wide.low_t, std::uint64_t{wide.low_t_pitch} * 4U, wide.count * 4U, 320U, stream));
-                        v.push_back(qpf2k_snapshot_rows(scratch.low16, 320U * 2U, 320U * 2U, wide.count, stream));
+                        if (wide.low_t) v.push_back(qpf2k_snapshot_rows(wide.low_t, std::uint64_t{wide.low_t_pitch} * 4U, wide.count * 4U, kHcRank, stream));
+                        v.push_back(qpf2k_snapshot_rows(scratch.low16, kHcRank * 2U, kHcRank * 2U, wide.count, stream));
                         return v;
                     };
                     const auto reference = snap();
                     // Every destination poisoned, so a missing store cannot inherit the reference's bytes.
-                    check_hip(hipMemset2DAsync(wide.normalized + 10240U, wide.normalized_stride, 0x5a, 320U * 4U, wide.count, stream), "qpf2k HC check poison");
+                    check_hip(hipMemset2DAsync(wide.normalized + kHcWidth, wide.normalized_stride, 0x5a, kHcRank * 4U, wide.count, stream), "qpf2k HC check poison");
                     if (wide.injection)
                         check_hip(hipMemset2DAsync(wide.injection, wide.injection_stride, 0x5a, config.hc_count * 4U, wide.count, stream), "qpf2k HC check poison");
                     if (wide.low_t)
-                        check_hip(hipMemset2DAsync(wide.low_t, std::uint64_t{wide.low_t_pitch} * 4U, 0x5a, wide.count * 4U, 320U, stream), "qpf2k HC check poison");
-                    check_hip(hipMemsetAsync(scratch.low16, 0x5a, std::uint64_t{wide.count} * 320U * 2U, stream), "qpf2k HC check poison");
+                        check_hip(hipMemset2DAsync(wide.low_t, std::uint64_t{wide.low_t_pitch} * 4U, 0x5a, wide.count * 4U, kHcRank, stream), "qpf2k HC check poison");
+                    check_hip(hipMemsetAsync(scratch.low16, 0x5a, std::uint64_t{wide.count} * kHcRank * 2U, stream), "qpf2k HC check poison");
                     qpf2k();
                     const auto candidate = snap();
                     const char* names[] = {"projection low", "projection injection", "projection low_t", "projection low16"};
@@ -5469,7 +5474,7 @@ void launch_wide_hyper_kernels_impl(const HyperWideRows& wide_in, const void* do
                 }
                 if constexpr (R == 32U) {
                     // STRIX_QPF2K_HC_OUTPUT3 (fast profile): output v3, the same arithmetic as the kernel below; same bytes.
-                    if (qpf2k_output3 || (!qpf2k_output && output_rows_first && config.fast_prefill_wmma && qpf2k_hc_output3() && config.hidden_size == 2560U)) {
+                    if (qpf2k_output3 || (!qpf2k_output && output_rows_first && config.fast_prefill_wmma && qpf2k_hc_output3() && config.hidden_size == kHcHidden)) {
                         const dim3 grid(groups, features);
                         // Engine and fast-profile fixtures include the cached per-call copy.
                         // Ordinary seam fixtures keep their supplied buffer.
@@ -5530,7 +5535,7 @@ void launch_wide_hyper_kernels_impl(const HyperWideRows& wide_in, const void* do
                         return;
                     }
                     // STRIX_QPF2K_HC bit 0 (fast profile): packed coefficients, double-buffered low values; same bytes.
-                    if (qpf2k_output || (output_rows_first && config.fast_prefill_wmma && (qpf2k_hc_mask() & 1U) && config.hidden_size == 2560U)) {
+                    if (qpf2k_output || (output_rows_first && config.fast_prefill_wmma && (qpf2k_hc_mask() & 1U) && config.hidden_size == kHcHidden)) {
                         const auto qpf2k = [&] {
                             auto* coef = qpf2k_hc_coef_scratch(stream);
                             STRIX_HIP_LAUNCH_GGL(Rdna3Layout, qpf2k_hc_pack_coef_kernel, dim3((config.hidden_size * 10U + 255U) / 256U), dim3(256U), 0, stream,
@@ -5644,7 +5649,7 @@ bool qpf2k_hc_recompute_view(const PreparedHyperRows& prepared, HyperWideRows& w
     const char* output_rows = std::getenv("STRIX_HC_WIDE2_OUTPUT_ROWS");
     const char* output_order = std::getenv("STRIX_HC_WIDE2_OUTPUT_ORDER");
     if (!config.fast_prefill_wmma || config.activation != HipActivationStorage::bf16 ||
-        config.hidden_size != 2560U || config.hc_count != 4U || config.lowrank != 320U ||
+        config.hidden_size != kHcHidden || config.hc_count != kHcStreams || config.lowrank != kHcRank ||
         wide.count > kHcwLowRows || p.norm_manifest->ggml_type != 0U || fast_output_kernel() != 1U ||
         !(qpf2k_hc_mask() & 8U) || qpf2k_hc_check() || on("STRIX_HC_WIDE_CHECK") ||
         on("STRIX_HCW_NORM16") || on("STRIX_HCW_NORMFREE") || on("STRIX_HCW_NORMFREE_CHECK"))
@@ -5693,7 +5698,7 @@ bool hcw_normfree_rows(const PreparedHyperRows& prepared, const HyperTileRows& t
         if (!tile_rows.input[r] || at(tile_rows.input[r]) != at(tile_rows.input[0]) + r * stride) return false;
     const std::uintptr_t in0 = at(tile_rows.input[0]), in1 = in0 + wide.count * stride, out0 = at(wide.output),
         out1 = out0 + wide.count * wide.output_stride;
-    if (in0 % 16U || stride % 16U || stride < 10240U * 2U || p.norm_runtime->address % 16U || (in0 < out1 && out0 < in1)) return false;
+    if (in0 % 16U || stride % 16U || stride < kHcWidth * 2U || p.norm_runtime->address % 16U || (in0 < out1 && out0 < in1)) return false;
     rows.input = tile_rows.input[0];
     rows.input_stride = stride;
     rows.inverse = hcw_inverse_scratch(wide.count);
@@ -5767,7 +5772,7 @@ std::vector<unsigned char> snapshot_wide_hyper_rows(const HyperWideRows& wide, c
         out.resize(at + bytes * wide.count);
         check_hip(hipMemcpy2D(out.data() + at, bytes, base, stride, bytes, wide.count, hipMemcpyDeviceToHost), "HC wide check copy");
     };
-    copy(wide.normalized + 10240U, wide.normalized_stride, low_bytes);
+    copy(wide.normalized + kHcWidth, wide.normalized_stride, low_bytes);
     if (injection_bytes) copy(wide.injection, wide.injection_stride, injection_bytes);
     copy(wide.output, wide.output_stride, output_bytes);
     return out;
@@ -5927,7 +5932,7 @@ bool hyper_mix_known_prefill_rows_launch_folded(std::span<const ExecutionDispatc
     if (at(in.output) != at(r.input[0]) || in.output_stride != input_stride) return qpf2k_decline("the HC step does not read the injected streams");
     if (combine && (at(cb.output) != at(in.second) || cb.output_stride != in.second_stride))
         return qpf2k_decline("the inject does not read the combined rows");
-    constexpr std::uint64_t width = 10240U * 2U, hidden = 2560U * 2U, workspace = (10240U + 320U) * 4U;
+    constexpr std::uint64_t width = kHcWidth * 2U, hidden = kHcHidden * 2U, workspace = (kHcWidth + kHcRank) * 4U;
     const auto aligned = [&](const void* x, std::uint64_t stride) { return at(x) % 16U == 0U && stride % 16U == 0U; };
     if (!aligned(in.first, in.first_stride) || !aligned(in.second, in.second_stride) || !aligned(in.output, in.output_stride) ||
         !aligned(wide.normalized, wide.normalized_stride) || at(in.weights) % 4U || in.weights_stride % 4U ||
@@ -6053,7 +6058,7 @@ std::uint64_t hip_hyper_mix_testing_prefill_folds() { return qpf2k_folds.load();
 void testing::enqueue_wide_hyper_rows_test(const HipHyperMixLauncherConfig& config, const WideHyperRowsTestViews& views,
     unsigned projection_kernel, unsigned output_kernel, hipStream_t stream) {
     const auto aligned = [](const void* p, std::uintptr_t a) { return reinterpret_cast<std::uintptr_t>(p) % a == 0U; };
-    if (config.hidden_size * config.hc_count != 10240U || config.lowrank != 320U || config.hc_count != kWideStreams ||
+    if (config.hidden_size * config.hc_count != kHcWidth || config.lowrank != kHcRank || config.hc_count != kWideStreams ||
         config.hidden_size % (32U * kWideOutputWaves) || !views.rows || !views.normalized || !views.output || !views.down ||
         !views.up || (views.inject && !views.injection) || views.normalized_stride % 16U || !aligned(views.normalized, 16U) ||
         !aligned(views.up, 4U) || (projection_kernel > 4U && projection_kernel != kSkipKernel) ||
@@ -6068,7 +6073,7 @@ void testing::enqueue_wide_hyper_rows_test(const HipHyperMixLauncherConfig& conf
     wide.output = views.output; wide.output_stride = views.output_stride;
     wide.count = views.rows;
     wide.normalized16 = static_cast<const _Float16*>(views.normalized16);
-    wide.normalized16_pitch = views.normalized16_pitch ? views.normalized16_pitch : 10240U;
+    wide.normalized16_pitch = views.normalized16_pitch ? views.normalized16_pitch : kHcWidth;
     wide.normalized16_only = views.normalized16 && views.normalized16_only;
     if (views.recompute_inverse) {
         if (!views.recompute_input || !views.recompute_norm || views.recompute_stride < 20480U ||
@@ -6192,7 +6197,7 @@ void testing::enqueue_lane_chain_hyper_output_test(const HipHyperMixLauncherConf
 
 void hc_projection_diagnostic::enqueue(Shape shape,Span normalized,Span down,Span inject,Span low,Span injection,
     std::uint32_t opw,std::uint32_t prefetch,bool reference_rows8,hipStream_t stream){
-    if(!shape.width || shape.width>10240U || shape.width%256U || shape.streams<2U || shape.streams>8U || shape.width%shape.streams || !shape.rank || shape.rank>512U || !shape.rows || shape.rows>65535U ||
+    if(!shape.width || shape.width>kHcWidth || shape.width%256U || shape.streams<2U || shape.streams>8U || shape.width%shape.streams || !shape.rank || shape.rank>512U || !shape.rows || shape.rows>65535U ||
        (opw!=0U && opw!=8U && opw!=16U && opw!=32U) || (prefetch!=1U && prefetch!=2U))throw std::invalid_argument("HC projection diagnostic unsupported shape/variant");
     const bool with_inject=injection.address!=0;
     if(with_inject!=(inject.address!=0) || (!with_inject && (inject.bytes || injection.bytes)))throw std::invalid_argument("HC projection diagnostic injection owner pair differs");
@@ -6225,7 +6230,7 @@ void hc_projection_diagnostic::enqueue_splitk(
     Shape shape,Span normalized,Span down,Span inject,Span low,Span injection,
     Span partial,SplitKVariant variant,hipStream_t stream) {
     const bool is_p2=variant==SplitKVariant::p2_r4;
-    if(shape.width!=10240U || shape.streams<2U || shape.streams>8U ||
+    if(shape.width!=kHcWidth || shape.streams<2U || shape.streams>8U ||
        !shape.rank || shape.rank>512U || !shape.rows || shape.rows>65535U ||
        (variant!=SplitKVariant::p1_r4 && variant!=SplitKVariant::p1_r2 &&
         variant!=SplitKVariant::p2_r4 && variant!=SplitKVariant::p1_r4_fp64))
@@ -6241,11 +6246,11 @@ void hc_projection_diagnostic::enqueue_splitk(
            owner.bytes>std::numeric_limits<std::uintptr_t>::max()-owner.address)
             throw std::invalid_argument("HC split-K projection owner extent/alignment differs");
     };
-    check_span(normalized,static_cast<std::uint64_t>(shape.rows)*10240U*4U,16U);
-    check_span(down,static_cast<std::uint64_t>(shape.rank)*320U*34U,16U);
+    check_span(normalized,static_cast<std::uint64_t>(shape.rows)*kHcWidth*4U,16U);
+    check_span(down,static_cast<std::uint64_t>(shape.rank)*kHcWidthBlocks*34U,16U);
     check_span(low,static_cast<std::uint64_t>(shape.rows)*shape.rank*4U,4U);
     if(with_inject) {
-        check_span(inject,static_cast<std::uint64_t>(shape.streams)*10240U*4U,16U);
+        check_span(inject,static_cast<std::uint64_t>(shape.streams)*kHcWidth*4U,16U);
         check_span(injection,static_cast<std::uint64_t>(shape.rows)*shape.streams*4U,4U);
     }
     const unsigned pitch=shape.rank+(with_inject?shape.streams:0U);
@@ -6311,7 +6316,7 @@ void hc_deferred_norm_diagnostic::enqueue(Span raw,Span norm,Span down,Span inje
     if(with_inject){check(inject,163840U,16U);check(injection,16U,4U);}
     if(inverse_audit.address)check(inverse_audit,(80U+(with_inject?1U:0U))*16U,4U);
     else if(inverse_audit.bytes)throw std::invalid_argument("deferred HC diagnostic empty audit extent differs");
-    if(scaled_audit.address)check(scaled_audit,(320U+(with_inject?4U:0U))*4U,4U);
+    if(scaled_audit.address)check(scaled_audit,(kHcRank+(with_inject?4U:0U))*4U,4U);
     else if(scaled_audit.bytes)throw std::invalid_argument("deferred HC diagnostic empty scaled audit extent differs");
     const auto overlaps=[](Span a,Span b) {
         return a.address && b.address && a.address<b.address+b.bytes && b.address<a.address+a.bytes;
@@ -6338,16 +6343,16 @@ void hc_deferred_norm_diagnostic::enqueue(Span raw,Span norm,Span down,Span inje
     STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(deferred_hyper_projection_kernel<4U>),
         dim3(80U+(with_inject?1U:0U)),dim3(512U),0,stream,
         reinterpret_cast<const std::uint16_t*>(raw.address),reinterpret_cast<const float*>(norm.address),
-        reinterpret_cast<const void*>(down.address),320U,epsilon,reinterpret_cast<float*>(inverse.address),
+        reinterpret_cast<const void*>(down.address),kHcRank,epsilon,reinterpret_cast<float*>(inverse.address),
         reinterpret_cast<float*>(low.address),reinterpret_cast<const void*>(inject.address),
         reinterpret_cast<float*>(injection.address),80U,reinterpret_cast<float*>(inverse_audit.address),
         reinterpret_cast<float*>(scaled_audit.address));
     check_hip(hipGetLastError(),"deferred HC diagnostic projection enqueue");
     STRIX_HIP_LAUNCH_GGL(Rdna3Layout, HIP_KERNEL_NAME(deferred_lane_chain_hyper_output_kernel<std::uint16_t>),
-        dim3(80U),dim3(128U),static_cast<std::size_t>(lane_chain_hyper_output_lds(4U,320U)),stream,
+        dim3(80U),dim3(128U),static_cast<std::size_t>(lane_chain_hyper_output_lds(kHcStreams,kHcRank)),stream,
         reinterpret_cast<const std::uint16_t*>(raw.address),reinterpret_cast<const float*>(inverse.address),
         reinterpret_cast<const float*>(norm.address),reinterpret_cast<const float*>(low.address),
-        reinterpret_cast<const void*>(up.address),2560U,4U,320U,reinterpret_cast<std::uint16_t*>(output.address));
+        reinterpret_cast<const void*>(up.address),kHcHidden,kHcStreams,kHcRank,reinterpret_cast<std::uint16_t*>(output.address));
     check_hip(hipGetLastError(),"deferred HC diagnostic lane-chain enqueue");
 }
 
@@ -6562,10 +6567,10 @@ void preflight_splitk_hyper_projection_model(const CompiledSerialExecution& comp
     const auto overlaps = [](Span a, Span b) {
         return a.address && b.address && a.address < b.address + b.bytes && b.address < a.address + a.bytes;
     };
-    const std::uint64_t normalized_bytes = static_cast<std::uint64_t>(compiled.logical_rows) * 10240U * sizeof(float);
+    const std::uint64_t normalized_bytes = static_cast<std::uint64_t>(compiled.logical_rows) * kHcWidth * sizeof(float);
     const std::uint64_t low_bytes = static_cast<std::uint64_t>(compiled.logical_rows) * config.lowrank * sizeof(float);
-    const std::uint64_t down_bytes = static_cast<std::uint64_t>(config.lowrank) * 320U * 34U;
-    const std::uint64_t inject_bytes = static_cast<std::uint64_t>(config.hc_count) * 10240U * sizeof(float);
+    const std::uint64_t down_bytes = static_cast<std::uint64_t>(config.lowrank) * kHcWidthBlocks * 34U;
+    const std::uint64_t inject_bytes = static_cast<std::uint64_t>(config.hc_count) * kHcWidth * sizeof(float);
     std::uint32_t count = 0;
     for (const auto& step : compiled.execution.steps) {
         if (step.op != SerialOp::attn_hyper_mix && step.op != SerialOp::mlp_hyper_mix && step.op != SerialOp::final_hyper_mix) continue;
@@ -6588,14 +6593,14 @@ void preflight_splitk_hyper_projection_model(const CompiledSerialExecution& comp
         const auto& down_access = resolve_dispatch_tensor_access(context, 1);
         const auto& down_manifest = manifest_tensor(context, down_access);
         const auto& down_owner = runtime_tensor(context, down_access);
-        if (down_manifest.ggml_type != 8U || down_manifest.dimensions != std::vector<std::uint64_t>{10240U,config.lowrank} || down_manifest.byte_size != down_bytes)
+        if (down_manifest.ggml_type != 8U || down_manifest.dimensions != std::vector<std::uint64_t>{kHcWidth,config.lowrank} || down_manifest.byte_size != down_bytes)
             throw std::invalid_argument("split-K HC preflight down tensor differs");
         checked({down_owner.address,down_owner.bytes},down_bytes,16U);
         const Span down{down_owner.address,down_bytes};Span inject{},injection{};
         if (!final) {
             const auto& access = resolve_dispatch_tensor_access(context, 3);
             const auto& manifest = manifest_tensor(context, access);const auto& owner = runtime_tensor(context, access);
-            if (manifest.ggml_type != 0U || manifest.dimensions != std::vector<std::uint64_t>{10240U,config.hc_count} || manifest.byte_size != inject_bytes)
+            if (manifest.ggml_type != 0U || manifest.dimensions != std::vector<std::uint64_t>{kHcWidth,config.hc_count} || manifest.byte_size != inject_bytes)
                 throw std::invalid_argument("split-K HC preflight injection tensor differs");
             checked({owner.address,owner.bytes},inject_bytes,16U);inject = {owner.address,inject_bytes};
             const auto output = resolve_dispatch_write(context, 1);const auto bytes = static_cast<std::uint64_t>(compiled.logical_rows) * config.hc_count * sizeof(float);
@@ -6617,7 +6622,7 @@ void preflight_splitk_hyper_projection_model(const CompiledSerialExecution& comp
             const auto& up_access=resolve_dispatch_tensor_access(context,2);
             const auto& up_manifest=manifest_tensor(context,up_access);
             const auto& up_owner=runtime_tensor(context,up_access);
-            if(norm_manifest.ggml_type!=0U || norm_manifest.dimensions!=std::vector<std::uint64_t>{10240U} ||
+            if(norm_manifest.ggml_type!=0U || norm_manifest.dimensions!=std::vector<std::uint64_t>{kHcWidth} ||
                 norm_manifest.byte_size!=40960U || !lane_chain_hyper_output_eligible(up_manifest,
                 config.hidden_size,config.hc_count,config.lowrank,up_owner.address%16U))
                 throw std::invalid_argument("deferred HC RMS whole-model norm/up contract differs");
@@ -6815,10 +6820,10 @@ MtpHyperPrepared mtp_hyper_prepare(const MtpNativeContext& c,MtpHyperRole role) 
         throw std::invalid_argument("MTP HC context or role is invalid");
     c.resources->validate_stage();
     if(c.model!=&c.resources->model() || c.plan!=&c.resources->plan() || c.tensors!=&c.resources->tensors() ||
-       c.position>=c.resources->context_capacity() || c.model->hidden_size!=2560U || c.model->hc_count!=4U || c.model->hc_lowrank!=320U)
+       c.position>=c.resources->context_capacity() || c.model->hidden_size!=kHcHidden || c.model->hc_count!=kHcStreams || c.model->hc_lowrank!=kHcRank)
         throw std::invalid_argument("MTP HC context is not bound to its actual canonical owner");
     const auto& t=*c.tensors;const auto& owner=*c.resources;
-    MtpHyperPrepared p{};p.h=2560U;p.c=4U;p.rank=320U;
+    MtpHyperPrepared p{};p.h=kHcHidden;p.c=kHcStreams;p.rank=kHcRank;
     if(role==MtpHyperRole::attention){p.input=owner.view(HipMtpBuffer::fused_wide);p.norm=t.attention_hc_norm;p.down=t.attention_hc_down;p.up=t.attention_hc_up;p.inject=t.attention_hc_inject;}
     else if(role==MtpHyperRole::mlp){p.input=owner.view(HipMtpBuffer::wide_work);p.norm=t.mlp_hc_norm;p.down=t.mlp_hc_down;p.up=t.mlp_hc_up;p.inject=t.mlp_hc_inject;}
     else {p.input=owner.view(HipMtpBuffer::wide_current);p.norm=t.head_norm;p.down=t.head_down;p.up=t.head_up;}
@@ -6880,7 +6885,7 @@ bool hip_mtp_hyper_mix_draft_rows_supported() {
 namespace {
 template<class Rows> void enqueue_mtp_hyper_rows(const Rows& rows,std::uint32_t count,const float* norm,const void* down,
     const float* inject,const void* up,float epsilon,void* raw_stream) {
-    constexpr unsigned h=2560U,streams=4U,rank=320U;
+    constexpr unsigned h=kHcHidden,streams=kHcStreams,rank=kHcRank;
     const auto stream=static_cast<hipStream_t>(raw_stream);
     const auto per_tile=std::min(count,kWindowRows);
     const auto tiles=(count+kWindowRows-1U)/kWindowRows;
@@ -6901,7 +6906,7 @@ template<class Rows> void enqueue_mtp_hyper_rows(const Rows& rows,std::uint32_t 
 }
 void enqueue_hip_mtp_hyper_mix_q8_rows(const HipMtpHyperDraftRows& views,std::uint32_t count,const float* norm,const void* down,
     const float* inject,const void* up,float epsilon,void* raw_stream) {
-    constexpr unsigned h=2560U,streams=4U;
+    constexpr unsigned h=kHcHidden,streams=kHcStreams;
     if(!count || count>kWindowRows || !raw_stream || !norm || !down || !up || !hip_mtp_hyper_mix_draft_rows_supported() ||
        (inject && reinterpret_cast<std::uintptr_t>(inject)%16U))
         throw std::invalid_argument("MTP draft HC batch views, size, stream or configuration are invalid");
@@ -6917,7 +6922,7 @@ void enqueue_hip_mtp_hyper_mix_q8_rows(const HipMtpHyperDraftRows& views,std::ui
 }
 void enqueue_hip_mtp_hyper_mix_q8_prime_rows(const HipMtpHyperPrimeRows& views,std::uint32_t count,const float* norm,
     const void* down,const float* inject,const void* up,float epsilon,void* raw_stream) {
-    constexpr unsigned h=2560U,streams=4U;
+    constexpr unsigned h=kHcHidden,streams=kHcStreams;
     if(!count || count>hip_mtp_prime_rows_max || !raw_stream || !norm || !down || !up ||
        !hip_mtp_hyper_mix_draft_rows_supported() || (inject && reinterpret_cast<std::uintptr_t>(inject)%16U) ||
        !views.input.base || !views.output.base || !views.workspace.base || views.workspace.base%16U ||
@@ -6956,7 +6961,7 @@ void launch_hip_mtp_hyper_mix_draft_rows(std::span<const MtpNativeContext> conte
 }
 void enqueue_hip_mtp_hyper_mix_q8(const std::uint16_t* input,const float* norm,const void* down,const void* inject,const void* up,
     float* workspace,float* injection,std::uint16_t* output,float epsilon,bool draft,void* raw_stream) {
-    constexpr unsigned h=2560U,streams=4U,rank=320U;
+    constexpr unsigned h=kHcHidden,streams=kHcStreams,rank=kHcRank;
     if(!input || !norm || !down || !up || !workspace || !output || !raw_stream || (inject==nullptr)!=(injection==nullptr) ||
        (draft && inject && reinterpret_cast<std::uintptr_t>(inject)%16U))
         throw std::invalid_argument("MTP HC raw views are incomplete");
