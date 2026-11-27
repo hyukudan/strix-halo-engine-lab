@@ -7480,3 +7480,20 @@ grid dimension, so the groups read each plane row together; the screen is now si
 | Inkling 2 Mini | bound: HIP served cohort passes (the CUDA cohort already sizes its screen for the cohort width) |
 | Hy4 Flash | not bound: no served cohort screened head on HIP |
 | Nemotron 3.5 Bolt E4B | not bound: no served cohort screened head on HIP |
+
+<a id="inkling-hip-exact-drafter-selector"></a>
+## Inkling 2 Mini HIP EXACT CLI: the MTP sidecar and DFlash 2 under the shared per-regime selector
+
+**Engine:** `inkling2-mini`. **Control:** `--dflash DIR|off`, `--dspark FILE|off`. **Default:** on (HIP, EXACT, CLI resident route).
+
+With both drafters beside the checkpoint (the MTP sidecar and the `dflash2` block-diffusion directory), the HIP EXACT CLI
+binds both and runs them under the shared per-regime selector; the block arm wins ties. FAST prose was slower under the
+selector (-5.1 % in both repetitions), so FAST, TURBO and CUDA keep the MTP sidecar alone and bind the block drafter only
+when it is named.
+
+- **Shared home:** include/strix/spec/arm_selector.hpp, src/serve/serial_generation_cli.cpp (chain_arms), include/strix/spec/drafter_source.hpp; binding in apps/inkling2_mini_gpu_main.hpp
+- **Tier and regime:** EXACT; one-request CLI decode with speculation
+- **Exactness evidence:** drafters only propose; ids equal with and without the selector (code and prose)
+- **Off switch:** `--dflash off` or `--dspark off`
+- **Measured gain:** gfx1151, 255 decode tokens: code 53.1 -> 61.0 tok/s (+14.8 %, two repetitions each), prose 29.3 -> 30.8 / 32.1 (+5.1..+9.6 %). FAST code 46.2 -> 48.7 / 50.9, FAST prose 41.2 -> 39.1 / 39.0 (stays off).
+- **Preconditions:** HIP build, EXACT, greedy auto speculation, both drafters present and valid

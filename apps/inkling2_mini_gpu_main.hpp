@@ -174,8 +174,8 @@ public:
     }
 
     // Both drafters bound: the incumbent MTP sidecar (arm 0, the fallback) and the block drafter under the shared
-    // per-regime selector. The block arm declares wins_ties from its device receipts (ink_df3: never slower than the
-    // sidecar on code / reasoning / prose, RTX and gfx1151) and needs no probe gate (its pass costs ~1 ms more).
+    // per-regime selector. The block arm declares wins_ties from its device receipts (never slower than the sidecar on
+    // code / reasoning / prose) and needs no probe gate (its pass costs ~1 ms more).
     std::vector<ChainArm> chain_arms(std::uint32_t anchor, std::uint32_t position) override {
         if (!dflash_ || !drafter_) return {};
         drafter_->start(anchor, position);
@@ -400,7 +400,7 @@ int main(int argc, char** argv) {
         std::cerr << "usage: " << executable
                   << " MODEL.safetensors (TOKEN [TOKEN ...] | --prompt TEXT | --messages FILE) [--tokenizer FILE]"
                      " [--prefill-chunk N] [--packed-decode | --grouped-decode] [--generate N] [--logits FILE]"
-                     " [--speculation off|auto|verify|lookup] [--dspark FILE] [--dflash DIR|off]"
+                     " [--speculation off|auto|verify|lookup] [--dspark FILE|off] [--dflash DIR|off]"
                      " [--step-graph | --no-step-graph"
 #if defined(STRIX_INKLING2_STEP_PROGRAM)
                      " | --step-program (default for decode)"
@@ -513,13 +513,24 @@ int main(int argc, char** argv) {
         // reserved for it; a directory it refuses is declined with its reason). When both bind, both run under the
         // shared per-regime selector (DeviceCliDecoder::chain_arms). An explicit --dspark FILE / off excludes the
         // registry's block drafter; --dflash off keeps the MTP sidecar alone, --dflash DIR --dspark off the block alone.
+        // HIP EXACT binds the block drafter beside the checkpoint by default: on gfx1151 the selector over both drafters
+        // was never slower than the MTP sidecar alone there (code 53.1 -> 61.0 tok/s, prose 29.3 -> 30.8 / 32.1, ids
+        // equal). FAST keeps the sidecar alone (code +5.4 %, but prose 41.2 -> 39.0, -5.1 % in both repetitions) until
+        // the selector policy is never slower there, and CUDA keeps it until its own device receipt: in those runs the
+        // block drafter binds only when named, and --dflash DIR alone runs it alone.
+#if defined(__HIPCC__)
+        const bool block_by_default = options.tier.profile == strix::profile::Name::standard;
+#else
+        constexpr bool block_by_default = false;
+#endif
         const bool may_draft = options.generation.speculation == serve::CliSpeculation::automatic &&
                                !options.gate_manifest && !options.generation.tokenize_file &&
                                !token_sampling_enabled(options.generation.sampling);
         const auto block_drafter = [&] {
             auto found = strix::spec::resolve_drafter_dir(
                 {.file = options.dflash ? std::string_view(options.dflash) : std::string_view{},
-                 .off = options.dflash_off || (options.dflash == nullptr && (options.dspark_off || options.dspark != nullptr)),
+                 .off = options.dflash_off ||
+                        (options.dflash == nullptr && (!block_by_default || options.dspark_off || options.dspark != nullptr)),
                  .speculating = may_draft},
                 argv[1], strix::model_data::inkling2_mini::speculation::block_drafter);
             if (found.source == strix::spec::DrafterSource::beside_model)
@@ -530,7 +541,7 @@ int main(int argc, char** argv) {
         const auto drafter = [&] {
             auto found = strix::spec::resolve_drafter_file(
                 {.file = options.dspark ? std::string_view(options.dspark) : std::string_view{},
-                 .off = options.dspark_off,
+                 .off = options.dspark_off || (!block_by_default && options.dflash != nullptr && options.dspark == nullptr),
                  .speculating = may_draft},
                 argv[1], strix::model_data::inkling2_mini::speculation::drafter);
             if (found.source == strix::spec::DrafterSource::beside_model)
