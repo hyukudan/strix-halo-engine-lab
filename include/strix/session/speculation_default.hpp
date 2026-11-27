@@ -48,11 +48,12 @@ inline bool speculation_opt_out_argument(std::string_view argument) {
 // turned the drafter off could never win), so they are neutral too.
 inline bool speculation_neutral_value_option(std::string_view argument) {
     return argument == "--profile" || argument == "--kv" || argument == "--prompt-ids" || argument == "--turbo-weights" ||
-        argument == "--turbo-weight-bits" || argument == "--turbo-weights-pack";
+        argument == "--turbo-weight-bits" || argument == "--turbo-weights-pack" || argument == "--turbo-weights-profile-pack";
 }
 inline bool speculation_neutral_inline_option(std::string_view argument) {
     return argument.starts_with("--profile=") || argument.starts_with("--kv=") || argument.starts_with("--turbo-weights=") ||
-        argument.starts_with("--turbo-weight-bits=") || argument.starts_with("--turbo-weights-pack=");
+        argument.starts_with("--turbo-weight-bits=") || argument.starts_with("--turbo-weights-pack=") ||
+        argument.starts_with("--turbo-weights-profile-pack=");
 }
 inline bool speculation_environment_off(const char* value) {
     const std::string_view text = value ? value : "";

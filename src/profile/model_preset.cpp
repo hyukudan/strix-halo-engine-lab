@@ -1,4 +1,5 @@
 #include "strix/profile/model_preset.hpp"
+#include "strix/turbo.hpp"
 
 #include <algorithm>
 #include <type_traits>
@@ -95,6 +96,7 @@ ModelPreset resolve_model_preset(const model_description::ModelDescription& desc
     const std::string path = "presets." + std::string(tier_word(requested));
     auto column = requested;
     std::string kv = "resolver";
+    std::string weights_pack;  // a calibrated pack resident beside the model (TURBO only)
     if (presets) {
         const auto* selected = description.find(path);
         if (!selected) throw std::invalid_argument("missing " + path);
@@ -102,6 +104,7 @@ ModelPreset resolve_model_preset(const model_description::ModelDescription& desc
             for (const auto& [key, item] : table(value, field)) {
                 if (key == "levers") column = parse_tier(setting(item, std::string(field) + ".levers"));
                 else if (key == "kv") kv = setting(item, std::string(field) + ".kv");
+                else if (key == "weights_pack") weights_pack = setting(item, std::string(field) + ".weights_pack");
                 else if (base && (key == "hip" || key == "cuda")) (void)table(item, key);
                 else throw std::invalid_argument("unknown preset field: " + std::string(field) + "." + key);
             }
@@ -118,6 +121,8 @@ ModelPreset resolve_model_preset(const model_description::ModelDescription& desc
         throw std::invalid_argument(path + " selects a higher tier");
     if (kv != "resolver" && kv != "native" && kv != "fp8")
         throw std::invalid_argument(path + ".kv must be resolver, native or fp8");
+    if (!weights_pack.empty() && (requested != Name::turbo || weights_pack.find_first_of("/\\") != std::string::npos))
+        throw std::invalid_argument(path + ".weights_pack is a file name beside the model, in the turbo preset only");
 
     Json storage_policy = Json::Object{{"policy", kv}};
     if (const auto* storage = description.find("presets.native_kv"))
@@ -138,7 +143,8 @@ ModelPreset resolve_model_preset(const model_description::ModelDescription& desc
     auto decision = multi_device::select(policy, query);
     decision.legacy = multi_device::legacy_overrides(policy);
     config.set("multi_device", decision.json(policy, query));
-    return {requested, column, std::move(kv), std::move(config), std::move(decision)};
+    if (!weights_pack.empty()) config.set("weights_pack", weights_pack);
+    return {requested, column, std::move(kv), std::move(config), std::move(decision), std::move(weights_pack)};
 }
 
 ModelPreset resolve_replica_router(const model_description::ModelDescription& description, std::optional<Name> tier,
@@ -206,6 +212,13 @@ void ModelPreset::append_options(std::vector<std::string>& args) const {
     if (kv != "resolver" && !has("--kv") && !has("--prefill-attn8") && !has("--decode-attn8")) {
         args.emplace_back("--kv");
         args.push_back(kv);
+    }
+    // The preset's resident pack is a default, not a request: any explicit weight source, width or pack wins, and the
+    // engine keeps native weights (with a note) when the file is absent.
+    if (requested == Name::turbo && !weights_pack.empty() && !has(turbo::kWeightsOption) &&
+        !has(turbo::kBitsOption) && !has(turbo::kPackOption) && !has(turbo::kProfilePackOption)) {
+        args.emplace_back(turbo::kProfilePackOption);
+        args.push_back(weights_pack);
     }
 }
 

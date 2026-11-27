@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
 #include <functional>
 #include <optional>
 #include <stdexcept>
@@ -40,6 +41,9 @@ inline constexpr std::string_view kPackEnv = "STRIX_TURBO_WEIGHTS_PACK";
 inline constexpr std::string_view kWeightsOption = "--turbo-weights";
 inline constexpr std::string_view kBitsOption = "--turbo-weight-bits";
 inline constexpr std::string_view kPackOption = "--turbo-weights-pack";
+// The model's TURBO weight default (preset data, projected by the launcher): a calibrated pack resident beside the
+// model. Not an explicit request: it applies only when nothing names a weight source, width or pack.
+inline constexpr std::string_view kProfilePackOption = "--turbo-weights-profile-pack";
 // Cache namespace of the resolved TURBO run, exported by the profile so every cache-key builder of the process
 // (prefix, session, drafter) reads one value; empty or unset outside TURBO (legacy namespaces unchanged).
 inline constexpr std::string_view kCacheNamespaceEnv = "STRIX_TURBO_CACHE_NS";
@@ -67,6 +71,7 @@ struct WeightCaps {
 
 struct WeightsRequest {  // explicit CLI spellings (take_options fills it)
     std::optional<std::string> source{}, bits{}, pack{};
+    std::optional<std::string> profile_pack{};  // kProfilePackOption: the preset's default pack path (not explicit)
 };
 
 inline bool has_weight_request(const WeightsRequest& request, const Env& env) {
@@ -85,6 +90,7 @@ struct Weights {
     std::string element = "int";                      // onfly element family (WeightCaps::onfly_element)
     std::string origin = "builtin";                   // builtin | profile | env | cli
     std::string reason{};                             // why requested != effective; empty: honoured
+    std::string note{};                               // a profile default that did not apply (honoured, printed)
 
     [[nodiscard]] bool honoured() const { return reason.empty(); }
     // Named identity per source, element and width: "native", "onfly-int4-rtn-g32", "onfly-nvfp4-rtn-g16",
@@ -103,6 +109,7 @@ struct Weights {
         std::string out = "turbo weights requested " + requested_text() + " (" + origin + ") effective " + identity();
         if (!pack.empty()) out += " pack " + pack;
         if (!reason.empty()) out += " refused: " + reason;
+        if (!note.empty()) out += " (" + note + ")";
         return out + "\n";
     }
     void require_honoured() const {
@@ -120,10 +127,24 @@ inline Weights resolve_weights(bool turbo, const WeightsRequest& cli, const Env&
     };
     Weights w;
     std::string bits_origin = "builtin", pack_origin = "builtin";
-    if (const auto s = pick(cli.source, kWeightsEnv, w.origin)) w.requested = parse_source(*s);
-    else if (turbo) w.origin = "profile";  // the turbo column of the toggle: native
+    const auto source = pick(cli.source, kWeightsEnv, w.origin);
+    if (source) w.requested = parse_source(*source);
+    else if (turbo) w.origin = "profile";  // the turbo column of the toggle: native unless the preset names a pack
     const auto bits = pick(cli.bits, kBitsEnv, bits_origin);
     if (const auto p = pick(cli.pack, kPackEnv, pack_origin)) w.pack = *p;
+    // The preset's resident pack: converted when nothing explicit names a source, width or pack and this build loads
+    // converted packs; an absent file or a build without the loader keeps native and says so (never a refusal).
+    if (turbo && !source && !bits && w.pack.empty() && cli.profile_pack && !cli.profile_pack->empty()) {
+        std::error_code ec;
+        if (!caps.source[static_cast<unsigned>(Source::converted)])
+            w.note = "profile pack not loaded by this build: " + *cli.profile_pack;
+        else if (!std::filesystem::is_regular_file(*cli.profile_pack, ec))
+            w.note = "profile pack absent: " + *cli.profile_pack;
+        else {
+            w.requested = Source::converted;
+            w.pack = *cli.profile_pack;
+        }
+    }
     if (w.requested != Source::native) w.requested_bits = bits ? parse_bits(*bits) : 4U;
     else if (bits) w.reason = "a weight width applies to onfly or converted only";
     if (w.requested == Source::native) {

@@ -280,12 +280,12 @@ inline bool take_option(int argc, char** argv, int& i, std::optional<Name>& prof
     const auto key = arg.substr(0, equal);
     if (arg == "--allow-pending") { inputs.allow_pending = true; return true; }
     namespace tb = ::strix::profile::turbo;
-    if (key == tb::kWeightsOption || key == tb::kBitsOption || key == tb::kPackOption) {
+    if (key == tb::kWeightsOption || key == tb::kBitsOption || key == tb::kPackOption || key == tb::kProfilePackOption) {
         const auto value = equal != std::string_view::npos ? arg.substr(equal + 1U) :
             (i + 1 < argc ? std::string_view(argv[++i]) : std::string_view{});
         if (value.empty() || value.starts_with("--")) throw std::invalid_argument(std::string(key) + " requires a value");
         (key == tb::kWeightsOption ? inputs.weights.source : key == tb::kBitsOption ? inputs.weights.bits :
-            inputs.weights.pack) = std::string(value);
+            key == tb::kPackOption ? inputs.weights.pack : inputs.weights.profile_pack) = std::string(value);
         return true;
     }
     const Lever* lever = nullptr;

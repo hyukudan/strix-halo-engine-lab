@@ -17,6 +17,7 @@ struct ModelPreset {
     std::string kv;
     serve::Json config;
     multi_device::Decision placement;   // also config["multi_device"]
+    std::string weights_pack{};         // presets.turbo[.backend].weights_pack: resident pack beside the model
 
     void append_options(std::vector<std::string>& args) const;
 };

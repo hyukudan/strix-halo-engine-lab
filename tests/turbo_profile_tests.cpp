@@ -8,6 +8,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <map>
 #include <stdexcept>
 #include <string>
@@ -329,6 +331,56 @@ void qwen_adapter() {
             "qwen refuses converted weights without their pack");
 }
 
+// The preset's resident pack (kProfilePackOption) is a TURBO default, never a request: present -> converted with origin
+// profile; absent or not loadable by the build -> native, honoured, with a note; anything explicit wins; never outside
+// TURBO.
+void profile_pack_default() {
+    namespace pq = strix::qwen::profile;
+    t::WeightCaps loads{};
+    loads.source = {true, true, true};
+    loads.bits[4] = true;
+    const auto env0 = [](const char*) -> const char* { return nullptr; };
+    const auto dir = std::filesystem::temp_directory_path() / "strix-turbo-profile-pack-test";
+    std::filesystem::create_directories(dir);
+    const auto present = (dir / "model.lowbit-pack").string();
+    { std::ofstream(present) << "pack"; }
+    const auto absent = (dir / "absent.lowbit-pack").string();
+    t::WeightsRequest r{};
+    r.profile_pack = present;
+    auto w = t::resolve_weights(true, r, env0, loads);
+    require(w.honoured() && w.effective == t::Source::converted && w.pack == present && w.origin == "profile" &&
+                w.identity() == "converted-int4" && w.note.empty(), "turbo preset pack present: converted, origin profile");
+    w = t::resolve_weights(false, r, env0, loads);
+    require(w.honoured() && w.identity() == "native" && w.note.empty(), "the preset pack never applies outside turbo");
+    r.source = "native";
+    w = t::resolve_weights(true, r, env0, loads);
+    require(w.honoured() && w.identity() == "native" && w.origin == "cli", "an explicit source wins over the preset pack");
+    r.source.reset();
+    r.pack = "/explicit/x.lowbit-pack";
+    w = t::resolve_weights(true, r, env0, loads);
+    require(!w.honoured() && w.reason.find("converted only") != std::string::npos,
+            "an explicit pack is a request: it never borrows the preset's converted default");
+    r.pack.reset();
+    r.profile_pack = absent;
+    w = t::resolve_weights(true, r, env0, loads);
+    require(w.honoured() && w.identity() == "native" && w.note.find("absent") != std::string::npos &&
+                w.describe().find("absent") != std::string::npos, "absent preset pack: native with a printed note");
+    r.profile_pack = present;
+    w = t::resolve_weights(true, r, env0, pq::kCudaWeightCaps);
+    require(w.honoured() && w.identity() == "native" && w.note.find("not loaded") != std::string::npos,
+            "a build without the converted loader keeps native with a note");
+    pq::Inputs inputs;
+    char a0[] = "x", a1[] = "--turbo-weights-profile-pack", a2[] = "m.lowbit-pack";
+    char* argv[] = {a0, a1, a2};
+    int i = 1;
+    std::optional<pq::Name> profile;
+    require(pq::take_option(3, argv, i, profile, inputs) && i == 2 && inputs.weights.profile_pack == "m.lowbit-pack" &&
+                !inputs.weights.source, "the Qwen intake reads the preset pack as a default, not a source");
+    require(strix::session::speculation_neutral_value_option("--turbo-weights-profile-pack"),
+            "the preset pack is speculation-neutral like every weight-format switch");
+    std::filesystem::remove_all(dir);
+}
+
 }  // namespace
 
 int main() {
@@ -342,6 +394,7 @@ int main() {
         turbo_column();
         off_recovers_reference();
         weights_toggle();
+        profile_pack_default();
         cache_keys();
         rank_agreement_and_one_resolution();
         qwen_adapter();

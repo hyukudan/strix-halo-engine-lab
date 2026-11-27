@@ -292,6 +292,23 @@ void model_presets(const fs::path& data, const ExecutableExists& exists) {
         }
     }
 
+    const auto qwen = strix::model_description::load((data / "models/qwen3.8-flash-next.toml").string());
+    const auto qwen_turbo = profile::resolve_model_preset(qwen, Name::turbo, "hip");
+    std::vector<std::string> qwen_args;
+    qwen_turbo.append_options(qwen_args);
+    require(!qwen_turbo.weights_pack.empty() &&
+                qwen_args == std::vector<std::string>{"--profile", "turbo", "--turbo-weights-profile-pack", qwen_turbo.weights_pack},
+            "Qwen HIP TURBO projects its resident calibrated pack as a default");
+    std::vector<std::string> qwen_explicit{"--turbo-weights", "native"};
+    qwen_turbo.append_options(qwen_explicit);
+    require(std::ranges::count(qwen_explicit, std::string("--turbo-weights-profile-pack")) == 0,
+            "an explicit weight source keeps the preset pack out");
+    for (const auto& [tier, backend] : {std::pair{Name::fast, "hip"}, std::pair{Name::turbo, "cuda"}}) {
+        std::vector<std::string> args;
+        profile::resolve_model_preset(qwen, tier, backend).append_options(args);
+        require(std::ranges::count(args, std::string("--turbo-weights-profile-pack")) == 0,
+                "the resident pack is the HIP TURBO preset only");
+    }
     const auto minimax = strix::model_description::load((data / "models/minimax-m3.1-flash.toml").string());
     std::vector<std::string> minimax_args;
     profile::resolve_model_preset(minimax, Name::turbo, "hip").append_options(minimax_args);

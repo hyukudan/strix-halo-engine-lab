@@ -28,6 +28,7 @@
 #include "strix/wave_router_contract.hpp"
 #include <algorithm>
 #include <array>
+#include <filesystem>
 #include <memory>
 #include "strix/token_sampling.hpp"
 #include "strix/serve/job_sampling.hpp"
@@ -3993,6 +3994,10 @@ inline Options parse_options(
     const bool defer_serve_prefill = http_prefill_pending(options);
     if (!defer_serve_prefill) validate_prefix_state_cache(options);
     validate_http_serve(options, defer_serve_prefill);
+    // The preset's resident pack is named beside the model file.
+    if (auto& pack = options.product_profile_inputs.weights.profile_pack;
+        pack && !pack->empty() && std::filesystem::path(*pack).is_relative())
+        *pack = (std::filesystem::path(options.model_path).parent_path() / *pack).string();
     // Regime of the FAST cells (strix/qwen_profile_table.hpp fast_regimes): the CLI prompt, or the serving context bound.
     options.product_profile_inputs.max_prompt_tokens =
         options.tokens.empty() ? options.context_tokens : static_cast<std::uint64_t>(options.tokens.size());

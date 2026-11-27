@@ -124,6 +124,9 @@ levers = "fast"
 # FAST where their timing receipt covers the regime.
 [presets.turbo.hip]
 levers = "turbo"
+# Calibrated low-bit decode rows (q4_g64, technique per matrix chosen on calibration statistics) for the GDN in / out
+# projections and the shared expert; attention projections stay Q8_0. Resident beside the model file; absent: native.
+weights_pack = "Qwen3.8-Flash-Next-UD-Q4_K_XL-merged.turbo-q4g64-v1.lowbit-pack"
 
 # Multi-device placement, resolved by the shared profile resolver (strix-serve --device-count N, strix-router
 # --description). The whole model fits one node, so two nodes serve independent requests as replicas behind

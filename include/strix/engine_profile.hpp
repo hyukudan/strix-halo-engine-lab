@@ -552,7 +552,8 @@ inline constexpr std::string_view kIdentityVariantOption = "--identity-variant";
             if (!v.option.starts_with("--") || v.option.size() == 2U ||
                 v.option.find_first_of("@, =\t\r\n") != std::string_view::npos ||
                 v.option == "--profile" || v.option == "--allow-pending" || v.option == kIdentityVariantOption ||
-                v.option == turbo::kWeightsOption || v.option == turbo::kBitsOption || v.option == turbo::kPackOption)
+                v.option == turbo::kWeightsOption || v.option == turbo::kBitsOption || v.option == turbo::kPackOption ||
+                v.option == turbo::kProfilePackOption)
                 return false;
             for (const auto& lever : levers) if (v.option == lever.option) return false;
         }
@@ -2002,13 +2003,15 @@ inline void take_options(const Engine& engine, std::vector<std::string>& args, I
             request_variant(engine, inputs, a, VariantOrigin::cli);
             continue;
         }
-        if (key == turbo::kWeightsOption || key == turbo::kBitsOption || key == turbo::kPackOption) {
+        if (key == turbo::kWeightsOption || key == turbo::kBitsOption || key == turbo::kPackOption ||
+            key == turbo::kProfilePackOption) {
             std::string value;
             if (equal != std::string::npos) value = a.substr(equal + 1U);
             else if (i + 1 < args.size()) value = args[++i];
             if (value.empty()) throw std::invalid_argument(key + " requires a value");
             auto& slot = key == turbo::kWeightsOption ? inputs.weights.source :
-                key == turbo::kBitsOption ? inputs.weights.bits : inputs.weights.pack;
+                key == turbo::kBitsOption ? inputs.weights.bits :
+                key == turbo::kPackOption ? inputs.weights.pack : inputs.weights.profile_pack;
             slot = value;
             continue;
         }
