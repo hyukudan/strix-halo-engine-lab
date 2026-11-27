@@ -1,6 +1,6 @@
 #pragma once
 
-#include "glm_rank_defaults.hpp"
+#include "glm/load/glm_rank_defaults.hpp"
 #include "glm_route_levers.hpp"
 #include "attn_core/index_score_mode.hpp"
 #include "glm/xfer/glm_xfer.hpp"
