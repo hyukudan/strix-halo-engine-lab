@@ -132,7 +132,7 @@ struct Draft final : e::DraftSession {
 Json normalize(const Json& j, const std::string& key={}) {
     // Keep shapes and every scheduler/cache/draft/state value. Only clocks and
     // measured durations are masked, including timing arrays in cost receipts.
-    if(key=="created" || key.ends_with("_ms") || key.find("_ms_")!=std::string::npos) return Json(0);
+    if(key=="created" || key.ends_with("_ms") || key.find("_ms_")!=std::string::npos || key=="decode_tokens_per_second") return Json(0);
     if(key=="id" && j.is_string() && j.as_string().starts_with("chatcmpl-g4-")) return Json("chatcmpl-g4-ID");
     // Host facts (kernel release, driver parameter) exist only on some platforms.
     const auto host_fact=[](const std::string& k){ return k=="kernel" || k=="amdgpu.iommu_perfopt"; };
