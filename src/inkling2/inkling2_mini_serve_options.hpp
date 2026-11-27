@@ -3,7 +3,9 @@
 #include "inkling2_mini_resident_route.hpp"
 #include "inkling2_mini_schedule.hpp"
 #include "inkling2_mini_weight_options.hpp"
+#include "strix/env_flags.hpp"
 #include "strix/serve/cohort_decode.hpp"
+#include "strix/serve/prefill_group.hpp"
 #include "strix/serve/row_budget.hpp"
 
 #include <cstdint>
@@ -155,6 +157,23 @@ constexpr bool mini_served_tall_chunk_admitted(bool hip, profile::Name tier, boo
            !decode_only_image && context > kMiniServedHeldBackChunk;
 }
 
+// Grouped prompt service policy: waiting whole prompts of up to one admitted chunk share a group work of at most
+// kMiniGroupPasses chunks of rows (the decoder's capacity decides where it may run: the EXACT BF16 tile rows of the served
+// route, serve::PrefillGroupCapacity). On by default; STRIX_SERVE_PREFILL_GROUP=0 serves every prompt alone again,
+// _MEMBERS / _ROWS tighten the limits. `env(name)` returns the value or an empty string.
+template <class Env>
+inline serve::PrefillGroupPolicy mini_serve_prompt_group(unsigned chunk, Env env) {
+    auto policy = serve::PrefillGroupPolicy::from_env(env, serve::PrefillGroupPolicy::Mode::automatic, chunk + 1U);
+    if (env("STRIX_SERVE_PREFILL_GROUP_ROWS").empty()) policy.max_rows = kMiniGroupPasses * chunk;
+    return policy;
+}
+inline serve::PrefillGroupPolicy mini_serve_prompt_group(unsigned chunk) {
+    return mini_serve_prompt_group(chunk, [](const char* name) -> std::string {
+        const char* value = ::strix::envcfg::text(name);
+        return value ? std::string(value) : std::string();
+    });
+}
+
 // The served cohort's prompt service: alone, a prompt runs the admitted chunk per call (prompt_slice); beside a
 // decoding lane, pieces of kMiniServeDecodingRows (the incumbent 128-row mixed-service bound) cut inside those chunks
 // where the decoder's piece rule keeps the bits (CohortBackend::prompt_piece_rule: the HIP command line's route, the
@@ -165,6 +184,7 @@ inline serve::CohortConfig mini_serve_scheduling(unsigned chunk, serve::PromptPi
     config.context_draft = false;
     config.max_draft = 0;
     config.prompt_slice = chunk;
+    config.prompt_group = mini_serve_prompt_group(chunk);
     serve::bind_mixed_service(config, pieces, rule, chunk);
     return config;
 }

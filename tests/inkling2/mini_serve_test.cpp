@@ -83,6 +83,30 @@ private:
 
 using FixtureCohort = sv::FixedKvCohort<FixtureDecoder>;
 
+// The served prompt group policy: on by default for whole prompts of up to one chunk, the group at most two chunks of
+// rows, the shared switch turns it off, the shared limits tighten it.
+void prompt_group_policy() {
+    const auto env = [](std::map<std::string, std::string> values) {
+        return [values = std::move(values)](const char* name) {
+            const auto it = values.find(name);
+            return it == values.end() ? std::string() : it->second;
+        };
+    };
+    const auto on = mini::mini_serve_prompt_group(8192U, env({}));
+    require(on.groups() && on.short_rows == 8193U && on.max_rows == mini::kMiniGroupPasses * 8192U &&
+                on.max_members == 8U && !on.explicit_mode,
+            "prompt group: on by default, whole prompts of up to one chunk, one chunk of rows per sub-pass");
+    require(!mini::mini_serve_prompt_group(8192U, env({{"STRIX_SERVE_PREFILL_GROUP", "0"}})).groups(),
+            "prompt group: STRIX_SERVE_PREFILL_GROUP=0 serves every prompt alone");
+    const auto tight = mini::mini_serve_prompt_group(
+        2048U, env({{"STRIX_SERVE_PREFILL_GROUP_ROWS", "3000"}, {"STRIX_SERVE_PREFILL_GROUP_MEMBERS", "4"}}));
+    require(tight.max_rows == 3000U && tight.max_members == 4U && tight.short_rows == 2049U,
+            "prompt group: the shared limits tighten it");
+    const auto rule = mini::mini_prefill_piece_rule(true, true);
+    require(mini::mini_serve_scheduling(8192U, rule).prompt_group.short_rows == 8193U,
+            "prompt group: the served scheduling carries it");
+}
+
 void admission() {
     require(mini::mini_served_prompt_emits_first(false, false, true),
             "a calibrated decode image serves prompts emits-first on the default served route");
@@ -1211,6 +1235,7 @@ int main(int argc, char** argv) try {
     set_image_env(nullptr);
     set_round_fold_env(nullptr);
     set_cli_route_env(nullptr);
+    prompt_group_policy();
     admission();
     sampling();
     for (const auto* backend : {"hip", "cuda"}) {

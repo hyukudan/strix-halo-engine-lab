@@ -3,8 +3,11 @@
 #include "strix/exec/descriptor.hpp"
 #include "strix/serve/decode_form.hpp"
 
+#include <cstddef>
+#include <span>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace strix::inkling2 {
 
@@ -193,6 +196,41 @@ constexpr MiniResidentRoute mini_resident_chunk_route(MiniAppendKind kind, unsig
 // the verify-kind cohorts of up to kMiniMaxVerifyRows lanes; a lane's bits do not depend on the cohort width.
 constexpr bool mini_packed_cohort_rows(bool hip, bool packed_decode, bool served_route_rows) noexcept {
     return packed_decode && (served_route_rows || !hip);
+}
+
+// Grouped prompt service (HIP, the served route lever): waiting whole prompts run as ONE grouped work, their rows
+// concatenated in passes of at most one call chunk. A prompt of at most kMiniGroupSoloRows rows runs alone: dense BF16
+// rows up to core::gemv_rows::max_rows take the tight-rows body, a pass of more rows the tile body, so the member's own
+// row count decides its bits and only a member the tile body serves in its solo call may share a pass. A member also
+// has to be ONE solo call chunk (rows <= the call chunk), which no tail rule splits.
+inline constexpr unsigned kMiniGroupSoloRows = 16U;
+// Sub-passes of one group work while no lane decodes (serve::PrefillGroupCapacity::passes): a burst of up to eight whole
+// prompts (each at most one call chunk) starts decoding together. With fewer passes the members left out of the first
+// group meet decoding lanes and fall back to bounded pieces one prompt at a time (two passes at a 4096-row chunk left
+// two of eight burst prompts there). The trade: the burst's first ids arrive together, after the whole group work.
+inline constexpr unsigned kMiniGroupPasses = 8U;
+
+// Route class of a prompt of `rows` rows for grouping: 1 = alone only (tight-rows body), 0 = groupable.
+constexpr unsigned mini_group_route_class(unsigned long long rows) noexcept { return rows <= kMiniGroupSoloRows ? 1U : 0U; }
+
+// Whole members, in order, packed into passes of at most `chunk` rows: the member count of each pass (a pass never
+// splits a member; a member of more than `chunk` rows is refused with an empty result).
+inline std::vector<unsigned> mini_group_pass_members(std::span<const std::size_t> rows, unsigned chunk) {
+    std::vector<unsigned> passes;
+    std::size_t used = 0;
+    unsigned count = 0;
+    for (const auto n : rows) {
+        if (n == 0U || n > chunk) return {};
+        if (count != 0U && used + n > chunk) {
+            passes.push_back(count);
+            used = 0;
+            count = 0;
+        }
+        used += n;
+        ++count;
+    }
+    if (count != 0U) passes.push_back(count);
+    return passes;
 }
 
 }  // namespace strix::inkling2

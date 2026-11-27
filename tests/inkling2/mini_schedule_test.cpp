@@ -6,6 +6,7 @@
 #include "strix/serve/serial_generation_cli.hpp"
 #include "strix/session/prompt_windows.hpp"
 #include <array>
+#include <initializer_list>
 #include <span>
 #include <algorithm>
 #include <cstddef>
@@ -218,9 +219,34 @@ int served_prefill_gate() {
     return failed;
 }
 
+// Grouped prompt service: whole members packed in order into passes of at most one chunk; a prompt of at most the
+// tight-rows bound is alone only; a member of more than one chunk is refused.
+int prompt_group_gate() {
+    using namespace strix::inkling2;
+    static_assert(mini_group_route_class(10U) == 1U && mini_group_route_class(kMiniGroupSoloRows) == 1U &&
+                  mini_group_route_class(kMiniGroupSoloRows + 1U) == 0U && mini_group_route_class(8192U) == 0U);
+    const auto packed = [](std::initializer_list<std::size_t> rows, unsigned chunk) {
+        const std::vector<std::size_t> v(rows);
+        return mini_group_pass_members(v, chunk);
+    };
+    using Counts = std::vector<unsigned>;
+    // the burst of the receipt (4 x 666 and 4 x 1885 rows = 10,204): two 8192-row passes, 6 + 2 members
+    if (packed({666U, 1885U, 666U, 1885U, 666U, 1885U, 666U, 1885U}, 8192U) != Counts{6U, 2U}) return 21;
+    if (packed({666U, 1885U, 666U, 1885U, 666U, 1885U, 666U, 1885U}, 12288U) != Counts{8U}) return 27;
+    // two passes when the members exceed one chunk, never splitting a member
+    if (packed({1885U, 1885U, 666U, 1885U, 1000U}, 4096U) != Counts{2U, 3U}) return 22;
+    if (packed({4096U, 17U}, 4096U) != Counts{1U, 1U}) return 23;
+    if (!packed({40U, 8193U}, 8192U).empty() || !packed({40U, 0U}, 8192U).empty()) return 24;
+    if (!packed({}, 8192U).empty()) return 25;
+    std::size_t total = 0;
+    for (const auto n : packed({100U, 200U, 300U, 4000U, 17U, 1000U, 3500U}, 4096U)) total += n;
+    return total == 7U ? 0 : 26;
+}
+
 }  // namespace
 
 int main() {
+    if (const auto failed = prompt_group_gate()) return failed;
     if (const auto failed = prefill_tail_gate()) return failed;
     if (const auto failed = served_prefill_gate()) return failed;
     constexpr auto schedule = strix::inkling2::mini_schedule();

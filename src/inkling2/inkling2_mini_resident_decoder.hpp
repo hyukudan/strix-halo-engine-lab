@@ -21,6 +21,7 @@
 #include "strix/head_argmax.hpp"
 #include "strix/logit_rows.hpp"
 #include "strix/serve/cohort_passes.hpp"
+#include "strix/serve/prefill_group.hpp"
 #include "strix/session/embed_splice_device.hpp"
 #include "strix/session/linear_verify_step.hpp"
 
@@ -377,6 +378,114 @@ public:
         }, prefill_rows_, served_cli_route_ ? call_tail_rows(ids.size()) : tail_rows_);
         last_logit_rows_ = 1U;
         return token;
+    }
+    // Grouped emits-first prefill (serve::FixedKvCohort::prefill_group, serve::plan_prefill_group): whole waiting prompts
+    // run their layers as ONE work, so every dense matrix and routed expert is read once for all members' rows.
+    //  - A member is exactly one solo call chunk (rows <= the call chunk, no tail rule splits it) and has more than
+    //    kMiniGroupSoloRows rows (its solo pass takes the tile body, as the group's pass does); route class 1 = alone.
+    //  - Members are packed whole, in order, into passes of at most one call chunk (mini_group_pass_members); each pass is
+    //    one packed forward (the decode lanes' append_batch) of kind prefill. Each member's attention stage runs as its own
+    //    solo chunk (MiniResidentBackend::attention_batch), its convolution histories and KV rows are its own, and its
+    //    first id comes from the one-row head of its last row, the head its solo call's last chunk runs (screened pick
+    //    where that one is screened, else the full softcap head + greedy), read after the pass completed.
+    //  - Score row r of the call is member r's last row (read_slot_logits(r)); a screened pick defers it like a lone pick.
+    //  - Refused (capacity members 0) wherever a prompt row is not the EXACT BF16 row of the solo call: a per-chunk low-bit
+    //    arithmetic choice, compact prompt weights, the integer prefill class, a narrow expert image, DSpark taps, the
+    //    held-back route; and always off the HIP backend (the CUDA prefill keeps its own route).
+    [[nodiscard]] std::uint32_t prefill_route_class(std::uint64_t rows) const noexcept { return mini_group_route_class(rows); }
+    [[nodiscard]] serve::PrefillGroupCapacity prefill_group_capacity() const noexcept {
+        serve::PrefillGroupCapacity capacity;
+        if (const char* why = group_refusal()) {
+            capacity.members = 0U;
+            capacity.reason = why;
+            return capacity;
+        }
+        capacity.members = decode_rows_;
+        capacity.rows = std::uint64_t{kMiniGroupPasses} * prefill_rows_;
+        capacity.member_rows = prefill_rows_;
+        capacity.rejected_class_mask = 1U;  // mini_group_route_class: alone only
+        capacity.passes = kMiniGroupPasses;
+        capacity.reason = "bf16-tile-rows";
+        return capacity;
+    }
+    void prefill_group_first(std::span<const unsigned> slots, std::span<const std::span<const unsigned>> prompts,
+                             std::span<unsigned> tops) {
+#if defined(__HIPCC__)
+        if (const char* why = group_refusal())
+            throw std::logic_error(std::string("Inkling 2 Mini: grouped prefill refused: ") + why);
+        const std::size_t members = slots.size();
+        if (members < 2U || members != prompts.size() || members != tops.size() || members > decode_rows_)
+            throw std::invalid_argument("Inkling 2 Mini: invalid prompt group size");
+        std::vector<std::size_t> rows(members);
+        for (std::size_t m = 0; m < members; ++m) {
+            rows[m] = prompts[m].size();
+            if (rows[m] <= kMiniGroupSoloRows || rows[m] > prefill_rows_)
+                throw std::logic_error("Inkling 2 Mini: a group member must be one solo chunk of more than the tight rows");
+            if (std::ranges::find(slots.first(m), slots[m]) != slots.begin() + static_cast<std::ptrdiff_t>(m))
+                throw std::invalid_argument("Inkling 2 Mini: duplicate slot in a prompt group");
+        }
+        const auto passes = mini_group_pass_members(rows, prefill_rows_);
+        for (std::size_t m = 0; m < members; ++m) {
+            reset_slot(slots[m]);
+            validate_inputs(slots_.at(slots[m])->state(), prompts[m], {});
+        }
+        last_logit_rows_ = 0U;
+        pending_scores_ = {};  // every forward below rewrites hidden_ (a lone prefill drops it the same way)
+        if (!group_heads_) group_heads_.emplace(std::size_t{decode_rows_} * kHiddenWidth);
+        backend_.set_step_token(std::nullopt);
+        // The prompt head is the lone prefill's: pick_next on the call's last row, no host scores, kind prefill.
+        const bool screened = !backend_.lowbit_applies(MiniAppendKind::prefill, kMiniGroupSoloRows + 1U) &&
+            mini_screened_pick(head_.reason, screen_.has_value(), MiniAppendKind::prefill, true, false, false);
+        std::size_t first = 0;
+        for (const auto count : passes) {
+            groups_.clear();
+            pass_ids_.clear();
+            unsigned total = 0;
+            for (std::size_t m = first; m < first + count; ++m) {
+                auto& state = slots_.at(slots[m])->state();
+                groups_.push_back({&state, {state.committed(), static_cast<unsigned>(rows[m])}});
+                pass_ids_.insert(pass_ids_.end(), prompts[m].begin(), prompts[m].end());
+                total += static_cast<unsigned>(rows[m]);
+            }
+            const auto embeddings = embeddings_.span().first(std::size_t{total} * kHiddenWidth);
+            const auto hidden = hidden_.span().first(embeddings.size());
+            try {
+                MiniResidentForward forward(backend_, workspace());
+                forward.append_batch(groups_, total, embeddings, hidden, [&] {
+                    embed(pass_ids_, embeddings, total, MiniAppendKind::prefill);
+                }, [](MiniConstRows) {}, [] {});
+            } catch (...) {
+                backend_.abandon_capture();
+                throw;
+            }
+            std::size_t at = 0;
+            for (std::size_t m = first; m < first + count; ++m) {
+                at += rows[m];
+                const float* input = hidden_.data() + (at - 1U) * kHiddenWidth;
+                mini_gpu::copy(group_heads_->data() + m * kHiddenWidth, input, std::size_t{kHiddenWidth} * sizeof(float),
+                               mini_gpu::device_to_device, stream_.get());
+                if (screened) {
+                    greedy_.enqueue_produced([&](HipGreedyRowsReply* reply) {
+                        backend_.check(screen_->enqueue(input, reply, stream_.get()));
+                    });
+                    note_screened_pick();
+                } else {
+                    const auto row_scores = logits_.span().subspan(
+                        ::strix::head::logit_row_offset(static_cast<unsigned>(m), kLogitPitch), kOutputVocabulary);
+                    project_head(input, row_scores, true);
+                    greedy_.enqueue(row_scores, stream_.get());
+                }
+                mini_gpu::synchronize(stream_.get());
+                tops[m] = checked_token(greedy_, 0U);
+            }
+            first += count;
+        }
+        last_logit_rows_ = static_cast<unsigned>(members);
+        if (screened) pending_scores_ = {group_heads_->data(), static_cast<unsigned>(members), logits_.data()};
+#else
+        (void)slots, (void)prompts, (void)tops;
+        throw std::logic_error("Inkling 2 Mini: grouped prompt prefill is a HIP route");
+#endif
     }
     // Admitted tail capacity (serve::CohortBackend::prompt_tail_rows), the cut rule of served pieces and the first
     // chunk of one prefill call (prompt_piece_rule / prompt_call_chunk).
@@ -1578,6 +1687,22 @@ private:
     }
 #endif
 
+    // Why grouped prompt prefill is off for this decoder (nullptr: it may group); see prefill_group_first.
+    [[nodiscard]] const char* group_refusal() const noexcept {
+#if defined(__HIPCC__)
+        if (!served_cli_route_ || !prefill_emits_first()) return "held-back-route";
+        if (decode_rows_ < 2U) return "one-slot";
+        if (lowbit_timing_) return "per-chunk-lowbit-arithmetic";
+        if (backend_.lowbit_applies(MiniAppendKind::prefill, kMiniGroupSoloRows + 1U)) return "compact-prompt-weights";
+        if (backend_.prefill_iu4_selected()) return "integer-prefill-class";
+        if (weight_plan_.narrow_bytes() != 0U) return "narrow-expert-image";
+        if (!draft_taps_.span().empty()) return "draft-taps";
+        return nullptr;
+#else
+        return "hip-only";
+#endif
+    }
+
     // Tail rows one prefill call of `rows` rows absorbs (mini_call_tail_rows within the admitted capacity).
     [[nodiscard]] unsigned call_tail_rows(std::size_t rows) const noexcept {
 #if defined(__HIPCC__)
@@ -1645,6 +1770,7 @@ private:
     std::vector<MiniResidentAppendGroup> groups_;
     std::vector<unsigned> pass_ids_;    // decode_slots input snapshot
     std::vector<unsigned> pass_picks_;  // decode_slots picks, published after the last pass
+    std::optional<mini_gpu::Buffer<float>> group_heads_;  // the last row of each member of the last prompt group
     bool served_cli_route_;             // served route lever, fixed at construction (admits_served_route)
     bool calibrated_decode_;            // calibrated decode-only image bound (BF16 prefill rows, compact decode rows)
     core::ResidentGreedy greedy_;

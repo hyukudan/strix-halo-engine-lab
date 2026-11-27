@@ -622,6 +622,8 @@ public:
     // on the admitted chunk or the pieces. Set once before any append; the command line keeps its one-row route.
     void keep_prefill_grouped() noexcept { grouped_prefill_ = !kBackendHip; }
     [[nodiscard]] bool prefill_grouped() const noexcept { return grouped_prefill_; }
+    // The rotated integer prefill class is selected (images built and on): prompt rows then run a lossy class.
+    [[nodiscard]] bool prefill_iu4_selected() const noexcept { return iu4_on_; }
 
     void finish() {
         std::array<unsigned, (1U + kMiniMaxVerifyRows) * kLogicalVisits> storage{};
@@ -784,6 +786,16 @@ public:
         if (groups.empty()) throw std::invalid_argument("Inkling 2 Mini: empty attention batch");
         if (groups.size() == 1U) {
             attention_grouped(visit, &groups.front(), {}, query, key, value, output);
+        } else if (std::ranges::all_of(groups, [](const auto& group) { return group.chunk.rows > kMiniGroupSoloRows; })) {
+            // Grouped prompt members: each runs the attention stage of its own solo chunk (the same single-chunk route,
+            // flash geometry and projected-bias form), on its rows of the packed images.
+            std::size_t base = 0;
+            for (const auto& group : groups) {
+                const auto elements = std::size_t{group.chunk.rows} * kHiddenWidth;
+                attention_grouped(visit, &group, {}, query.subspan(base, elements), key.subspan(base, elements),
+                                  value.subspan(base, elements), output.subspan(base, elements));
+                base += elements;
+            }
         } else {
             attention_grouped(visit, nullptr, groups, query, key, value, output);
         }
