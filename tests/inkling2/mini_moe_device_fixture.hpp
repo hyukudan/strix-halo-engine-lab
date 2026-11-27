@@ -302,11 +302,12 @@ bool run_r1(typename Device::Stream stream) {
 }
 
 // Several routed rows in one R1 launch: every row's activations and output are bitwise those of a one-row launch on
-// that row (rows share experts and differ in inputs, route order and weights).
-template <class Device, bool Nvfp4>
+// that row (rows share experts and differ in inputs, route order and weights). Rows = 8 (r1::kUnionMinRows on HIP)
+// runs the decode plan's expert union.
+template <class Device, bool Nvfp4, unsigned Rows = 3U>
 bool run_r1_rows(typename Device::Stream stream) {
     namespace r1 = strix::moe_core::microscaled_r1;
-    constexpr unsigned top_k = model::kExpertsPerToken, rows = 3U;
+    constexpr unsigned top_k = model::kExpertsPerToken, rows = Rows;
     constexpr auto format = Nvfp4 ? packed::MatrixFormat::nvfp4 : packed::MatrixFormat::mxfp8;
     Matrices<Device, Nvfp4> positive(false), negative(true);
     Managed<Device, model::MiniMoeExpert> matrices(top_k);
@@ -326,7 +327,7 @@ bool run_r1_rows(typename Device::Stream stream) {
     const r1::Args args{matrices.data, ids.data, weights.data, failure.data, input.data, activation.data, output.data,
                         top_k, kHiddenWidth, kExpertWidth, model::kMlpGateSoftcap, model::kMlpUpSoftcap};
     if (r1::launch<format, top_k>(args, stream, 0U) == Device::MoeBackend::success ||
-        r1::launch<format, top_k>(args, stream, r1::kMaxRows + 1U) == Device::MoeBackend::success) return false;
+        r1::launch<format, top_k>(args, stream, r1::kMaxLaunchRows + 1U) == Device::MoeBackend::success) return false;
     Device::require(r1::launch<format, top_k>(args, stream, rows));
     Device::sync(stream);
     for (unsigned row = 0; row < rows; ++row) {
@@ -482,6 +483,7 @@ int verify() {
     const bool passed = run<Device, true>(stream) && run<Device, false>(stream) &&
                         run_resident<Device>(stream) && run_r1<Device, true>(stream) && run_r1<Device, false>(stream) &&
                         run_r1_rows<Device, true>(stream) && run_r1_rows<Device, false>(stream) &&
+                        run_r1_rows<Device, true, 8U>(stream) && run_r1_rows<Device, false, 8U>(stream) &&
                         run_r1_dot<Device, MatrixFormat::nvfp4, float, r1::kGateColumns, 2U>(stream, kHiddenWidth) &&
                         run_r1_dot<Device, MatrixFormat::mxfp8, float, r1::kGateColumns, 2U>(stream, kHiddenWidth) &&
                         run_r1_dot<Device, MatrixFormat::nvfp4, std::uint16_t, r1::kDownColumns, 1U>(stream, kExpertWidth) &&

@@ -110,8 +110,11 @@ std::optional<std::pair<std::uint64_t, std::uint64_t>> token_range(const Json& i
     if (tokens == nullptr) return std::nullopt;
     if (!tokens->is_array() || tokens->size() != 2U)
         throw std::invalid_argument("all_on catalogue: " + std::string(what) + " tokens needs [min, max]");
-    return std::pair{static_cast<std::uint64_t>(tokens->as_array()[0].as_int()),
-                     static_cast<std::uint64_t>(tokens->as_array()[1].as_int())};
+    const auto first = tokens->as_array()[0].as_int();
+    const auto last = tokens->as_array()[1].as_int();
+    if (first < 0 || last < first)
+        throw std::invalid_argument("all_on catalogue: " + std::string(what) + " tokens needs nonnegative ordered bounds");
+    return std::pair{static_cast<std::uint64_t>(first), static_cast<std::uint64_t>(last)};
 }
 
 std::string range_word(const std::pair<std::uint64_t, std::uint64_t>& range) {
