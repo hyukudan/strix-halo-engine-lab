@@ -93,6 +93,7 @@ inline constexpr bool dspark_shared_lm_head = true;
 inline constexpr double hc_eps = 0x1.0c6f7a0b5ed8dp-20 /* 1e-06 */;
 inline constexpr std::int64_t hc_mult = 4;
 inline constexpr std::int64_t hc_sinkhorn_iters = 20;
+inline constexpr std::string_view head_logit_transform = "linear_quadratic_hinges";
 inline constexpr std::int64_t multimax_parameters = 4;
 inline constexpr std::int64_t num_nextn_predict_layers = 0;
 inline constexpr bool tie_word_embeddings = false;

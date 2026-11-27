@@ -1,6 +1,7 @@
 #pragma once
 
 #include "strix/attn/group_indexer.hpp"
+#include "strix/core/logit_epilogue.hpp"
 
 #include <algorithm>
 #include <limits>
@@ -26,6 +27,11 @@ inline void multimax_f32_reference(std::span<float> logits,
         const volatile float d = strengths[3] * (upper_square * upper_square);
         logit = (((source + a) + b) + c) + d;
     }
+}
+
+inline void apply_logit_epilogue(std::span<float> logits, const LinearQuadraticHinges& policy,
+                                 bool preserve_mask = false) {
+    multimax_f32_reference(logits, policy.thresholds, policy.gains, preserve_mask);
 }
 
 // Vocabulary epilogue with four learned hinges: a lower and upper linear

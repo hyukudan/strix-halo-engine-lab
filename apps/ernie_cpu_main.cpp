@@ -35,6 +35,7 @@ struct Options {
     unsigned steps = 32, threads = 1, cache_mib = 0;
     unsigned min_new_tokens = 0;
     unsigned start_layer = 0, end_layer = ernie::kLayerCount, limit = 128;
+    unsigned lens_stride = 0;
     std::optional<unsigned> prompt;
     std::string activation = "soft-clip";
     std::string multimax = "identity";
@@ -44,6 +45,7 @@ struct Options {
     fs::path capture, packed, replay, resume;
     bool bf16 = false, fixed_gain = false, oracle = false, bos = false, save_layers = false, profile = false;
     bool simd = false, parallel_mla = false, dump_logits = false;
+    bool rescore_layers = false, head_f32 = false;
 };
 
 void set_variant(Options& opts, std::string_view name) {
@@ -109,6 +111,8 @@ Options parse_options(int argc, char** argv) {
         if (arg == "--checkpoint-contract") { contract = Contract::checkpoint; continue; }
         if (arg == "--bos") { opts.bos = true; continue; }
         if (arg == "--save-layers") { opts.save_layers = true; continue; }
+        if (arg == "--rescore-layers") { opts.rescore_layers = true; continue; }
+        if (arg == "--head-store-f32") { opts.head_f32 = true; continue; }
         if (arg == "--dump-logits") { opts.dump_logits = true; continue; }
         if (arg == "--profile-host") { opts.profile = true; continue; }
         if (arg == "--bf16-projections") { opts.bf16 = true; continue; }
@@ -129,6 +133,7 @@ Options parse_options(int argc, char** argv) {
         else if (arg == "--start-layer") opts.start_layer = number(argv[i]);
         else if (arg == "--end-layer") opts.end_layer = number(argv[i]);
         else if (arg == "--limit") opts.limit = number(argv[i]);
+        else if (arg == "--lens-stride") opts.lens_stride = number(argv[i]);
         else throw std::invalid_argument("unrecognized option " + std::string(arg));
     }
     if (contract == Contract::checkpoint) {
@@ -157,13 +162,15 @@ Options parse_options(int argc, char** argv) {
     if (!opts.capture.empty() && (!opts.packed.empty() || !opts.replay.empty()))
         throw std::invalid_argument("capture requires a free-running source-checkpoint run");
     if (opts.oracle && (opts.prompt || !opts.capture.empty() || !opts.replay.empty() ||
-        opts.limit < 2 || opts.limit > kOracleMaxTokens || opts.cache_mib > 8192 ||
+        opts.limit < 2 || opts.limit > kOracleMaxTokens || opts.lens_stride >= opts.limit ||
         opts.start_layer > opts.end_layer || opts.end_layer > ernie::kLayerCount ||
         (opts.start_layer != 0 && opts.resume.empty())))
         throw std::invalid_argument("invalid oracle options or missing layer cache");
-    if (!opts.oracle && (opts.save_layers || opts.dump_logits || !opts.resume.empty() || opts.start_layer != 0 ||
-        opts.end_layer != ernie::kLayerCount || opts.limit != 128))
+    if (!opts.oracle && (opts.save_layers || opts.rescore_layers || opts.lens_stride || opts.dump_logits ||
+        !opts.resume.empty() || opts.start_layer != 0 || opts.end_layer != ernie::kLayerCount || opts.limit != 128))
         throw std::invalid_argument("layer and text options require --oracle");
+    if (opts.rescore_layers && (opts.resume.empty() || opts.save_layers))
+        throw std::invalid_argument("rescoring requires a saved layer cache");
     return opts;
 }
 
@@ -173,13 +180,23 @@ Json::Array variant_names(const Options& opts) {
     return names;
 }
 
-void transform_logits(std::span<float> logits, std::string_view mode, const ernie::ReferenceRead& read) {
+core::LinearQuadraticHinges load_logit_transform(std::string_view mode, const ernie::ReferenceRead& read) {
+    static_assert(ernie::data::extras::head_logit_transform == "linear_quadratic_hinges" &&
+                  ernie::data::extras::multimax_parameters == 4);
+    core::LinearQuadraticHinges policy;
+    if (mode != "identity") {
+        read("model.lm_head.multimax_ranges", policy.thresholds, 0);
+        read("model.lm_head.multimax_ts", policy.gains, 0);
+    }
+    return policy;
+}
+
+void transform_logits(std::span<float> logits, std::string_view mode, const core::LinearQuadraticHinges& policy) {
     if (mode == "identity") return;
-    float ranges[4], strengths[4];
-    read("model.lm_head.multimax_ranges", ranges, 0);
-    read("model.lm_head.multimax_ts", strengths, 0);
+    const auto& ranges = policy.thresholds;
+    const auto& strengths = policy.gains;
     if (mode == "checkpoint") {
-        core::multimax_f32_reference(logits, ranges, strengths);
+        core::apply_logit_epilogue(logits, policy);
     } else if (mode == "hinge" || mode == "signed-hinge") {
         for (auto& z : logits) {
             const auto x = mode == "signed-hinge" ? std::abs(z) : z;
@@ -290,71 +307,29 @@ fs::path layer_file(const fs::path& folder, unsigned layer) {
     return folder / ("layer-" + std::to_string(layer) + ".f32");
 }
 
-void run_oracle(std::vector<std::uint32_t> ids, const Options& opts, const fs::path& folder,
-                const ernie::ReferenceRead& read, const ernie::ReferenceProject& project,
-                core::HostLane& lane, strix::cpu::OrderedFma kernel,
-                const ernie::AttentionHeadExecutor& execute_heads) {
-    if (ids.size() < 2) throw std::invalid_argument("oracle needs at least two input tokens");
-    auto shape = ernie::checkpoint_reference_shape();
-    if (!opts.fixed_gain) shape.route.scale = 1.0F;
-    shape.contracts = opts.contracts;
-    auto token_out = output_file(folder / "prompt.u32");
-    write_row(token_out, std::span<const std::uint32_t>(ids));
-    token_out.close();
-    const auto inputs = std::span<const std::uint32_t>(ids).first(ids.size() - 1);
-    const auto targets = std::span<const std::uint32_t>(ids).subspan(1);
-    const auto width = std::size_t{shape.hidden} * ernie::data::extras::hc_mult;
-    ernie::CpuReference ref(shape, read, activation(opts.activation), project, {}, execute_heads);
-    const auto started = Clock::now();
-    ernie::ReferenceRows rows;
-    if (opts.resume.empty()) {
-        rows = ref.embed_rows(inputs);
-    } else {
-        const auto token_path = opts.resume / "prompt.u32";
-        if (fs::file_size(token_path) != ids.size() * sizeof(ids[0]))
-            throw std::invalid_argument("oracle layer cache has a different token count");
-        auto saved = input_file(token_path);
-        std::vector<std::uint32_t> original(ids.size());
-        saved.read(reinterpret_cast<char*>(original.data()), static_cast<std::streamsize>(ids.size() * sizeof(ids[0])));
-        if (original != ids) throw std::invalid_argument("oracle layer cache tokens differ");
-        const auto path = layer_file(opts.resume, opts.start_layer);
-        const auto row_bytes = width * sizeof(float);
-        if (fs::file_size(path) != inputs.size() * row_bytes)
-            throw std::invalid_argument("oracle layer cache has an invalid size");
-        auto boundary = input_file(path);
-        rows.assign(inputs.size(), std::vector<float>(width));
-        for (auto& row : rows)
-            boundary.read(reinterpret_cast<char*>(row.data()), static_cast<std::streamsize>(row_bytes));
-    }
-    auto scales = trace_file(folder / "rms.tsv", "boundary\tposition\trms");
-    auto timing = trace_file(folder / "layers.tsv", "boundary\tseconds\tmean_rms");
-    auto previous = Clock::now();
-    rows = ref.prefill(std::move(rows), opts.start_layer, opts.end_layer, [&](unsigned layer, const auto& streams) {
-        const auto now = Clock::now();
-        const double seconds = std::chrono::duration<double>(now - previous).count();
-        double total = 0;
-        for (std::size_t row = 0; row < streams.size(); ++row) {
-            const auto scale = rms(streams[row]);
-            if (!std::isfinite(scale)) throw std::runtime_error("oracle: nonfinite residual RMS");
-            scales << layer << '\t' << row << '\t' << scale << '\n';
-            total += scale;
-        }
-        timing << layer << '\t' << seconds << '\t' << total / static_cast<double>(streams.size()) << '\n';
-        if (opts.save_layers) {
-            auto file = output_file(layer_file(folder, layer));
-            for (const auto& row : streams) write_row(file, std::span(row));
-        }
-        timing.flush();
-        std::cerr << "oracle boundary " << layer << " in " << seconds << " s\n";
-        previous = Clock::now();
-    });
-    const auto prefill = Clock::now();
-    for (auto& row : rows) row = ref.head_input(row);
-    // Read each head block once for all positions. Preserve each dot's
-    // accumulation order and stream the decoded weights instead of caching it.
+ernie::ReferenceRows read_boundary(const fs::path& dir, unsigned layer, std::size_t count, std::size_t width) {
+    const auto path = layer_file(dir, layer);
+    const auto row_bytes = width * sizeof(float);
+    if (fs::file_size(path) != count * row_bytes)
+        throw std::invalid_argument("oracle layer cache has an invalid size");
+    auto boundary = input_file(path);
+    ernie::ReferenceRows rows(count, std::vector<float>(width));
+    for (auto& row : rows)
+        boundary.read(reinterpret_cast<char*>(row.data()), static_cast<std::streamsize>(row_bytes));
+    return rows;
+}
+
+bool head_stores_bf16(const Options& opts) {
+    return !opts.head_f32 && (opts.bf16 || opts.contracts.checkpoint_stores);
+}
+
+ernie::ReferenceRows project_oracle_head(const ernie::ReferenceRows& rows, const ernie::ReferenceShape& shape,
+                                        const Options& opts, const ernie::ReferenceRead& read,
+                                        core::HostLane& lane, strix::cpu::OrderedFma kernel) {
+    // Read each head block once for all positions and preserve each dot's accumulation order.
     constexpr std::size_t kRows = 1024;
     std::vector<float> block(kRows * shape.hidden);
-    std::vector<std::vector<float>> logits(rows.size(), std::vector<float>(shape.vocab));
+    ernie::ReferenceRows logits(rows.size(), std::vector<float>(shape.vocab));
     std::optional<strix::cpu::OrderedLinearBatch> batch;
     if (opts.simd) batch.emplace(rows, kernel);
     for (std::size_t first = 0; first < shape.vocab; first += kRows) {
@@ -373,8 +348,89 @@ void run_oracle(std::vector<std::uint32_t> ids, const Options& opts, const fs::p
             }
         });
     }
-    if (opts.bf16 || opts.contracts.checkpoint_stores)
+    if (head_stores_bf16(opts))
         for (auto& row : logits) core::round_bf16_reference(row);
+    return logits;
+}
+
+void run_oracle(std::vector<std::uint32_t> ids, const Options& opts, const fs::path& folder,
+                const ernie::ReferenceRead& read, const ernie::ReferenceProject& project,
+                core::HostLane& lane, strix::cpu::OrderedFma kernel,
+                const ernie::AttentionHeadExecutor& execute_heads) {
+    if (ids.size() < 2) throw std::invalid_argument("oracle needs at least two input tokens");
+    auto shape = ernie::checkpoint_reference_shape();
+    if (!opts.fixed_gain) shape.route.scale = 1.0F;
+    shape.contracts = opts.contracts;
+    auto token_out = output_file(folder / "prompt.u32");
+    write_row(token_out, std::span<const std::uint32_t>(ids));
+    token_out.close();
+    const auto inputs = std::span<const std::uint32_t>(ids).first(ids.size() - 1);
+    const auto targets = std::span<const std::uint32_t>(ids).subspan(1);
+    const auto width = std::size_t{shape.hidden} * ernie::data::extras::hc_mult;
+    const auto logit_transform = load_logit_transform(opts.multimax, read);
+    ernie::CpuReference ref(shape, read, activation(opts.activation), project, {}, execute_heads);
+    const auto started = Clock::now();
+    ernie::ReferenceRows rows;
+    if (opts.resume.empty()) {
+        rows = ref.embed_rows(inputs);
+    } else {
+        const auto token_path = opts.resume / "prompt.u32";
+        if (fs::file_size(token_path) != ids.size() * sizeof(ids[0]))
+            throw std::invalid_argument("oracle layer cache has a different token count");
+        auto saved = input_file(token_path);
+        std::vector<std::uint32_t> original(ids.size());
+        saved.read(reinterpret_cast<char*>(original.data()), static_cast<std::streamsize>(ids.size() * sizeof(ids[0])));
+        if (original != ids) throw std::invalid_argument("oracle layer cache tokens differ");
+        rows = read_boundary(opts.resume, opts.start_layer, inputs.size(), width);
+    }
+    auto scales = trace_file(folder / "rms.tsv", "boundary\tposition\trms");
+    auto stream_scales = trace_file(folder / "stream-rms.tsv", "boundary\tposition\tstream\trms");
+    auto timing = trace_file(folder / "layers.tsv", "boundary\tseconds\tmean_rms");
+    std::optional<std::ofstream> lens;
+    if (opts.lens_stride)
+        lens.emplace(trace_file(folder / "lens.tsv", "boundary\tposition\tinput_id\ttarget_id\ttop_id\tnll\thit"));
+    std::vector<std::pair<unsigned, ernie::ReferenceRows>> lens_inputs;
+    auto previous = Clock::now();
+    const auto observe = [&](unsigned layer, const ernie::ReferenceRows& streams) {
+        const auto now = Clock::now();
+        const double seconds = std::chrono::duration<double>(now - previous).count();
+        double total = 0;
+        for (std::size_t row = 0; row < streams.size(); ++row) {
+            const auto scale = rms(streams[row]);
+            if (!std::isfinite(scale)) throw std::runtime_error("oracle: nonfinite residual RMS");
+            scales << layer << '\t' << row << '\t' << scale << '\n';
+            for (std::size_t stream = 0; stream < ernie::data::extras::hc_mult; ++stream) {
+                const auto slice = std::span(streams[row]).subspan(stream * shape.hidden, shape.hidden);
+                stream_scales << layer << '\t' << row << '\t' << stream << '\t' << rms(slice) << '\n';
+            }
+            total += scale;
+        }
+        timing << layer << '\t' << seconds << '\t' << total / static_cast<double>(streams.size()) << '\n';
+        if (opts.save_layers) {
+            auto file = output_file(layer_file(folder, layer));
+            for (const auto& row : streams) write_row(file, std::span(row));
+        }
+        if (lens && layer != opts.end_layer) {
+            auto& sampled = lens_inputs.emplace_back(layer, ernie::ReferenceRows{}).second;
+            for (std::size_t row = 0; row < streams.size(); row += opts.lens_stride)
+                sampled.push_back(streams[row]);
+        }
+        timing.flush();
+        std::cerr << "oracle boundary " << layer << " in " << seconds << " s\n";
+        previous = Clock::now();
+    };
+    if (opts.rescore_layers) {
+        for (auto layer = opts.start_layer; layer <= opts.end_layer; ++layer) {
+            if (layer != opts.start_layer)
+                rows = read_boundary(opts.resume, layer, inputs.size(), width);
+            observe(layer, rows);
+        }
+    } else {
+        rows = ref.prefill(std::move(rows), opts.start_layer, opts.end_layer, observe);
+    }
+    const auto prefill = Clock::now();
+    for (auto& row : rows) row = ref.head_input(row);
+    auto logits = project_oracle_head(rows, shape, opts, read, lane, kernel);
     if (opts.dump_logits) {
         auto dump = output_file(folder / "raw-logits.f32");
         for (const auto& row : logits) write_row(dump, std::span(row));
@@ -385,22 +441,40 @@ void run_oracle(std::vector<std::uint32_t> ids, const Options& opts, const fs::p
     double loss = 0, unigram = 0;
     unsigned hits = 0;
     for (std::size_t row = 0; row < rows.size(); ++row) {
-        transform_logits(logits[row], opts.multimax, read);
+        transform_logits(logits[row], opts.multimax, logit_transform);
         const auto score = ernie::score_next_token(logits[row], targets[row]);
         const bool hit = score.best_id == targets[row];
         scores << row << '\t' << inputs[row] << '\t' << targets[row] << '\t' << score.best_id << '\t'
                << score.nll << '\t' << hit << '\n';
+        if (lens && row % opts.lens_stride == 0)
+            *lens << opts.end_layer << '\t' << row << '\t' << inputs[row] << '\t' << targets[row] << '\t'
+                  << score.best_id << '\t' << score.nll << '\t' << hit << '\n';
         loss += score.nll;
         hits += hit ? 1U : 0U;
         unigram += std::log(static_cast<double>(targets.size()) / static_cast<double>(frequencies.at(targets[row])));
     }
+    const auto head_done = Clock::now();
+    for (auto& [layer, sampled] : lens_inputs) {
+        for (auto& row : sampled) row = ref.head_input(row);
+        auto layer_logits = project_oracle_head(sampled, shape, opts, read, lane, kernel);
+        for (std::size_t i = 0; i < layer_logits.size(); ++i) {
+            const auto row = i * opts.lens_stride;
+            transform_logits(layer_logits[i], opts.multimax, logit_transform);
+            const auto score = ernie::score_next_token(layer_logits[i], targets[row]);
+            *lens << layer << '\t' << row << '\t' << inputs[row] << '\t' << targets[row] << '\t'
+                  << score.best_id << '\t' << score.nll << '\t' << (score.best_id == targets[row]) << '\n';
+        }
+        lens->flush();
+    }
     const auto count = static_cast<double>(targets.size());
     const auto end = Clock::now();
     const auto prefill_seconds = std::chrono::duration<double>(prefill - started).count();
-    const auto head_seconds = std::chrono::duration<double>(end - prefill).count();
+    const auto head_seconds = std::chrono::duration<double>(head_done - prefill).count();
     const auto receipt = Json(Json::Object{
         {"activation", opts.activation}, {"multiply_fixed_gain", opts.fixed_gain}, {"bf16_projections", opts.bf16},
         {"variants", variant_names(opts)}, {"multimax", opts.multimax},
+        {"head_store", head_stores_bf16(opts) ? "bf16" : "f32"},
+        {"lens_stride", std::uint64_t{opts.lens_stride}}, {"rescored_layers", opts.rescore_layers},
         {"bos", opts.bos}, {"first_layer", std::uint64_t{opts.start_layer}}, {"end_layer", std::uint64_t{opts.end_layer}},
         {"cache_prefix", opts.resume.generic_string()}, {"threads", std::uint64_t{opts.threads}},
         {"cache_mib", std::uint64_t{opts.cache_mib}}, {"positions", std::uint64_t{targets.size()}},
@@ -408,7 +482,8 @@ void run_oracle(std::vector<std::uint32_t> ids, const Options& opts, const fs::p
         {"table_mxfp4", opts.decode.table_mxfp4},
         {"mean_nll", loss / count}, {"perplexity", std::exp(loss / count)}, {"top1_hit_rate", hits / count},
         {"unigram_nll", unigram / count}, {"uniform_nll", std::log(static_cast<double>(shape.vocab))},
-        {"prefill_seconds", prefill_seconds}, {"head_seconds", head_seconds}});
+        {"prefill_seconds", prefill_seconds}, {"head_seconds", head_seconds},
+        {"lens_seconds", std::chrono::duration<double>(end - head_done).count()}});
     output_file(folder / "run.json") << receipt.dump() << '\n';
     std::cout << receipt.dump() << '\n';
 }
@@ -526,9 +601,10 @@ void run_prompt(const Json& request, unsigned index, const strix::serve::BpeToke
     const auto prefill = Clock::now();
     std::optional<std::ofstream> selection_scores;
     if (opts.multimax != "identity") selection_scores.emplace(output_file(folder / "selection-logits.f32"));
+    const auto logit_transform = load_logit_transform(opts.multimax, read);
     for (unsigned step = 0; step < opts.steps; ++step) {
         write_row(files.scores, std::span<const float>(logits));
-        transform_logits(logits, opts.multimax, read);
+        transform_logits(logits, opts.multimax, logit_transform);
         if (selection_scores) {
             write_row(*selection_scores, std::span<const float>(logits));
             selection_scores->flush();
@@ -566,6 +642,7 @@ void run_prompt(const Json& request, unsigned index, const strix::serve::BpeToke
         {"identity", opts.multimax == "checkpoint" ? "checkpoint-host" :
                      (opts.multimax == "identity" ? "candidate-raw-head" : "candidate-transformed-head")},
         {"activation", opts.activation}, {"multimax", opts.multimax},
+        {"head_store", head_stores_bf16(opts) ? "bf16" : "f32"},
         {"bos", opts.bos}, {"minimum_new_tokens", std::uint64_t{opts.min_new_tokens}},
         {"bf16_projections", opts.bf16}, {"multiply_fixed_gain", opts.fixed_gain},
         {"variants", variant_names(opts)},
@@ -595,6 +672,7 @@ int main(int argc, char** argv) try {
                      " [--capture MODEL_DESCRIPTION] [--pack SIDECAR] [--replay TRACE_DIR]\n"
                      "       strix-ernie-cpu CHECKPOINT TEXT_FILE NEW_TRACE_DIR --oracle"
                      " [--bos] [--limit N] [--save-layers] [--dump-logits] [--resume TRACE_DIR]"
+                     " [--rescore-layers] [--lens-stride N] [--head-store-f32]"
                      " [--start-layer N] [--end-layer N] [--threads N] [--cache-mib N] [--profile-host]"
                      " [--ordered-simd] [--table-mxfp4] [--parallel-mla] [--checkpoint-contract|--recovered-contract|--candidate-contract]"
                      " [--variant NAME] [--multimax checkpoint|identity|hinge|signed-hinge|softplus]\n";
@@ -667,8 +745,10 @@ int main(int argc, char** argv) try {
             linear(name, matrix, in, out, groups);
         }
         const bool raw_router = name.ends_with(".gate.weight") || name.ends_with(".gate.weight_1");
-        if ((opts.contracts.checkpoint_stores && !raw_router) ||
-            (opts.bf16 && name.find(".linear_o_group_proj") == std::string::npos))
+        const bool bf16 = name == "lm_head.weight" ? head_stores_bf16(opts) :
+            (opts.contracts.checkpoint_stores && !raw_router) ||
+            (opts.bf16 && name.find(".linear_o_group_proj") == std::string::npos);
+        if (bf16)
             core::round_bf16_reference(out);
     };
     if (opts.oracle) {

@@ -100,6 +100,7 @@ hc_mult = 4
 hc_sinkhorn_iters = 20
 hc_eps = 0.000001
 tie_word_embeddings = false
+head_logit_transform = "linear_quadratic_hinges"
 multimax_parameters = 4
 dspark_attention_kind = "uncompressed"
 dspark_confidence_input = 4352
