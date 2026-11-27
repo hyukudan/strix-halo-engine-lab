@@ -4,6 +4,7 @@
 #include "strix/attn/group_indexer.hpp"
 #include "strix/attn/reference_executor.hpp"
 
+#include <algorithm>
 #include <vector>
 
 namespace strix::attn_core {

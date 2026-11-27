@@ -480,9 +480,10 @@ void campaign_defaults_contract(){
                 require(refused,"the served wide default is refused together with a golden dump");
                 withdraw_mtp_copy_wide(dump,"dump");
                 require(dump.mtp.copy_wide_rows.empty() && !dump.mtp.copy_wide_default && !dump.mtp.ngram_copy_edit,"withdraw clears the cycle");
-                bool still_refused=false;
-                try{validate_resolved_mtp_cli(dump);}catch(const std::invalid_argument& e){still_refused=std::string(e.what()).find("wide")!=std::string::npos;}
-                require(!still_refused,"the golden dump copy no longer trips the wide-copy validation");
+                // The withdrawn copy must validate as a whole, not merely lose the wide-copy refusal.
+                std::string dump_error;
+                try{validate_resolved_mtp_cli(dump);}catch(const std::invalid_argument& e){dump_error=e.what();}
+                if(!dump_error.empty())throw std::runtime_error("the golden dump copy validates after the withdrawal: "+dump_error);
             }
             auto baseline=def;baseline.baseline=true;settle_mtp_copy_wide_default(baseline);
             require(!baseline.mtp.copy_wide_default && baseline.mtp.copy_wide_rows.empty(),"the baseline withdraws the default");

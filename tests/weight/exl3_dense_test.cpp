@@ -151,7 +151,21 @@ void identity_reference_binding(std::mt19937& rng) {
                 for (unsigned b = 0; b < 4U; ++b) bytes.push_back(static_cast<std::uint8_t>(w >> (8U * b)));
             const auto reference = R::decode(words.data(), input, output, static_cast<int>(bits));
             const auto shared = ed::coefficients_kn(bytes, input, output, bits);
-            char what[96];
+            // Independent oracle: the registry's word-form state extraction (no byte adapter, no shared reader), so a
+            // layout regression common to both sides above still fails here.
+            using Format = strix::core::trellis::Format;
+            bool oracle = reference.size() == std::size_t{input} * output;
+            for (unsigned k = 0; oracle && k < input; ++k)
+                for (unsigned n = 0; oracle && n < output; ++n) {
+                    const std::uint32_t* tile = words.data() + Format::tile(k / 16U, n / 16U, output / 16U, static_cast<int>(bits));
+                    const float expected = strix::core::trellis::mul1_value(
+                        Format::state(tile, static_cast<int>(bits), Format::position(k % 16U, n % 16U)));
+                    oracle = R::bits_of(reference[std::size_t{k} * output + n]) == R::bits_of(expected);
+                }
+            char what[128];
+            std::snprintf(what, sizeof what, "identity reference decode equals the word-form registry oracle (%u x %u, %u bits)",
+                          input, output, bits);
+            check(oracle, what);
             std::snprintf(what, sizeof what, "identity reference decode equals coefficients_kn (%u x %u, %u bits)", input, output, bits);
             check(reference.size() == shared.size() &&
                       std::memcmp(reference.data(), shared.data(), shared.size() * sizeof(float)) == 0, what);
