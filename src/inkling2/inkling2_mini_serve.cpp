@@ -94,16 +94,15 @@ ResolvedService resolve(const serve::ServiceSelection& selection, const MiniServ
     if (out.weight_options.qualify_decode_only && resolved.backend != "hip")
         throw std::invalid_argument("STRIX_INK_LOWBIT_HEAD: the SP4 decode arms are qualified on HIP only");
     // One speculation rule for the command line and the server (mini_speculation_policy: an explicit --speculation
-    // wins over the row; speculation and a requested low-bit row never share a run). Served verify windows are
-    // admitted on HIP (the verify rows body and per-slot tapes: each greedy lane drafts from its context while one lane
-    // is live) and on CUDA as the shared lone-lane speculator (lane_speculation). The admitted windows take the verify
-    // rows body; a run that does not speculate keeps the row's level.
+    // wins over the row; speculation and a requested low-bit row never share a run). Admitted served speculation is the
+    // shared lone-lane speculator on either backend (mini_served_lane_speculation, with the backend's probe loss as the
+    // command line's). The admitted windows take the verify rows body; a run that does not speculate keeps the row's level.
     out.speculation_policy = mini_speculation_policy(explicit_speculation.value_or(mini_speculation(resolution)),
                                                      explicit_speculation.has_value(), out.weight_options.lowbit_turbo);
     out.weight_options.lowbit_turbo = out.speculation_policy.lowbit;
     out.speculation_requested = out.speculation_policy.requested;
     out.speculation = out.speculation_policy.admitted;
-    out.lane_speculation = out.speculation && resolved.backend != "hip";
+    out.probe_loss = mini_probe_loss(resolved.backend == "hip");
     mini_record_verify_rows_idle(mini_verify_rows(resolution), out.speculation, std::cerr);
     out.verify_rows = mini_speculation_verify_rows(mini_verify_rows(resolution), out.speculation);
     // The W4A4 class is admitted for the resolved backend (HIP refuses a selected class instead of running BF16).
@@ -164,24 +163,12 @@ serve::CohortConfig scheduling(const MiniServeOptions& opt, const MiniServeCohor
     // The chunk the load admitted (the chunk ladder may keep a smaller one), never the requested one.
     auto config = mini_serve_scheduling(device.prefill_rows != 0U ? device.prefill_rows : opt.prefill_rows,
                                         backend.prompt_piece_rule(), device.mixed_service);
-    // Admitted speculation (the decoder staged windows: backend.max_window > 1): each greedy lane drafts from its own
-    // context (the shared cohort drafter) and verifies the window on its slot; draft rows by live lanes are the
-    // model's data (drafts only while one lane is live, the previous one-row route at two or more).
-    const bool windows = opt.speculation && backend.max_window(0U) > 1U;
-    if (windows && opt.lane_speculation) {
-        // CUDA: the lone lane runs the command line's speculator step (LaneSpeculator: the same drafter setup, arbiter
-        // and verify windows as the CLI's auto, the DSpark drafter on slot 0); two or more live lanes take the round.
-        // One strix-lane-spec line per finished request (the lane's receipt and drafter stats).
-        config.lane_speculation = {true, 1U, kMiniMaxVerifyRows, kMiniProbeLoss, true};
-        return config;
-    }
-    config.context_draft = windows;
-    config.max_draft = windows ? kMiniMaxVerifyRows - 1U : 0U;
-    if (windows) config.max_draft_by_live = mini_served_draft_by_live();
-    // The cycle prior until the cohort's own fit takes over (it prices draft rows only; never ids): ticket ink_draft t1c
-    // on gfx1151, BF16 weights, a served B=1 step 42.4 ms and 10.2 ms per extra verify row -> fixed 32.2 + 10.2 per row.
-    // Without windows the cohort keeps its default prior, as before speculation existed.
-    if (windows) config.prior = {32.2, 10.2, 0.0, 0.0};
+    // Admitted speculation (the decoder staged windows: backend.max_window > 1), either backend: the lone lane runs the
+    // command line's speculator step (LaneSpeculator: the CLI auto's drafter setup, arbiter and verify windows, the
+    // DSpark drafter on slot 0's taps, lookup drafts elsewhere); two or more live lanes take the round, one row each.
+    // (The HIP server drafted from the lane's context through the round before: lookup drafts only, no model drafter.)
+    config.lane_speculation =
+        mini_served_lane_speculation(opt.speculation && backend.max_window(0U) > 1U, opt.probe_loss);
     return config;
 }
 

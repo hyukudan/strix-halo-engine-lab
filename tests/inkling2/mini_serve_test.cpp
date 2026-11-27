@@ -540,6 +540,14 @@ void profile_parity() {
                             loaded->verify_rows ==
                                 mini::mini_speculation_verify_rows(mini::mini_verify_rows(cli.tier), loaded->speculation),
                         "CLI and server must resolve both rows independently (screened head default on, verify rows opt-in)");
+                // Served speculation is the shared lone-lane speculator on BOTH backends, with that backend's probe
+                // loss (the command line's kMiniProbeLoss of the same build); HIP no longer drafts context-only.
+                const bool hip = std::string_view(backend) == "hip";
+                const auto lane = mini::mini_served_lane_speculation(loaded->speculation, loaded->probe_loss);
+                require(loaded->speculation && loaded->probe_loss == mini::mini_probe_loss(hip) && lane.enabled &&
+                            lane.max_live == 1U && lane.max_rows == mini::kMiniMaxVerifyRows && lane.log &&
+                            lane.probe_loss == loaded->probe_loss && !mini::mini_served_lane_speculation(false, 0.0).enabled,
+                        "an admitted served speculation binds the shared lone-lane speculator on HIP and CUDA");
             }
         }
     }
