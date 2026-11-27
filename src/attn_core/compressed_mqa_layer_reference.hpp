@@ -87,7 +87,7 @@ std::vector<float> compressed_mqa_layer_reference(const Weights& w, const Compre
     std::vector<float> grouped(std::size_t{s.o_groups} * s.o_rank);
     w.linear(r.o_group, heads, grouped, s.o_groups);
     std::vector<float> output(s.hidden);
-    sigmoid_gate_values_reference(w, r.gate, q_lora, grouped, s.gate_precision);
+    sigmoid_gate_values_reference(w, r.gate, q_lora, grouped, s.gate_precision, s.order);
     w.linear(r.o_proj, grouped, output, 1U);
     commit_compressed_mqa_history<Ratio>(step, operands, state);
     return output;

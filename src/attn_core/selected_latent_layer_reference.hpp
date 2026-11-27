@@ -142,7 +142,7 @@ std::vector<float> selected_latent_layer_reference(const Weights& w, const Selec
     value_head_postmix_reference(w, r.mix, shape.heads, s.vha_rank, s.fold, output_heads,
                                  folded_mix, execute);
     if (bf16) core::round_bf16_reference(output_heads);
-    sigmoid_gate_values_reference(w, r.gate, q_lora, output_heads, s.gate_precision);
+    sigmoid_gate_values_reference(w, r.gate, q_lora, output_heads, s.gate_precision, s.order);
     std::vector<float> output(s.hidden);
     w.linear(r.o_proj, output_heads, output, 1U);
 

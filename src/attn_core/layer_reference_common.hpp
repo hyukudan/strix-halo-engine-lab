@@ -74,14 +74,16 @@ void value_head_postmix_reference(const Weights& w, const ValueHeadMixRoles& rol
     }
 }
 
-// values *= sigmoid(linear(role, query_lora)) at the declared sigmoid precision.
+// values *= sigmoid(linear(role, query_lora)) at the declared sigmoid precision. The declared order binds the
+// declared exp (the device's DeclaredSigmoidExp).
 template <class Weights>
 void sigmoid_gate_values_reference(const Weights& w, std::string_view role, std::span<const float> query_lora,
                                    std::span<float> values,
-                                   core::SigmoidGatePrecision precision) {
+                                   core::SigmoidGatePrecision precision,
+                                   attn::ReferenceOrder order = attn::ReferenceOrder::sequential) {
     std::vector<float> gate(values.size());
     w.linear(role, query_lora, gate, 1U);
-    core::sigmoid_product_reference(values, gate, values, precision);
+    core::sigmoid_product_reference(values, gate, values, precision, order == attn::ReferenceOrder::declared);
 }
 
 } // namespace strix::attn_core

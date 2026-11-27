@@ -22,15 +22,18 @@ inline void round_bf16_reference(std::span<float> row) {
 // models the operand and result stores of the gated output epilogue.
 enum class SigmoidGatePrecision { f32, bf16, bf16_sigmoid };
 
+// declared_exp: the sigmoid's exp is numeric::declared_exp (the same bits on every host and device) instead of the
+// platform libm's std::exp.
 inline void sigmoid_product_reference(std::span<const float> values, std::span<const float> logits,
-                                      std::span<float> out, SigmoidGatePrecision precision) {
+                                      std::span<float> out, SigmoidGatePrecision precision, bool declared_exp = false) {
     if (values.size() != logits.size() || values.size() != out.size())
         throw std::invalid_argument("sigmoid product: row shapes differ");
     const auto round = [precision](float value) {
         return precision != SigmoidGatePrecision::f32 ? attn::group_indexer::bf16_round(value) : value;
     };
     for (std::size_t i = 0; i < out.size(); ++i) {
-        const float sigmoid = 1.0F / (1.0F + std::exp(-round(logits[i])));
+        const float gate = round(logits[i]);
+        const float sigmoid = 1.0F / (1.0F + (declared_exp ? numeric::declared_exp(-gate) : std::exp(-gate)));
         out[i] = round(round(values[i]) * (precision == SigmoidGatePrecision::bf16_sigmoid ? round(sigmoid) : sigmoid));
     }
 }
