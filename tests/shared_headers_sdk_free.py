@@ -114,6 +114,7 @@ NATIVE_HEADERS = {
     "src/moe_core/device_plan.hpp",
     "src/moe_core/exl3_trellis.hpp",
     "src/moe_core/expert_activation.hpp",
+    "src/moe_core/expert_rows_plan.hpp",
     "src/moe_core/grouped_a8_f16.hpp",
     "src/moe_core/grouped_dispatch.hpp",
     "src/moe_core/grouped_integer_decode.hpp",

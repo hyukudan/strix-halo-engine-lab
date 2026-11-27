@@ -102,7 +102,8 @@ constexpr bool plan_tight_blocks(const unsigned* outputs, unsigned count, unsign
 
 namespace strix::core::dense_linear {
 
-enum class Epilogue : std::uint8_t { store, silu_mul, store_tight_rows, store_tight_rows_bf16, store_mapped };
+enum class Epilogue : std::uint8_t { store, silu_mul, store_tight_rows, store_tight_rows_bf16, store_mapped, store_gathered,
+                                     store_gathered_bf16 };
 
 struct View {
     const std::uint8_t* data;
@@ -123,11 +124,15 @@ __device__ __forceinline__ float silu(float x) { return x / (1.0F + expf(-x)); }
 // rows for the original epilogues). The tight-row variant aliases unused reads to row 0.
 // Every variant stores only rows < nrows. store_mapped (Rows 1) runs output o of the launch on weight row ids[o]
 // (ids == nullptr: row o) with the same per-output body; it stores the FP32 sum at out[o].
+// store_gathered(_bf16) (Rows 4..16, tight tile): live row r < nrows reads input row in_rows[r] of x and stores output row
+// out_rows[r] of out; the unused rows alias live row 0 and are not stored. The per-output sum is the tight-row body's.
 template <unsigned Rows, unsigned T, weight_decode::Format Format, Epilogue Ep>
 __device__ __forceinline__ void body(View w, View up, const float* x, float* out, unsigned nrows, unsigned block,
-                                     const std::uint32_t* ids = nullptr) {
+                                     const std::uint32_t* ids = nullptr, const std::uint32_t* in_rows = nullptr,
+                                     const std::uint32_t* out_rows = nullptr) {
     const unsigned first = (block * 4U + threadIdx.x / 32U) * T, lane = threadIdx.x % 32U;
     constexpr bool tight = Ep == Epilogue::store_tight_rows || Ep == Epilogue::store_tight_rows_bf16;
+    constexpr bool gather = Ep == Epilogue::store_gathered || Ep == Epilogue::store_gathered_bf16;
     constexpr unsigned Streams = Ep == Epilogue::silu_mul ? 2U : 1U;
     const auto inputs = w.inputs, outputs = w.outputs;
 #define GEMV_ROWS_WEIGHT_ROW(stream, o)                                                                              \
@@ -137,11 +142,11 @@ __device__ __forceinline__ void body(View w, View up, const float* x, float* out
 #define GEMV_ROWS_CHUNK weight_decode::Chunk<Format>
 #define GEMV_ROWS_LOAD_CHUNK(row, start) weight_decode::Chunk<Format>(row, start)
 #define GEMV_ROWS_LANE_SUM(partial) wave_sum32(partial)
-#define GEMV_ROWS_INPUT_ROW(row) (tight && (row) != 0U && (row) >= nrows ? 0U : (row))
+#define GEMV_ROWS_INPUT_ROW(row) (gather ? in_rows[(row)] : (tight && (row) != 0U && (row) >= nrows ? 0U : (row)))
 #define GEMV_ROWS_STORE(row, o, sa, sb)                                                                              \
     if (lane == 0 && (o) < outputs && (row) < nrows)                                                               \
-    out[std::size_t(row) * outputs + (o)] = (Ep == Epilogue::silu_mul ? silu(sa) * (sb) : \
-        Ep == Epilogue::store_tight_rows_bf16 ? attn::group_indexer::bf16_round(sa) : (sa))
+    out[std::size_t(gather ? out_rows[(row)] : (row)) * outputs + (o)] = (Ep == Epilogue::silu_mul ? silu(sa) * (sb) : \
+        (Ep == Epilogue::store_tight_rows_bf16 || Ep == Epilogue::store_gathered_bf16) ? attn::group_indexer::bf16_round(sa) : (sa))
     if constexpr (Rows == 1U && T == 1U) {
         // One row, one output per wave: two chunk loads in flight per lane (cold K3072 x 2304 BF16: 84 -> 73 us).
 #define GEMV_ROWS_K_UNROLL 2
@@ -237,6 +242,70 @@ inline hipError_t enqueue_slot_rows(const SlotRows& g, unsigned projections, uns
 // its own chunk / element order, so the bits match any other tile (cold BF16, T2 -> T1: K2304 x 3072 69 -> 63 us).
 template <unsigned Rows>
 inline constexpr unsigned kTightTile = Rows == 1U ? 1U : Rows <= 8U ? 2U : 4U;
+
+// Expert-major rows (MoE experts selected on the device, many rows per expert): the same per-output body as slot rows, but one
+// launch block computes `Rows` slots of ONE expert at once, so the expert's matrix is decoded once per tile instead of once
+// per slot. `tiles` is a CSR by expert built on the device (moe_core/expert_rows_plan.hpp): tile t = experts[t], assignments
+// [begins[t], begins[t] + min(Rows, offsets[expert + 1] - begins[t])); assignment a = (rows[a], slots[a]); its flat slot is
+// rows[a] * top_k + slots[a]. The tile row for slot f reads x row f / input_divisor and stores out[p] row f. Every stored value
+// is the tight-row body's (lane split 32, ascending chunk16, butterfly), so it equals the slot-rows value of the same slot
+// whatever tile it lands in. The grid is fixed (the blocks loop over the live tiles, read on the device): no host read.
+struct ExpertTiles {
+    const std::uint32_t *offsets, *experts, *begins, *rows, *slots, *tile_count;
+};
+struct ExpertRows {
+    const std::uint8_t* const* table[kSlotProjectionsMax];
+    float* out[kSlotProjectionsMax];
+    unsigned inputs, outputs, input_divisor, top_k, projections;
+    std::size_t row_bytes;
+    ExpertTiles tiles;
+};
+
+template <unsigned Rows, weight_decode::Format Format, bool RoundBf16>
+__global__ void __launch_bounds__(128) expert_rows_kernel(ExpertRows g, const float* x) {
+    static_assert(Rows == 4U || Rows == 8U || Rows == 16U, "expert tiles are 4, 8 or 16 rows");
+    constexpr unsigned tile_outputs = kTightTile<Rows>, block_outputs = 4U * tile_outputs;
+    constexpr auto epilogue = RoundBf16 ? Epilogue::store_gathered_bf16 : Epilogue::store_gathered;
+    const unsigned blocks = (g.outputs + block_outputs - 1U) / block_outputs;
+    const std::size_t per_tile = std::size_t(blocks) * g.projections;
+    const std::size_t items = std::size_t(*g.tiles.tile_count) * per_tile;
+    for (std::size_t item = blockIdx.x; item < items; item += gridDim.x) {
+        const unsigned tile = static_cast<unsigned>(item / per_tile);
+        const unsigned within = static_cast<unsigned>(item % per_tile);
+        const unsigned projection = within / blocks, block = within % blocks;
+        const unsigned expert = g.tiles.experts[tile], begin = g.tiles.begins[tile];
+        const unsigned left = g.tiles.offsets[expert + 1U] - begin, count = left < Rows ? left : Rows;
+        std::uint32_t in_rows[Rows], out_rows[Rows];
+#pragma unroll
+        for (unsigned r = 0; r < Rows; ++r) {
+            const unsigned a = begin + (r < count ? r : 0U);
+            const unsigned flat = g.tiles.rows[a] * g.top_k + g.tiles.slots[a];
+            out_rows[r] = flat;
+            in_rows[r] = flat / g.input_divisor;
+        }
+        const View w{g.table[projection][expert], g.inputs, g.outputs, g.row_bytes};
+        body<Rows, tile_outputs, Format, epilogue>(w, w, x, g.out[projection], count, block, nullptr, in_rows, out_rows);
+    }
+}
+
+// rows_per_tile = Rows of the plan's tiles (4, 8 or 16; the plan's cap must be the same). tile_bound = the plan's tile capacity.
+template <weight_decode::Format Format, bool RoundBf16 = false>
+inline hipError_t enqueue_expert_rows(const ExpertRows& g, unsigned rows_per_tile, unsigned tile_bound, const float* x,
+                                      hipStream_t stream) {
+    if (g.projections == 0U || g.projections > kSlotProjectionsMax || tile_bound == 0U || g.input_divisor == 0U ||
+        g.outputs == 0U || g.top_k == 0U || g.inputs % 16U != 0U)
+        return hipErrorInvalidValue;
+    const unsigned block_outputs = 4U * (rows_per_tile == 16U ? 4U : 2U);
+    const std::uint64_t bound = std::uint64_t{tile_bound} * ((g.outputs + block_outputs - 1U) / block_outputs) * g.projections;
+    const unsigned grid = static_cast<unsigned>(bound < 8192U ? bound : 8192U);
+    switch (rows_per_tile) {
+    case 4U: expert_rows_kernel<4U, Format, RoundBf16><<<grid, 128, 0, stream>>>(g, x); break;
+    case 8U: expert_rows_kernel<8U, Format, RoundBf16><<<grid, 128, 0, stream>>>(g, x); break;
+    case 16U: expert_rows_kernel<16U, Format, RoundBf16><<<grid, 128, 0, stream>>>(g, x); break;
+    default: return hipErrorInvalidValue;
+    }
+    return hipGetLastError();
+}
 
 // Any chunk format (weight_decode.hpp): w.row_bytes is the format's row image (weight_decode::row_bytes).
 template <unsigned Rows, weight_decode::Format Format, bool RoundBf16 = false>
