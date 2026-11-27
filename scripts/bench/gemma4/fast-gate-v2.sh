@@ -14,7 +14,9 @@
 #   Writes OUT/logits/<case>.<ARM>.bin (cases already captured are skipped), OUT/log/<ARM>-L<LENGTH>.{out,err}, OUT/sum.txt.
 # Then, on any CPU, per band directory:
 #   python3 tools/strix-gate/gate_v2.py qual OUT --ref REF --cand CAND --null NULL [--tier turbo] --json OUT/gate.json
-# Environment: TMO (process timeout, s; default 440), ENGINE_ARGS (extra engine options, e.g. "--threads 8").
+# Environment: TMO (process timeout, s; default 440), ENGINE_ARGS (extra engine options, e.g. "--threads 8"),
+#   REF_ENV ("K=V K=V" for REF and NULL), e.g. the qualified fast prompt prefill under exact decode at long bands:
+#   REF_ENV="STRIX_G4_PREFILL_IDENTITY=fast STRIX_G4_PREFILL_ATTN=flash" (prompt KV within KL 3e-6 of exact; decode exact).
 set -u
 [ $# -ge 9 ] || { sed -n '2,18p' "$0" >&2; exit 64; }
 BIN=$1; MODEL=$2; ROPE=$3; MAN=$4; OUT=$5; ARM=$6; LEN=$7; ROWS=$8; shift 8
@@ -60,9 +62,10 @@ PY
 N=$(grep -c . "$LIST")
 [ "$N" -gt 0 ] || { echo "$TAG: every case already captured" >> "$SUM"; exit 0; }
 E=(); P=(--profile exact)
+read -r -a R <<< "${REF_ENV:-}"
 case $ARM in
-  REF) ;;
-  NULL) E=(STRIX_DENSE_NULL=0:$((LEN - 1)):${NULL_ELEM:-7}) ;;
+  REF) E=("${R[@]}") ;;
+  NULL) E=("${R[@]}" STRIX_DENSE_NULL=0:$((LEN - 1)):${NULL_ELEM:-7}) ;;
   *) P=(--profile "${CAND_PROFILE:-fast}" --allow-pending); read -r -a E <<< "${CAND_ENV:-}" ;;
 esac
 T0=$(date +%s)

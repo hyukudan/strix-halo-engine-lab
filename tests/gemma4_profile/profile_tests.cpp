@@ -335,37 +335,39 @@ void product_table() {
         }
         check(lines.size() == pending + ladder, "one stderr line per pending row and ladder diagnostic");
     }
-    // FAST decode attention at depth: pending until its receipt (exact runs), runnable with --allow-pending,
-    // never in DEFAULT/QUALITY, STRIX_G4_DECODE_ATTN=exact switches it off.
+    // Decode attention at depth: gate v2 failed FAST and passed TURBO, so FAST (and --allow-pending) runs the exact
+    // attention and TURBO runs g4-dattn-f2 exactly in the bands of its band receipts (bound to the run's own FAST
+    // reference by the shared binder); outside a band, or with no known regime, TURBO keeps the FAST cell.
+    // STRIX_G4_DECODE_ATTN=exact switches it off.
     for (const auto app : {pr::App::engine, pr::App::decode_bench}) {
         r = pr::resolve(pr::Name::fast, app, in());
-        check(status(r, "decode_attention") == pr::Status::pending && value(r, "decode_attention") == "exact" &&
-              r.find("decode_attention")->target == "g4-dattn-f2" && !r.active("decode_attention"),
-              "fast decode attention pending, exact runs");
+        check(value(r, "decode_attention") == "exact" && !r.active("decode_attention"), "fast runs the exact decode attention");
         pr::Inputs pending_ok = in(); pending_ok.allow_pending = true;
         r = pr::resolve(pr::Name::fast, app, pending_ok);
-        check(status(r, "decode_attention") == pr::Status::unqualified && value(r, "decode_attention") == "g4-dattn-f2",
-              "allow-pending runs g4-dattn-f2 unqualified");
+        check(value(r, "decode_attention") == "exact", "allow-pending keeps fast on the exact decode attention");
         namespace shared = strix::profile;
-        shared::LadderRow timing{"decode_attention", "g4-dattn-f2", shared::Name::fast, shared::Phase::decode,
-                                  "fixture", 4096, 4096, 1, 1, 1.10, 0.02, "fixture timing"};
-        pending_ok.regime = {shared::Phase::decode, 4096, 1, "fixture", "fixture-exec"};
-        const std::string reference = pr::resolve(pr::Name::fast, app, pending_ok).find("decode_attention")->ladder_reference;
-        check(reference.starts_with("ladder-arm/v4;"), "Gemma reports the decode attention reference");
-        timing.over = reference;
-        pending_ok.ladder = std::span(&timing, 1);
-        r = pr::resolve(pr::Name::fast, app, pending_ok);
-        check(status(r, "decode_attention") == pr::Status::unqualified &&
-              r.find("decode_attention")->ladder.find("applies x1.100") != std::string::npos,
-              "measured candidate remains unqualified until its quality gate passes");
-        timing.over = {};
-        timing.band_bound = true;
-        timing.identity = "v1";
-        timing.band_evidence.timed = {4096};  // the band's own timing (a band row with no in-band timing matches nothing)
-        r = pr::resolve(pr::Name::fast, app, pending_ok);
-        check(status(r, "decode_attention") == pr::Status::unqualified &&
-              r.find("decode_attention")->ladder.find("applies x1.100") != std::string::npos,
-              "Gemma settles its band receipt with the shared binder");
+        r = pr::resolve(pr::Name::turbo, app, in());
+        check(value(r, "decode_attention") == "exact" && !r.active("decode_attention"),
+              "turbo without a known regime keeps the fast cell");
+        for (const std::uint64_t context : {2048ULL, 8192ULL, 40000ULL, 65280ULL}) {
+            pr::Inputs banded = in();
+            banded.regime = {shared::Phase::decode, context, 1, "gfx1151", "fixture-exec"};
+            r = pr::resolve(pr::Name::turbo, app, banded);
+            check(value(r, "decode_attention") == "g4-dattn-f2" && status(r, "decode_attention") == pr::Status::set &&
+                  r.find("decode_attention")->ladder.find("applies") != std::string::npos,
+                  "turbo runs g4-dattn-f2 inside its band receipts");
+            r = pr::resolve(pr::Name::fast, app, banded);
+            check(value(r, "decode_attention") == "exact", "fast stays exact in every band");
+            banded.env = lookup({{"STRIX_G4_DECODE_ATTN", "exact"}});
+            r = pr::resolve(pr::Name::turbo, app, banded);
+            check(value(r, "decode_attention") == "exact" && !r.active("decode_attention"), "STRIX_G4_DECODE_ATTN=exact is OFF in turbo");
+        }
+        for (const auto& [context, device] : {std::pair<std::uint64_t, std::string_view>{1024, "gfx1151"}, {8192, "sm_120"}}) {
+            pr::Inputs outside = in();
+            outside.regime = {shared::Phase::decode, context, 1, device, "fixture-exec"};
+            r = pr::resolve(pr::Name::turbo, app, outside);
+            check(value(r, "decode_attention") == "exact", "turbo keeps the fast cell outside its measured bands and device");
+        }
         r = pr::resolve(pr::Name::fast, app, in({}, {}, lookup({{"STRIX_G4_DECODE_ATTN", "exact"}})));
         check(value(r, "decode_attention") == "exact" && !r.active("decode_attention"), "STRIX_G4_DECODE_ATTN=exact is OFF");
         r = pr::resolve(pr::Name::standard, app, in({}, {}, lookup({{"STRIX_G4_DECODE_ATTN", "g4-dattn-f2"}})));
