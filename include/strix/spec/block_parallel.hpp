@@ -43,7 +43,7 @@ struct BlockPolicy {
     std::uint32_t share_budget = 0;   // target_share: max selected context positions per draft layer
     BlockMask mask = BlockMask::bidirectional;
     Fusion fusion = Fusion::none;
-    bool correction = false;          // hidden-correction hook (DFly2 hidden_correction)
+    bool correction = false;          // hidden_correction chain: slot j corrected by E(prev pick) after final_norm (DFly2)
     bool anchor_proposes = false;
     bool prefix_in_block = false;     // known tokens may replace the leading fill rows (hybrid extension)
     std::uint32_t draft_layers = 0;

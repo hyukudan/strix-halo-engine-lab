@@ -94,7 +94,7 @@ void layout_tests() {
     BP_CHECK(sp::max_drafts(h) == 5 && sp::proposal_row(h, 0) == 1 && sp::proposal_row(h, 4) == 5, "dfly2 rows");
     BP_CHECK(sp::max_drafts(sp::ds41_dspark()) == 5 && sp::proposal_row(sp::ds41_dspark(), 0) == 0, "dspark rows");
     BP_CHECK(sp::max_drafts(sp::g4_dflash()) == 7, "dflash rows");
-    BP_CHECK(h.mask == sp::BlockMask::causal && !h.correction, "dfly2 measured numerics: causal block, correction off");
+    BP_CHECK(h.mask == sp::BlockMask::causal && h.correction, "dfly2 publisher numerics: causal block, hidden_correction chain on");
     auto b = h;
     b.mask = sp::BlockMask::bidirectional;
     std::vector<std::uint32_t> ids;
