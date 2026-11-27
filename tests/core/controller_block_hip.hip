@@ -1,7 +1,8 @@
-// Block-per-row controller: enqueue_low_rank_controller (and its tail form over a produced message) stores the same output
-// bits whether the backend runs the six launches (readout, operand-norm pair, down projection, gate pair, pointwise
-// controller, final norm) or the one block-per-row launch of core::controller_block, apart and in place. Rows 1, 2, 3, 8
-// and 16 take the fused launch; 17 rows keep the launches. Value classes per row: random, exact and negative zeros,
+// Fused controller: enqueue_low_rank_controller (and its tail form over a produced message, held in the first rows of the
+// controller scratch) stores the same output bits whether the backend runs the six launches (readout, operand-norm pair,
+// down projection, gate pair, pointwise controller, final norm) or core::controller_block (the down launch and the gate
+// launch with the row-ticket final norm), apart and in place, over a scratch filled with 0x5A bytes (the fused launches
+// zero their own tickets). Rows 1..16 take the fused launches; 17 rows keep the launches. Value classes per row: random, exact and negative zeros,
 // denormals, large magnitudes, and (a separate class) infinities and NaNs, compared with every NaN equal to every NaN.
 // Prints "controller-fused rows R: identical N/N" per row count; exits non-zero on any mismatch.
 #include "strix/hip/legacy_intrinsics.hpp"
@@ -195,12 +196,15 @@ bool run(unsigned rows, Kind kind, std::mt19937& random, std::size_t& same, std:
             mix::enqueue_low_rank_controller(plan, weights, rows, {raw_fused, elements}, banks,
                                              {target_fused, elements}, {scratch_fused, scratch_elements}, fused);
             // The readout of the incumbent run is the message of the tail runs (its scratch holds it first).
-            if (!ok(hipMemcpy(message, scratch_ref, bytes, hipMemcpyDeviceToDevice))) throw std::runtime_error("copy");
+            // The fused tail reads it from the first rows of its own scratch (the served bank-batch layout).
+            if (!ok(hipMemcpy(message, scratch_ref, bytes, hipMemcpyDeviceToDevice)) ||
+                !ok(hipMemcpy(scratch_tail_fused, scratch_ref, bytes, hipMemcpyDeviceToDevice)))
+                throw std::runtime_error("copy");
             mix::enqueue_low_rank_controller_tail(plan, weights, rows, {raw_tail_ref, elements}, {message, elements},
                                                   {target_tail_ref, elements}, {scratch_tail_ref, scratch_elements}, base);
-            mix::enqueue_low_rank_controller_tail(plan, weights, rows, {raw_tail_fused, elements}, {message, elements},
-                                                  {target_tail_fused, elements}, {scratch_tail_fused, scratch_elements},
-                                                  fused_tail);
+            mix::enqueue_low_rank_controller_tail(plan, weights, rows, {raw_tail_fused, elements},
+                                                  {scratch_tail_fused, elements}, {target_tail_fused, elements},
+                                                  {scratch_tail_fused, scratch_elements}, fused_tail);
         } catch (const std::exception&) {
             launched = false;
         }
@@ -250,7 +254,7 @@ bool bench(unsigned rows, std::mt19937& random) {
                 ok(hipMalloc(&scratch, scratch_elements * sizeof(float))) &&
                 ok(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking));
     for (auto*& o : out) good = good && ok(hipMalloc(&o, elements * sizeof(float)));
-    unsigned taken = 0;
+    unsigned taken[kForms] = {0U, 0U, 0U};
     for (unsigned form = 0; good && form < kForms; ++form) {
         Operations six;
         ServedOperations served;
@@ -277,7 +281,7 @@ bool bench(unsigned rows, std::mt19937& random) {
         }
         good = ok(hipStreamEndCapture(stream, &graph)) && good && ok(hipGraphInstantiate(&exec[form], graph, nullptr, nullptr, 0));
         if (graph) (void)hipGraphDestroy(graph);
-        if (form == 2U) taken = fused.taken;
+        taken[form] = fused.taken;
     }
     std::vector<float> ms[kForms];
     hipEvent_t start = nullptr, stop = nullptr;
@@ -305,11 +309,11 @@ bool bench(unsigned rows, std::mt19937& random) {
         }
         const std::size_t served_same = identical(host[0], host[1], false);
         const std::size_t fused_same = identical(host[0], host[2], false);
-        std::printf("controller-fused bench rows %u: six %.2f us served %.2f us fused %.2f us per controller (fused/served "
-                    "%.3f; fused taken %u/%u; bits served %zu/%zu fused %zu/%zu)\n",
-                    rows, us[0], us[1], us[2], us[2] / us[1], taken, kBenchControllers, served_same, elements,
-                    fused_same, elements);
-        good = served_same == elements && fused_same == elements;
+        std::printf("controller-fused bench rows %u: six %.2f served %.2f fused %.2f us per controller (fused/served "
+                    "%.3f; fused taken %u of %u; bits served %zu fused %zu of %zu)\n",
+                    rows, us[0], us[1], us[2], us[2] / us[1], taken[2], kBenchControllers, served_same, fused_same,
+                    elements);
+        good = served_same == elements && fused_same == elements && taken[2] == kBenchControllers;
     } else {
         std::printf("controller-fused bench rows %u: FAIL (capture, launch or timing)\n", rows);
     }
@@ -328,11 +332,11 @@ int main(int argc, char** argv) {
     std::mt19937 random(20261127U);
     if (argc > 1 && std::strcmp(argv[1], "--bench") == 0) {
         bool good = true;
-        for (const unsigned rows : {1U, 2U, 3U, 4U, 6U, 8U, 12U, 16U}) good = bench(rows, random) && good;
+        for (const unsigned rows : {1U, 2U, 4U, 8U, 9U, 12U, 16U}) good = bench(rows, random) && good;
         return good ? 0 : 1;
     }
     int failures = 0;
-    for (const unsigned rows : {1U, 2U, 3U, 8U, 16U, 17U}) {
+    for (const unsigned rows : {1U, 2U, 3U, 5U, 8U, 9U, 12U, 16U, 17U}) {
         std::size_t same = 0, total = 0;
         bool good = true;
         for (const Kind kind : {Kind::random, Kind::random, Kind::edge, Kind::nonfinite})

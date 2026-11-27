@@ -866,10 +866,12 @@ struct ControllerWeights {
 
 namespace detail {
 
-// Block-per-row controller arguments (the final norm's epsilon is the backend's: it fills norm_epsilon).
+// Fused controller arguments (the final norm's epsilon is the backend's: it fills norm_epsilon). `scratch` is the part of
+// the controller scratch past the message rows (the split form's rows).
 inline controller_block::Args fused_controller_args(const LowRankController& plan, const ControllerWeights& weights,
                                                     unsigned rows, ConstRows raw, const float* bank0,
-                                                    const float* bank1, const float* message, float* output) {
+                                                    const float* bank1, const float* message, float* output,
+                                                    MutableRows scratch) {
     controller_block::Args args;
     args.raw = raw.data();
     args.bank0 = bank0;
@@ -887,6 +889,8 @@ inline controller_block::Args fused_controller_args(const LowRankController& pla
     args.operand_epsilon = plan.epsilon;
     args.round_operands = plan.round_operands_bf16;
     args.round_latent = plan.round_latent_bf16;
+    args.scratch = scratch.data();
+    args.scratch_elements = scratch.size();
     return args;
 }
 
@@ -920,11 +924,13 @@ void enqueue_low_rank_controller_tail(LowRankController plan, ControllerWeights 
         !detail::disjoint_rows(message.data(), elements, output.data(), elements))
         throw std::invalid_argument("invalid low-rank controller buffers");
 
-    // A backend may run the whole controller after the readout as one block-per-row launch (the bits of the launches
-    // below; none of the scratch rows is written). It returns false where it does not admit the shape.
+    // A backend may run the whole controller after the readout as the fused controller (core/controller_block_rows.hpp:
+    // the bits of the launches below; only scratch past the first rows * width elements, which may hold the message, is
+    // written). It returns false where it does not admit the shape.
     if constexpr (requires(controller_block::Args args) { { operations.fused_controller(args) } -> std::same_as<bool>; }) {
         if (operations.fused_controller(detail::fused_controller_args(plan, weights, rows, raw, nullptr, nullptr,
-                                                                       message.data(), output.data())))
+                                                                       message.data(), output.data(),
+                                                                       scratch.subspan(elements))))
             return;
     }
     const auto operands = scratch.subspan(elements, 2U * elements);
@@ -1027,12 +1033,13 @@ void enqueue_low_rank_controller(LowRankController plan, ControllerWeights weigh
     MixArgs mix{};
     if (!bind_banks(mix, bank, elements))
         throw std::invalid_argument("invalid low-rank controller bank or normalization");
-    // A backend may run the readout and the whole controller as one block-per-row launch (the bits of the launches
-    // below; the scratch rows are not written). It returns false where it does not admit the shape.
+    // A backend may run the readout and the whole controller as the fused controller (the bits of the launches below;
+    // only scratch past the first rows * width elements is written). It returns false where it does not admit the shape.
     if constexpr (requires(controller_block::Args args) { { operations.fused_controller(args) } -> std::same_as<bool>; }) {
         if (bank.size() == 2U &&
             operations.fused_controller(detail::fused_controller_args(plan, weights, rows, raw, bank[0].data(),
-                                                                       bank[1].data(), nullptr, output.data())))
+                                                                       bank[1].data(), nullptr, output.data(),
+                                                                       scratch.subspan(elements))))
             return;
     }
     mix.queries = weights.query.data();

@@ -1,4 +1,4 @@
-// Host admission of the block-per-row controller launch (no device access).
+// Host admission and row policy of the fused controller (no device access).
 #include "core/controller_block_plan.hpp"
 
 #include <cstddef>
@@ -10,6 +10,13 @@ namespace cb = strix::core::controller_block;
 static_assert(cb::row_regs(2304U) == 9U);
 static_assert(cb::row_regs(2048U) == 0U);
 static_assert(cb::row_regs(0U) == 0U);
+// one latent per wave (8 waves x 8 blocks = rank), gate blocks of 128 outputs tile the width
+static_assert(cb::kDownBlocks * (cb::kThreads / 32U) == cb::kRank);
+static_assert(2304U % cb::kGateOutputs == 0U && 2304U / cb::kGateOutputs == 18U);
+static_assert(cb::scratch_elements_for(1U, 2304U) == 2U * 2304U + 64U + 1U);
+static_assert(cb::scratch_elements_for(16U, 2304U) == 16U * (2U * 2304U + 64U + 1U));
+// its rows fit the controller scratch past its message rows (residual_mix LowRankController: 4 width + rank)
+static_assert(cb::scratch_elements_for(16U, 2304U) <= 16U * (4U * 2304U + 64U) - 16U * 2304U);
 
 namespace {
 
@@ -47,12 +54,15 @@ int main() {
     base.norm_epsilon = 1.0e-6F;
     base.round_operands = true;
     base.round_latent = true;
+    base.scratch = static_cast<float*>(at(10U * 1048576U));
+    base.scratch_elements = cb::scratch_elements_for(rows, width);
     static_assert(row_bytes < 1048576U);
 
     expect("banks", cb::admits(base), true);
-    // decode route policy: the block form only past 8 rows, up to the band
-    expect("preferred 1", cb::preferred(1U), false);
-    expect("preferred 8", cb::preferred(8U), false);
+    // decode route policy: every row count of the band, nothing outside it
+    expect("preferred 0", cb::preferred(0U), false);
+    expect("preferred 1", cb::preferred(1U), true);
+    expect("preferred 8", cb::preferred(8U), true);
     expect("preferred 9", cb::preferred(9U), true);
     expect("preferred 16", cb::preferred(16U), true);
     expect("preferred 17", cb::preferred(17U), false);
@@ -85,6 +95,8 @@ int main() {
     expect("scale inside output", cb::admits(a), false);
     a = base;
     a.rows = 16U;
+    expect("16 rows on an 8-row scratch", cb::admits(a), false);
+    a.scratch_elements = cb::scratch_elements_for(16U, width);
     expect("16 rows", cb::admits(a), true);
     a.rows = 17U;
     expect("17 rows", cb::admits(a), false);
@@ -114,6 +126,33 @@ int main() {
     a = base;
     a.gain = nullptr;
     expect("null gain", cb::admits(a), false);
+
+    // scratch rows apart from everything the launches read or write
+    a = base;
+    a.scratch = nullptr;
+    expect("no scratch", cb::admits(a), false);
+    a = base;
+    a.scratch_elements -= 1U;
+    expect("scratch one short", cb::admits(a), false);
+    a = base;
+    a.scratch = base.scratch + 1;
+    expect("scratch unaligned", cb::admits(a), false);
+    a = base;
+    a.scratch = base.output + width;
+    expect("scratch inside output", cb::admits(a), false);
+    a = base;
+    a.scratch = const_cast<float*>(base.bank1);
+    expect("scratch is a bank", cb::admits(a), false);
+    a = base;
+    a.bank0 = a.bank1 = nullptr;
+    a.message = base.scratch + 4U;
+    expect("scratch over the message", cb::admits(a), false);
+    a = base;
+    a.scratch = reinterpret_cast<float*>(const_cast<std::uint16_t*>(base.gain));
+    expect("scratch over gain", cb::admits(a), false);
+    a = base;
+    a.scratch = const_cast<float*>(base.query) - 8;
+    expect("scratch over query", cb::admits(a), false);
 
     if (failures == 0) std::printf("controller-block-plan: PASS\n");
     return failures == 0 ? 0 : 1;

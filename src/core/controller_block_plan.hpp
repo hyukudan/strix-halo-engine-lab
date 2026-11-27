@@ -1,8 +1,8 @@
 #pragma once
-// Plan of the block-per-row low-rank controller (decode rows): one launch, one 256-thread block per row, runs the
-// controller's readout, the two operand norms, the down projection, the [forget, gain] gate pair, the controller and the
-// final norm that enqueue_low_rank_controller issues as six launches. Host-side shapes only (no device header): the
-// device body is in core/controller_block_rows.hpp.
+// Plan of the fused low-rank controller (decode rows): the controller's readout, the two operand norms, the down
+// projection, the [forget, gain] gate pair, the controller and the final norm that enqueue_low_rank_controller issues as
+// six launches, as two launches with the bits of those launches. Host-side shapes only (no device header):
+// the device bodies are in core/controller_block_rows.hpp.
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -11,15 +11,22 @@ namespace strix::core::controller_block {
 
 // Rows of one launch (decode, verify and cohort rows); taller calls keep the tiled launches.
 inline constexpr unsigned kMaxRows = 16U;
-// Fewest rows the decode route hands to the block form. One block per row streams the controller's 1.18 MB of weights
-// from one compute unit (gfx1151 graph bench, 96 controllers with their own weights: 42-48 us per controller at any row
-// count), while the served launches spread them (23 us at 1 row, 39 us at 8, 81-99 us at 12-16 rows): the block form
-// is the faster one only past 8 rows.
-inline constexpr unsigned kMinRows = 9U;
-constexpr bool preferred(unsigned rows) noexcept { return rows >= kMinRows && rows <= kMaxRows; }
 inline constexpr unsigned kThreads = 256U;
 // The gate pair's K: one 16-value chunk per lane of a four-lane group (the chunk order of the wave-sum form).
 inline constexpr unsigned kRank = 64U;
+// The down launch: one latent per wave of a 256-thread block, so kRank / 8 blocks per row.
+inline constexpr unsigned kDownBlocks = kRank / (kThreads / 32U);
+// The gate launch: outputs per block (two steps of eight waves x eight outputs).
+inline constexpr unsigned kGateOutputs = 128U;
+
+// Device form: two launches. (kDownBlocks, rows) blocks each recompute the row's readout and operand norms and produce
+// eight latents; (width / kGateOutputs, rows) blocks each produce kGateOutputs gate sums and their controller values, and
+// the last of a row's gate blocks to finish (device-scope ticket) runs the final norm over the whole row. The weight
+// bytes spread over many compute units. gfx1151 bench (96 controllers with their own weights per graph, us per
+// controller, rows 1 / 2 / 4 / 8 / 9 / 12 / 16): fused 15.5 / 15.9 / 17.7 / 22.3 / 22.2 / 30.8 / 32.1 against the four
+// served launches 22.4 / 25.5 / 29.8 / 39.4 / 71.3 / 72.8 / 75.6 (and a one-block-per-row launch, 41.6-42.2 at every row
+// count: one compute unit streams the 1.18 MB of weights). The decode route takes it at every row count of the band.
+constexpr bool preferred(unsigned rows) noexcept { return rows >= 1U && rows <= kMaxRows; }
 
 // Values per thread of a row (width / kThreads) for the widths the device body instantiates; 0 = not instantiated.
 constexpr unsigned row_regs(unsigned width) noexcept { return width == 2304U ? 9U : 0U; }
@@ -42,7 +49,15 @@ struct Args {
     float norm_epsilon{};     // epsilon of the final norm
     bool round_operands{};    // the down operands are BF16-rounded (the only form the device body runs)
     bool round_latent{};      // the latent is BF16-rounded (likewise)
+    float* scratch{};         // rows the launches write and read (scratch_elements_for); apart from every row above
+    std::size_t scratch_elements{};
 };
+
+// Scratch (floats): [rows][width] controller rows, [rows][width] readout rows (banks form), [rows][kRank] latents, then
+// one 32-bit ticket per row (the down launch zeroes it, the gate launch counts its blocks on it).
+constexpr std::size_t scratch_elements_for(unsigned rows, unsigned width) noexcept {
+    return std::size_t{rows} * (2U * std::size_t{width} + kRank + 1U);
+}
 
 namespace detail {
 inline bool overlaps(const void* a, std::size_t a_bytes, const void* b, std::size_t b_bytes) noexcept {
@@ -51,8 +66,9 @@ inline bool overlaps(const void* a, std::size_t a_bytes, const void* b, std::siz
 }
 }  // namespace detail
 
-// Admission: the shape the device body is built for, 16-byte aligned weight rows, and output apart from everything the
-// blocks read, except that the raw rows may be the output rows (every block reads its raw row before it stores it).
+// Admission: the shape the device body is built for, 16-byte aligned weight rows, output apart from everything the
+// blocks read, except that the raw rows may be the output rows (the final norm stores a row after every block of the row
+// has read it), and a 16-byte aligned scratch of scratch_elements_for apart from every row and weight.
 inline bool admits(const Args& a) noexcept {
     const bool banks = a.bank0 != nullptr && a.bank1 != nullptr;
     const bool given = a.message != nullptr && a.bank0 == nullptr && a.bank1 == nullptr;
@@ -77,6 +93,16 @@ inline bool admits(const Args& a) noexcept {
     for (const float* p : operands)
         if (p && detail::overlaps(a.output, rows_bytes, p, rows_bytes)) return false;
     if (a.query && detail::overlaps(a.output, rows_bytes, a.query, row_bytes)) return false;
+    if (a.width % kGateOutputs != 0U || !a.scratch) return false;
+    const std::size_t need = scratch_elements_for(a.rows, a.width);
+    if (a.scratch_elements < need || !aligned(a.scratch)) return false;
+    const std::size_t scratch_bytes = need * sizeof(float);
+    const float* const rows[] = {a.raw, a.bank0, a.bank1, a.message, a.output};
+    for (const float* p : rows)
+        if (p && detail::overlaps(a.scratch, scratch_bytes, p, rows_bytes)) return false;
+    if (a.query && detail::overlaps(a.scratch, scratch_bytes, a.query, row_bytes)) return false;
+    for (unsigned i = 0; i < 4U; ++i)
+        if (detail::overlaps(a.scratch, scratch_bytes, weights[i], weight_bytes[i])) return false;
     return true;
 }
 
