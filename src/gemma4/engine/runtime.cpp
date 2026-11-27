@@ -14,6 +14,9 @@
 #include <fstream>
 #include <iostream>
 #include <sstream>
+#ifdef STRIX_GEMMA4_DEVICE_BACKEND
+#include "device/hip_cost_identity.hpp"
+#endif
 
 namespace strix::gemma4::engine {
 namespace {
@@ -55,6 +58,35 @@ private:
     strix::serve::Json metadata_;
 };
 std::string file_hash(const std::filesystem::path& path) { const MappedFile f(path); return hash_bytes(f.data(),f.size()); }
+// The decode regime of a one-prompt CLI run whose prompt length is known before the backend is built (--ids: the ids of
+// the file; --prompt with --tokenizer: its tokenization). The decode attention format is a process property read when
+// the device backend is built, so a TURBO band row can only decide here, once per process. Unknown length, a chat /
+// fixture / deploy run, a non-device backend or an unknown device product: no regime (the startup resolution stands).
+struct DecodeRegime { std::uint64_t prompt_tokens = 0; std::string execution; };
+std::optional<DecodeRegime> decode_regime(const Options& o) {
+    if (o.backend != "device" || o.deploy_check || !o.chat.empty() || !o.fixtures.empty() || (o.ids.empty() == o.prompt.empty()))
+        return std::nullopt;
+    if (const char* list = std::getenv("STRIX_BITCALC_CASES"); list && *list) return std::nullopt;
+    std::uint64_t tokens = 0;
+    if (!o.ids.empty()) {
+        auto text = read_text(o.ids);
+        for (auto& ch : text) if (ch == ',') ch = ' ';
+        std::istringstream input(text); std::string word;
+        while (input >> word) ++tokens;
+    } else if (!o.tokenizer.empty()) {
+        tokens = gemma4::serve::Tokenizer::load(o.tokenizer)->encode(o.prompt).size();
+    }
+    if (!tokens) return std::nullopt;
+#ifdef STRIX_GEMMA4_DEVICE_BACKEND
+    const auto product = strix::device::hip_cost_device_identity();
+    if (product.rfind("gfx1151",0) != 0) return std::nullopt;
+    // Decode does not chunk: the chunk spells one row per step. The capacity is the prompt plus the generation.
+    return DecodeRegime{tokens, strix::profile::ladder_execution({"hip",product,
+        {tokens,tokens + o.request.max_tokens,o.streams,1U,0U,0U,0U,static_cast<std::uint32_t>(o.request.max_tokens)},"gemma4-cli,one-prompt-decode"})};
+#else
+    return std::nullopt;
+#endif
+}
 }
 Options parse_options(int argc, char** argv) {
     Options o;
@@ -135,6 +167,9 @@ Options parse_options(int argc, char** argv) {
                          eagle::mtp::drafter_subdirectory;
     if (std::filesystem::is_regular_file(drafter / "model.safetensors", error))
         inputs.assets.emplace_back("draft",drafter.generic_string());
+    // One resolution carries the decode regime when the CLI knows it (never the server: prepare_serve does not set one).
+    const auto regime = decode_regime(o);
+    if (regime) inputs.regime = {strix::profile::Phase::decode,regime->prompt_tokens,o.streams,"gfx1151",regime->execution};
     o.profile = profile::resolve(selected,profile::App::engine,inputs);
     profile::apply(o.profile);
     if (const auto* draft = o.profile.find("draft")) {

@@ -201,8 +201,8 @@ constexpr strix::profile::LadderRow ladder_rows[] = {
     strix::profile::incumbent_cell("prefill_route", "fast", strix::profile::Name::fast, fast_prefill_receipt, "g4-wmma-pf-v1"),
     strix::profile::incumbent_cell("prefill_route_attention", "flash", strix::profile::Name::fast,
                                    fast_prefill_attention_receipt, "g4-flash-attn-v1"),
-    // g4-dattn-f2 in TURBO (2K/8K/32K/64K decode +4.9 / +8.9 / +46 / +82 %, noise <= 2 %).
-    dattn_band(2048, 8191, 1.049, 0.02),
+    // g4-dattn-f2 in TURBO from 8K up (8K/32K/64K decode +8.9 / +46 / +82 %, noise <= 2 %); 256..2K prompts are within
+    // noise (the 2K gate passed, its +4.9 % did not clear the noise bar) and stay exact.
     dattn_band(8192, 32767, 1.089, 0.02),
     dattn_band(32768, 65279, 1.460, 0.01),
     dattn_band(65280, 65536, 1.819, 0.01),

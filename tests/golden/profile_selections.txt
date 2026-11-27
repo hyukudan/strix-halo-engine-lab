@@ -728,7 +728,7 @@ C qwen35-cuda-dense turbo w2 r1 ctx=32768 decode_attn8=off s4
 C qwen35-cuda-dense turbo w2 r1 ctx=32768 kv_fp8=native s3
 C qwen35-cuda-dense turbo w2 r1 ctx=32768 dense_activation=off s4
 D gemma4 fast app1 decode_identity=g4-a8-v1 s0
-D gemma4 fast app1 decode_attention=exact s4
+D gemma4 fast app1 decode_attention=exact s3
 D gemma4 fast app1 a8_ffn_ple_fuse=1 s3
 D gemma4 fast app1 draft=off s6
 D gemma4 fast app1 draft_mode=auto s3
@@ -740,7 +740,7 @@ D gemma4 fast app1 prefill_route=fast s0
 D gemma4 fast app1 prefill_route_attention=flash s0
 D gemma4 fast app1 mtp_q8=0 s4
 D gemma4 fast app2 decode_identity=g4-a8-v1 s0
-D gemma4 fast app2 decode_attention=exact s4
+D gemma4 fast app2 decode_attention=exact s3
 D gemma4 fast app2 a8_ffn_ple_fuse=1 s3
 D gemma4 fast app4 throws profile 'fast' requires prefill_linears = wmma: the prefill bench runs WMMA prefill linears (g4-wmma-pf-v1; STRIX_G4_PREFILL_LINEAR_POLICY selects g4-wmma-pf-v2), stamped unqualified here: the engine applies the qualified identity per profile and pack; measure prefill-exact through strix-gemma4-decode prompt prefill (--allow-pending runs the unqualified implementation, benchmarking only)
 E ds41-rtx fast app1 lean_state=on s0

@@ -176,7 +176,8 @@ void product_table() {
         check(!lever.env.empty() || !lever.option.empty(), std::string(lever.name) + " has a switch");
         if (lever.kind == pr::Kind::bit_changing)
             for (const unsigned p : {0U, 2U})
-                check(lever.value[p].empty() || (lever.value[p] != lever.value[1] &&
+                check(lever.value[p].empty() || (lever.value[0] == lever.value[1] && lever.value[1] == lever.value[2]) ||
+                      (lever.value[p] != lever.value[1] &&
                       (lever.value[0].empty() || lever.value[2].empty() || lever.value[0] == lever.value[2])),
                       std::string(lever.name) + " bit-changing value outside FAST");
         if (lever.kind == pr::Kind::pack)
@@ -349,7 +350,7 @@ void product_table() {
         r = pr::resolve(pr::Name::turbo, app, in());
         check(value(r, "decode_attention") == "exact" && !r.active("decode_attention"),
               "turbo without a known regime keeps the fast cell");
-        for (const std::uint64_t context : {2048ULL, 8192ULL, 40000ULL, 65280ULL}) {
+        for (const std::uint64_t context : {8192ULL, 32768ULL, 40000ULL, 65280ULL, 65536ULL}) {
             pr::Inputs banded = in();
             banded.regime = {shared::Phase::decode, context, 1, "gfx1151", "fixture-exec"};
             r = pr::resolve(pr::Name::turbo, app, banded);
@@ -360,17 +361,21 @@ void product_table() {
             check(value(r, "decode_attention") == "exact", "fast stays exact in every band");
             banded.env = lookup({{"STRIX_G4_DECODE_ATTN", "exact"}});
             r = pr::resolve(pr::Name::turbo, app, banded);
-            check(value(r, "decode_attention") == "exact" && !r.active("decode_attention"), "STRIX_G4_DECODE_ATTN=exact is OFF in turbo");
+            check(status(r, "decode_attention") == pr::Status::off && !r.active("decode_attention"), "STRIX_G4_DECODE_ATTN=exact is OFF in turbo");
+            banded.env = lookup({{"STRIX_G4_DECODE_ATTN", "g4-dattn-f1"}});
+            r = pr::resolve(pr::Name::turbo, app, banded);
+            check(value(r, "decode_attention") == "g4-dattn-f1" && status(r, "decode_attention") == pr::Status::explicit_env,
+                  "an explicit STRIX_G4_DECODE_ATTN value wins over the band row");
         }
-        for (const auto& [context, device] : {std::pair<std::uint64_t, std::string_view>{1024, "gfx1151"}, {8192, "sm_120"}}) {
+        for (const auto& [context, device] : {std::pair<std::uint64_t, std::string_view>{1024, "gfx1151"}, {2048, "gfx1151"}, {4096, "gfx1151"}, {8191, "gfx1151"}, {8192, "sm_120"}}) {
             pr::Inputs outside = in();
             outside.regime = {shared::Phase::decode, context, 1, device, "fixture-exec"};
             r = pr::resolve(pr::Name::turbo, app, outside);
             check(value(r, "decode_attention") == "exact", "turbo keeps the fast cell outside its measured bands and device");
         }
         r = pr::resolve(pr::Name::fast, app, in({}, {}, lookup({{"STRIX_G4_DECODE_ATTN", "exact"}})));
-        check(value(r, "decode_attention") == "exact" && !r.active("decode_attention"), "STRIX_G4_DECODE_ATTN=exact is OFF");
-        r = pr::resolve(pr::Name::standard, app, in({}, {}, lookup({{"STRIX_G4_DECODE_ATTN", "g4-dattn-f2"}})));
+        check(status(r, "decode_attention") == pr::Status::off && !r.active("decode_attention"), "STRIX_G4_DECODE_ATTN=exact is OFF");
+        r = pr::resolve(pr::Name::standard, app, in({}, {}, lookup({{"STRIX_G4_DECODE_ATTN", "g4-dattn-f1"}})));
         check(status(r, "decode_attention") == pr::Status::explicit_env &&
               r.qualification() == "unqualified: decode_attention" &&
               r.json().find("\"unqualified\":[\"decode_attention\"]") != std::string::npos,
@@ -519,6 +524,8 @@ void parsing_and_apply() {
         const auto turbo = pr::resolve(pr::Name::turbo, app, inputs);
         for (const auto& entry : fast.entries) {
             const auto* inherited = turbo.find(entry.lever->name);
+            // --allow-pending admits the TURBO column of decode_attention without a regime (explicit benchmarking).
+            if (entry.lever->name == "decode_attention") continue;
             check(inherited && inherited->value == entry.value && inherited->status == entry.status,
                   "TURBO inherits FAST without a measured higher rung");
         }
