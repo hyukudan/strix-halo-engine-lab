@@ -213,8 +213,9 @@ std::size_t run_case(const Case& c, std::uint32_t heads, std::uint32_t kvh, cons
     return bad_total;
 }
 
-int check_flash8_tail() {
-    constexpr std::uint32_t dim = 256, heads = 6, keys = 65, position = keys - 1;
+int check_flash8_tail(std::uint32_t keys) {
+    constexpr std::uint32_t dim = 256, heads = 6;
+    const std::uint32_t position = keys - 1;
     constexpr std::size_t query_size = heads * dim;
     const cc::AttentionDims d{heads, 1, dim, 1.0f / 16.0f, keys};
     const cc::GroupedView qv{1, heads, dim, heads * dim, dim};
@@ -240,11 +241,11 @@ int check_flash8_tail() {
     fill_bf16<<<8, 256>>>(v, keys * dim, 23u, 1.0f);
     CK(cudaGetLastError());
 
-    auto fill_shadow = [&](int v_byte, float v_scale) {
-        const std::vector<float> scales(capacity, v_scale);
-        CK(cudaMemset(shadow.k8, 0, capacity * dim));
-        CK(cudaMemset(shadow.v8t, v_byte, capacity * dim));
-        CK(cudaMemset(shadow.ks, 0, capacity * sizeof(float)));
+    auto fill_shadow = [&](int byte, float scale) {
+        const std::vector<float> scales(capacity, scale);
+        CK(cudaMemset(shadow.k8, byte, capacity * dim));
+        CK(cudaMemset(shadow.v8t, byte, capacity * dim));
+        CK(cudaMemcpy(shadow.ks, scales.data(), capacity * sizeof(float), cudaMemcpyHostToDevice));
         CK(cudaMemcpy(shadow.vs, scales.data(), capacity * sizeof(float), cudaMemcpyHostToDevice));
         // Rebuild only valid keys. This overwrites their bytes even in the transposed V layout.
         CK(cc::kv_shadow_e4m3(d, k, v, shadow, 0, keys, nullptr));
@@ -281,7 +282,9 @@ int check_flash8_tail() {
         compare(name, true, decode);
     };
     compare_tail("stale-finite", 0x7E, 1e30f);
-    compare_tail("infinite-scale", 0x7E, std::numeric_limits<float>::infinity());
+    compare_tail("positive-infinite-scale", 0x7E, std::numeric_limits<float>::infinity());
+    compare_tail("negative-infinite-scale", 0x7E, -std::numeric_limits<float>::infinity());
+    compare_tail("nan-scale", 0x7E, std::numeric_limits<float>::signaling_NaN());
     compare_tail("nan-e4m3", 0x7F, 0.0f);
 
     for (void* p : {static_cast<void*>(shadow.k8), static_cast<void*>(shadow.v8t), static_cast<void*>(shadow.ks),
@@ -293,7 +296,12 @@ int check_flash8_tail() {
 }  // namespace
 
 int main(int argc, char** argv) {
-    if (argc == 2 && std::strcmp(argv[1], "--flash8-tail-check") == 0) return check_flash8_tail();
+    if (argc == 2 && std::strcmp(argv[1], "--flash8-tail-check") == 0) {
+        int failed = 0;
+        for (const std::uint32_t keys : {1U, 15U, 16U, 17U, 63U, 64U, 65U, 2047U, 2048U, 2049U})
+            failed |= check_flash8_tail(keys);
+        return failed;
+    }
     std::vector<std::uint32_t> lens{32768, 65536, 131072, 262144};
     std::uint32_t rows = 4096, heads = 24, kvh = 4;
     int iters = 3;
