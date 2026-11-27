@@ -229,12 +229,12 @@ Plan resolve(std::span<const Lever> levers, const Query& query) {
         } else if (!defect.empty()) {
             slot.state = State::refused;
             slot.reason = defect;
-        } else if (contains(lever.default_tiers, tier_word(query.tier))) {
-            slot.state = State::def;
         } else if (const auto value = query.env_value && !lever.env.empty() ? query.env_value(lever.env) : std::nullopt) {
             const bool off = contains(lever.off_values, *value);
             slot.state = off ? State::explicit_off : State::explicit_on;
             slot.reason = off ? "explicit setting kept: off" : "explicit setting kept";
+        } else if (contains(lever.default_tiers, tier_word(query.tier))) {
+            slot.state = State::def;
         } else if (lever.cls == Class::fast && lever.gate != Gate::pass && query.tier == Tier::fast) {
             slot.state = State::refused;
             slot.reason = "gate v2 " + std::string(gate_word(lever.gate)) + " for fast";
