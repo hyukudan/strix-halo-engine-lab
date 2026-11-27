@@ -155,6 +155,7 @@ struct CohortDecoder::StepScratch {
     explicit StepScratch(std::size_t lanes) : decode(lanes) {}
 
     std::vector<std::pair<Lane*, std::string>> done;
+    std::vector<std::uint32_t> decode_ids;  // the lanes that take the round (not a speculator step)
     std::vector<StepLane> step_lanes;
     StepPlan plan;
     std::vector<std::uint64_t> group;
@@ -744,7 +745,8 @@ void CohortDecoder::step() {
     // acceptance) and its context drafter first reads the ids the speculator emitted. Ends are applied after the round.
     auto& done = round.done;  // speculator ends first, then the round's (applied after the round)
     done.clear();
-    std::vector<std::uint32_t> decode_ids;  // the lanes of the round
+    auto& decode_ids = round.decode_ids;  // the lanes of the round
+    decode_ids.clear();
     double spec_ms = 0;
     std::size_t spec_lanes = 0;
     const bool speculate = config_.lane_speculation.enabled && live() <= config_.lane_speculation.max_live;
