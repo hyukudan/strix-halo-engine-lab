@@ -60,6 +60,7 @@ void set_variant(Options& opts, std::string_view name) {
     else if (name == "router-summed-scores") c.router = RouterContract::summed_scores;
     else if (name == "norm-routed-output") c.norm_routed_output = true;
     else if (name == "checkpoint-attention") c.checkpoint_attention = true;
+    else if (name == "hca-fp8-epilogue") c.hca_fp8_epilogue = true;
     else if (name == "checkpoint-hc") c.checkpoint_hc = true;
     else if (name == "checkpoint-stores") c.checkpoint_stores = true;
     else if (name == "router-swap") c.router = RouterContract::swapped_planes;
