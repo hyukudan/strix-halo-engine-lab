@@ -328,12 +328,27 @@ void test_lowbit_arms() {
                 attention_q8_plan.head_storage == weight::kBf16WeightStorage &&
                 attention_q8_plan.status == profile::Status::unqualified,
             "attention-only arm keeps the BF16 head and requires qualification");
-    for (const char* key : {"weights.attention_head.q6_g64@1", "weights.attention_head.q4_g64@1"}) {
+    for (const char* key : {"weights.attention_head.q6_g64@1", "weights.attention_head.q4_g64@1",
+                            "weights.attention_head.sp4t@1"}) {
         mini::MiniWeightOptions arm;
         const auto value = [&]() { return std::string_view(key); };
         require(mini::parse_mini_weight_option(arm, "--qualify-weights", value, true), "arm key");
         const auto plan = mini::resolve_mini_resident_weight_load(profile::Name::turbo, arm, hip);
         require(plan.storage == arm.qualify->target && plan.head_storage == arm.qualify->target, "uniform low-bit arm");
+    }
+    {
+        // The SP4 attention + head arm: decode-only, both roles strix.sp4t on HIP, the SP4 consumer identity.
+        mini::MiniWeightOptions arm;
+        const auto value = [] { return std::string_view("weights.attention_head.sp4t@1"); };
+        require(mini::parse_mini_weight_option(arm, "--qualify-decode-weights", value, true) && arm.qualify_decode_only &&
+                    arm.qualify != nullptr && weight::same_id(arm.qualify->id, weight::kAttentionHeadSP4TPolicy.id),
+                "SP4 attention + head decode-only arm");
+        const auto plan = mini::resolve_mini_resident_weight_load(profile::Name::fast, arm, hip);
+        require(plan.storage == weight::kSP4TWeightStorage && plan.head_storage == weight::kSP4TWeightStorage &&
+                    plan.status == profile::Status::unqualified,
+                "SP4 attention + head arm resolves strix.sp4t on every tagged role, unqualified");
+        require(mini::mini_lowbit_consumers(plan.head_storage).data() == strix::core::kResidentSp4ArithmeticHip.data(),
+                "SP4 arm names the SP4 consumer identity");
     }
     for (const char* key : {"weights.head.q6_g64@1", "weights.head.q4_g64@1"}) {
         mini::MiniWeightOptions arm;

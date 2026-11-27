@@ -417,7 +417,11 @@ public:
     [[nodiscard]] bool lowbit_applies(MiniAppendKind kind, unsigned rows) const noexcept {
         if (!weights_.compact() && !weights_.compact_head_bound()) return false;
         if (!weights_.bf16_bound()) return true;
-        return kind == MiniAppendKind::decode && mini_lowbit_receipt_width(rows);
+        // A dual image decodes on the low-bit copies at the receipt widths and verifies every window on them too: the
+        // low-bit rows are bitwise per row across row counts, so a window's picks are the one-row decode's and a
+        // speculating run keeps the low-bit target. Prompt chunks keep the BF16 image.
+        static_assert(kMiniMaxVerifyRows <= kMiniLowBitStepBand);
+        return (kind == MiniAppendKind::decode && mini_lowbit_receipt_width(rows)) || kind == MiniAppendKind::verify;
     }
     // The current chunk reads the compact roles (attention projections here, the head in the decoder).
     [[nodiscard]] bool lowbit_chunk() const noexcept { return lowbit_chunk_; }

@@ -291,8 +291,8 @@ public:
     // the command line's verify arithmetic (append, MiniAppendKind::verify: every row on its one-row decode body), and
     // under the verify rows lever every slot binds its own convolution tape (a partial commit is copies, no replay).
     // One window is staged at a time (the decoder's one checkpoint workspace). Off: one row per lane, as before.
-    // Declined (returns false) where the window rows would not run the one-row decode's target arithmetic: a dual
-    // BF16 / low-bit image decodes one row on the low-bit image but verifies on BF16 (backend lowbit_applies).
+    // Declined (returns false) where the window rows would not run the one-row decode's target arithmetic (backend
+    // lowbit_applies: a dual BF16 / low-bit image decodes and verifies on the low-bit copies, so it keeps its windows).
     bool set_slot_windows(bool enabled) {
         if (slots_.size() > 1U) throw std::logic_error("set slot windows before allocating slots");
         const bool same_target = backend_.lowbit_applies(MiniAppendKind::decode, 1U) ==
