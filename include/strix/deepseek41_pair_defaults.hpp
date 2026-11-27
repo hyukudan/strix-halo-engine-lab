@@ -124,7 +124,10 @@ const strix::profile::Resolution& profile_resolution();
 std::optional<strix::profile::Resolution> resolve_prefill_profile(const strix::profile::Resolution& startup,
     const PrefillOptions& options, std::uint64_t prompt_tokens, std::uint32_t lanes, std::string_view device_product,
     bool measured_reference);
-// The decoder_replay bound R a resolution sets (0: off, absent or not a positive multiple of 128).
+// The decoder_replay bound R a value / a resolution sets: 0 when off ("0") or absent; otherwise the bound the run
+// executes (a multiple of 128, at least ds41::bounded_replay_min_rows). Any other value throws std::invalid_argument.
+// The drafter seed bound is this R (seed <= R), never a separate literal.
+[[nodiscard]] std::uint32_t replay_rows_from_value(std::string_view value);
 [[nodiscard]] std::uint32_t resolved_replay_rows(const strix::profile::Resolution& resolution);
 // The served device prefill enters the one admission (DevicePrefill::run_full_prompt, the pair prefill CLI's entry)
 // for a fresh whole text prompt run as one piece, whatever the slot count: the band rows then decide as for the CLI.

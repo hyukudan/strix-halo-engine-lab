@@ -290,12 +290,16 @@ def compare(ledger, campaign, tolerance, required):
                 result.update(delta_pct=float(change),
                               status="ABOVE RECORD" if change > tolerance else
                               "BELOW RECORD" if change < -tolerance else "WITHIN NOISE")
+                # Comparability is decided before the verdict: a different clock, request count or token
+                # count is another workload. Its numeric gap is still surfaced, but it neither fails the
+                # regression verdict nor replaces the record under --write.
                 if row["workload"]["timing"] != record["workload"]["timing"]:
-                    # Still surface the numeric gap. A different clock cannot replace the record.
                     result["timing_differs"] = True
                 if any(row["workload"][field] != record["workload"][field]
-                       for field in ("prompt_tokens", "generated_tokens")):
+                       for field in ("prompt_tokens", "generated_tokens", "requests")):
                     result["workload_differs"] = True
+                if result.get("timing_differs") or result.get("workload_differs"):
+                    result["status"] = "NOT COMPARABLE"
             results.append(result)
             if "value" not in row:
                 continue

@@ -457,7 +457,7 @@ void test_d1_request_profile() {
             };
             const auto hit = resolve(8128, measured);
             const bool expect_d1 = std::string_view(tier) != "exact";
-            // ds_replay (held-out gate v2): R=512 passes FAST in 4,096..8,192; TURBO nests the FAST cell. 8,193..32,768
+            // Held-out gate v2: R=512 passes FAST in 4,096..8,192; TURBO nests the FAST cell. 8,193..32,768
             // keeps D1 without replay until its gate completes.
             const auto expect_replay = [&](std::uint64_t prompt) -> std::string_view {
                 return expect_d1 && prompt >= 4096U && prompt <= 8192U ? "512" : "0";
@@ -558,7 +558,7 @@ void test_profile() {
               "TURBO startup leaves R512 to the request's band receipt (test_d1_request_profile)");
         const auto* fast_replay = f.profile->find("decoder_replay");
         check(fast_replay && fast_replay->value == "0" && fast_replay->status == pr::Status::pending,
-              "FAST startup leaves R512 to the request's band receipt (ds_replay held-out gate v2 PASS)");
+              "FAST startup leaves R512 to the request's band receipt (held-out gate v2 PASS)");
         auto i4_world = w;
         i4_world.env["STRIX_DS41_FAST_I4"] = "1";
         for (const auto* profile : {"fast", "turbo"}) {

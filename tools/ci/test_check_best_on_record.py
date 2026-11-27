@@ -61,8 +61,30 @@ class Comparisons(unittest.TestCase):
         data = ledger()
         results, _ = gate.compare(data, campaign({EXACT: measurement(150, clock="ttft")}), Decimal(3), set())
         self.assertTrue(results[0]["timing_differs"])
+        self.assertEqual(results[0]["status"], "NOT COMPARABLE")
         gate.propose(data, results, {})
         self.assertEqual(data, ledger())
+
+    def test_mismatched_clock_is_not_a_regression(self):
+        data = ledger()
+        results, _ = gate.compare(data, campaign({EXACT: measurement(50, clock="ttft")}), Decimal(3), set())
+        self.assertEqual(results[0]["status"], "NOT COMPARABLE")
+        self.assertTrue(results[0]["timing_differs"])
+        self.assertLess(results[0]["delta_pct"], -3)
+        with self.assertRaisesRegex(ValueError, "exactly one below-record"):
+            gate.propose(deepcopy(data), results, {EXACT: "A different clock is not a loss to accept."})
+
+    def test_mismatched_counts_cannot_raise_or_fail_record(self):
+        for value in (150, 50):
+            with self.subTest(value=value):
+                data = ledger()
+                row = measurement(value)
+                row["workload"]["generated_tokens"] = 256
+                results, _ = gate.compare(data, campaign({EXACT: row}), Decimal(3), set())
+                self.assertEqual(results[0]["status"], "NOT COMPARABLE")
+                self.assertTrue(results[0]["workload_differs"])
+                gate.propose(data, results, {})
+                self.assertEqual(data, ledger())
 
     def test_raises_and_acceptance_history(self):
         data = ledger()
@@ -150,6 +172,25 @@ class CommandLine(unittest.TestCase):
             self.assertEqual(saved["records"][FAST]["value"], 110)
             self.assertEqual(len(saved["acceptances"]), 1)
             self.assertEqual(record_file.with_suffix(".md").read_text(encoding="utf-8"), gate.view(saved))
+
+    def test_write_keeps_record_for_other_clock_or_counts(self):
+        with TemporaryDirectory() as temporary:
+            path = Path(temporary)
+            record_file = path / "records.json"
+            campaign_file = path / "campaign.json"
+            original = json.dumps(ledger())
+            other_counts = measurement(150)
+            other_counts["workload"]["generated_tokens"] = 256
+            for row in (measurement(50, clock="ttft"), other_counts):
+                with self.subTest(row=row["workload"]):
+                    record_file.write_text(original, encoding="utf-8")
+                    campaign_file.write_text(json.dumps(campaign({EXACT: row})), encoding="utf-8")
+                    result = subprocess.run([sys.executable, "-B", gate.__file__, str(campaign_file), "--ledger",
+                                             str(record_file), "--write"], capture_output=True, text=True)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertIn("NOT COMPARABLE", result.stdout)
+                    self.assertNotIn("BELOW RECORD", result.stdout)
+                    self.assertEqual(gate.load(record_file)["records"], ledger()["records"])
 
     def test_concurrent_writers_cannot_read_the_same_floor(self):
         with TemporaryDirectory() as temporary:

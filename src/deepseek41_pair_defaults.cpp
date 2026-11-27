@@ -254,7 +254,6 @@ std::optional<strix::profile::Resolution> resolve_prefill_profile(const strix::p
         o.world != 2U || !o.tp_attention || o.expert_tp || o.stream_experts || o.layers != 40U ||
         prompt_tokens > o.max_positions || o.chunk_rows != 1024U || o.window_rows != 8U || o.attention_lanes != 4U ||
         (o.moe_chunk_rows != 0U && o.moe_chunk_rows != 4096U) || !o.engram_direct_io ||
-        o.draft_rows > ::strix::ds41::bounded_replay_min_rows ||
         o.fp16_dense || o.bf16_attention || o.fast_attention || o.fast_dense || o.fast_moe ||
         o.fast_engram || o.fast_shared || o.fast_moe_f16 || o.fast_i4 > 0 || o.null_ulp_layer >= 0 ||
         o.approx_layer_first != 0U || o.approx_layer_end != PrefillOptions{}.approx_layer_end ||
@@ -279,13 +278,23 @@ std::optional<strix::profile::Resolution> resolve_prefill_profile(const strix::p
     return out;
 }
 
+std::uint32_t replay_rows_from_value(std::string_view value) {
+    if (value.empty() || value == "0") return 0U;
+    std::uint32_t rows = 0;
+    const auto [end, ec] = std::from_chars(value.data(), value.data() + value.size(), rows);
+    // The run's own rule (hip_deepseek41_prefill.hip): a multiple of the 128-row attention window, at least the
+    // smallest qualified bound. A value the run cannot execute is a table defect, never a silent "off".
+    if (ec != std::errc{} || end != value.data() + value.size() || rows % 128U != 0U ||
+        rows < ::strix::ds41::bounded_replay_min_rows)
+        throw std::invalid_argument("ds41-decoder-replay-bounded-v1: decoder_replay = '" + std::string(value) +
+                                    "' is not a bound the run executes (0, or a multiple of 128 of at least " +
+                                    std::to_string(::strix::ds41::bounded_replay_min_rows) + ")");
+    return rows;
+}
+
 std::uint32_t resolved_replay_rows(const strix::profile::Resolution& resolution) {
     const auto* replay = resolution.find("decoder_replay");
-    if (replay == nullptr) return 0U;
-    std::uint32_t rows = 0;
-    const auto& v = replay->value;
-    const auto [end, ec] = std::from_chars(v.data(), v.data() + v.size(), rows);
-    return ec == std::errc{} && end == v.data() + v.size() && rows % 128U == 0U ? rows : 0U;
+    return replay == nullptr ? 0U : replay_rows_from_value(replay->value);
 }
 
 const std::vector<std::pair<std::string, std::string>>& baseline_off_items() {
