@@ -93,6 +93,32 @@ int main(int argc, char** argv) {
             const auto cuda = invoke(cuda_args, in_process, no_launch);
             CHECK(cuda.code == 0 && cuda.out.ends_with("native config\n"));
         }
+        {
+            namespace profile = strix::profile;
+            sv::ServiceFactories factories;
+            std::optional<std::string_view> expected_tier;
+            factories.install("qwen", {
+                [&expected_tier](const sv::ServiceSelection& s) {
+                    CHECK(!profile::model_preset());
+                    CHECK(profile::native_profile_option(s.arguments) == expected_tier);
+                    CHECK(s.arguments.front() == "model.gguf");
+                    CHECK(s.arguments.back() == "--print-effective-config");
+                },
+                [](const sv::ServiceSelection&, std::ostream&) {},
+                [](const sv::ServiceSelection&) -> std::unique_ptr<sv::SessionService> {
+                    throw std::logic_error("inspection constructed a service");
+                },
+                [](const sv::ServiceSelection&, std::ostream& out) -> std::optional<int> { out << "native config\n"; return 0; }});
+            profile::PresetScope inherited;
+            const std::vector<std::string> args{"serve", "--registry-root", root, "--model", "qwen3.8-flash-next",
+                "--asset", "model.gguf", "--print-effective-config"};
+            CHECK(invoke(args, factories).out == "native config\n");
+            expected_tier = "exact";
+            auto exact = args;
+            exact.emplace_back("--profile=exact");
+            CHECK(invoke(exact, factories).out == "native config\n");
+            CHECK(profile::model_preset());
+        }
         {   // engine table: unknown key installs nothing; each built key installs the rows install_service_factories does
             sv::ServiceFactories none;
             CHECK(!sv::install_serve_engine("no-such-engine", none) && !sv::install_serve_engine("", none));

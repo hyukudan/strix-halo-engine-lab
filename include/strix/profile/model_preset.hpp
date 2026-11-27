@@ -23,6 +23,10 @@ struct ModelPreset {
 
 [[nodiscard]] std::string_view tier_word(Name);
 [[nodiscard]] Name parse_tier(std::string_view);
+[[nodiscard]] Name model_default_tier(const model_description::ModelDescription&);
+[[nodiscard]] bool uses_native_resolution(const model_description::ModelDescription&, std::string_view backend,
+                                          std::optional<Name> requested);
+[[nodiscard]] std::optional<std::string_view> native_profile_option(const std::vector<std::string>& args);
 // `placement` carries --device-count / --placement (its tier is replaced by the resolved tier). Every launcher (CLI, server,
 // replica router) passes the same query so the effective "multi_device" member is identical for the same request.
 // The preset is inspection: a launcher that executes it first calls multi_device::admit(preset.placement, its executor).

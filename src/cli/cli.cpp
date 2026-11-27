@@ -70,18 +70,6 @@ profile::multi_device::Query placement_query(const Request& req) {
     return query;
 }
 
-bool native_profile_arguments(const std::vector<std::string>& args) {
-    return std::ranges::any_of(args, [](std::string_view arg) { return arg == "--profile" || arg.starts_with("--profile="); });
-}
-
-std::string_view native_profile_word(const std::vector<std::string>& args) {
-    for (std::size_t i = 0; i < args.size(); ++i) {
-        if (args[i].starts_with("--profile=")) return std::string_view(args[i]).substr(10);
-        if (args[i] == "--profile" && i + 1 < args.size()) return args[i + 1];
-    }
-    return {};
-}
-
 std::uint32_t number(std::string_view value, std::string_view name, std::uint32_t lo, std::uint32_t hi) {
     std::uint32_t result = 0;
     const auto parsed = std::from_chars(value.data(), value.data() + value.size(), result);
@@ -328,16 +316,17 @@ Command resolve(const Request& req, const std::vector<model_registry::Entry>& en
             cmd.args.insert(cmd.args.end(), rest.begin(), rest.end());
             return cmd;
         }
-        if (req.native_profile) profile::append_native_profile(cmd.args, req.profile);
+        const auto native_word = profile::native_profile_option(rest);
+        const bool migrated = description && profile::uses_native_resolution(*description, route.backend, req.profile);
+        cmd.native_resolution = req.native_profile || migrated ||
+            (!req.profile && !req.print_effective_config && native_word.has_value());
+        if (cmd.native_resolution) profile::append_native_profile(cmd.args, req.profile);
         if (description) {
-            // A native --profile in the engine arguments (or a model without [presets]) keeps its passthrough (no preset injection), but the explicit
-            // placement is still validated: the description stays available independently of argument injection.
-            if (req.native_profile || (!req.profile && !req.print_effective_config &&
-                    (native_profile_arguments(rest) || !description->find("presets")))) {
+            if (cmd.native_resolution || (!req.profile && !req.print_effective_config && !description->find("presets"))) {
                 if (req.profile) query.tier = *req.profile;
-                else if (const auto word = native_profile_word(rest); !word.empty()) {
-                    try { query.tier = profile::parse_tier(word); } catch (const std::invalid_argument&) {}   // the engine rejects it
-                }
+                else if (native_word) {
+                    try { query.tier = profile::parse_tier(*native_word); } catch (const std::invalid_argument&) {}   // the engine rejects it
+                } else if (migrated) query.tier = profile::model_default_tier(*description);
                 cmd.placement = profile::multi_device::resolve(*description, query);
             } else {
                 cmd.preset = profile::resolve_model_preset(*description, req.profile, route.backend, query);
@@ -403,7 +392,7 @@ int launch(const Request& request, const std::vector<model_registry::Entry>& ent
     if (command.placement && !req.print_effective_config)
         profile::multi_device::admit(*command.placement, profile::multi_device::Executor::engine);
     std::optional<profile::PresetScope> scope;
-    if (req.native_profile || command.preset) scope.emplace(!req.native_profile);
+    if (command.native_resolution || command.preset) scope.emplace(!command.native_resolution);
     return execute(command);
 }
 

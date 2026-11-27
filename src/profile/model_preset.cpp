@@ -52,18 +52,46 @@ Name parse_tier(std::string_view tier) {
     throw std::invalid_argument("--profile requires exact, fast or turbo (got '" + std::string(tier) + "')");
 }
 
+Name model_default_tier(const model_description::ModelDescription& description) {
+    const auto* presets = description.find("presets");
+    if (!presets) return Name::standard;
+    (void)table(*presets, "presets");
+    const auto* fallback = description.find("presets.default");
+    if (!fallback) throw std::invalid_argument("missing presets.default");
+    const auto tier = parse_tier(setting(*fallback, "presets.default"));
+    if (tier == Name::turbo) throw std::invalid_argument("presets.default cannot select turbo");
+    return tier;
+}
+
+bool uses_native_resolution(const model_description::ModelDescription& description,
+                            std::string_view backend, std::optional<Name> requested) {
+    const auto key = "presets.native_resolution." + std::string(backend);
+    const auto* migration = description.find(key);
+    if (!migration) return false;
+    const auto* choices = std::get_if<Value::Array>(&migration->data);
+    if (!choices) throw std::invalid_argument(key + " must be an array of tiers");
+    const auto selection = requested ? tier_word(*requested) : "implicit";
+    bool selected = false;
+    for (const auto& item : *choices) {
+        const auto word = setting(item, key);
+        if (word != "implicit") (void)parse_tier(word);
+        selected |= word == selection;
+    }
+    return selected;
+}
+
+std::optional<std::string_view> native_profile_option(const std::vector<std::string>& args) {
+    for (std::size_t i = 0; i < args.size(); ++i) {
+        if (args[i].starts_with("--profile=")) return std::string_view(args[i]).substr(10);
+        if (args[i] == "--profile") return i + 1 < args.size() ? std::string_view(args[i + 1]) : std::string_view{};
+    }
+    return std::nullopt;
+}
+
 ModelPreset resolve_model_preset(const model_description::ModelDescription& description, std::optional<Name> request,
                                  std::string_view backend, const multi_device::Query& placement) {
     const auto* presets = description.find("presets");
-    auto requested = request.value_or(Name::standard);
-    if (presets) {
-        (void)table(*presets, "presets");
-        const auto* fallback = description.find("presets.default");
-        if (!fallback) throw std::invalid_argument("missing presets.default");
-        const auto default_tier = parse_tier(setting(*fallback, "presets.default"));
-        if (default_tier == Name::turbo) throw std::invalid_argument("presets.default cannot select turbo");
-        requested = request.value_or(default_tier);
-    }
+    const auto requested = request.value_or(model_default_tier(description));
     const std::string path = "presets." + std::string(tier_word(requested));
     auto column = requested;
     std::string kv = "resolver";

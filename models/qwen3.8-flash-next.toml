@@ -107,6 +107,9 @@ weights = "q8_0"
 default = "fast"
 native_kv = "bf16"
 
+[presets.native_resolution]
+hip = ["implicit", "exact"]
+
 [presets.exact]
 levers = "exact"
 

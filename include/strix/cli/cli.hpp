@@ -57,6 +57,7 @@ struct Command {
     std::optional<profile::ModelPreset> preset = {};
     std::optional<profile::multi_device::Decision> placement = {};   // also set when a native --profile skips the preset
     std::string backend = {};   // the route's backend (hip | cuda)
+    bool native_resolution = false;
 };
 using ExecutableExists = std::function<bool(const std::filesystem::path&)>;
 
