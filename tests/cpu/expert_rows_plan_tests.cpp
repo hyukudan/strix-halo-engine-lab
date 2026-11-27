@@ -131,6 +131,13 @@ int main() {
     }
     ER_CHECK(er::tile_capacity(2048U, kTopK, kExperts, 4U) == 512U + 20479U / 4U, "capacity 2048 rows");
     ER_CHECK(er::tile_capacity(1U, kTopK, kExperts, 4U) == 10U, "capacity 1 row (10 assignments)");
+    // Tile policy (slots = rows x top-k over 512 experts): slot path near one row, 4-row tiles up to 12 rows per expert.
+    ER_CHECK(er::tile_rows(1U * kTopK, kExperts) == 0U && er::tile_rows(12U * kTopK, kExperts) == 0U, "tile policy: slot path");
+    ER_CHECK(er::tile_rows(13U * kTopK, kExperts) == 4U && er::tile_rows(128U * kTopK, kExperts) == 4U &&
+             er::tile_rows(614U * kTopK, kExperts) == 4U, "tile policy: 4-row tiles");
+    ER_CHECK(er::tile_rows(615U * kTopK, kExperts) == 16U && er::tile_rows(2048U * kTopK, kExperts) == 16U,
+             "tile policy: 16-row tiles");
+    ER_CHECK(er::tile_rows(100U, 0U) == 0U, "tile policy: no experts");
     std::printf("expert rows plan tests PASS\n");
     return 0;
 }

@@ -17,6 +17,16 @@ constexpr unsigned tile_capacity(unsigned rows, unsigned top_k, unsigned experts
     return static_cast<unsigned>(assignments < bound ? assignments : bound);
 }
 
+// Rows per expert tile for `slots` (row, expert) assignments over `experts` experts; 0 = the slot path (one decode row per
+// slot). Every choice stores the same bits (the tiles run the slot path's per-output body); only the time differs. Measured
+// on gfx1151 (MXFP4 experts, 512 experts, top-10, ms per layer, 11-27): the slot path wins only near one row (1 row: 0.70 vs
+// 0.74); 4-row tiles win from 16 to 256 rows (16: 5.8 vs 6.3 slot; 64: 15.1 vs 20.7 / 33.7 / 24.6 for tiles 8 / 16 / slot;
+// 256: 47 vs 55 / 65 / 98); 16-row tiles are kept where an expert averages 12 rows or more (2048 rows: 487 vs 849 tile 8).
+constexpr unsigned tile_rows(std::uint64_t slots, unsigned experts) {
+    if (experts == 0U || slots * 4U < experts) return 0U;
+    return slots < std::uint64_t{experts} * 12U ? 4U : 16U;
+}
+
 struct Tables {
     unsigned *offsets, *touched, *experts, *begins, *rows, *slots, *tile_count, *failure;
 };
