@@ -146,7 +146,8 @@ void FirstRowReference::feed_forward(unsigned layer_id, const std::string& layer
     result.experts.resize(s.route.top_k);
     result.expert_weights.resize(s.route.top_k);
     moe::route_split_logits_ref<RouteMath>(s.route, s.contracts.router, select, mix,
-        read(prefix + "e_score_correction_bias", s.route.experts), gain, result.experts, result.expert_weights, 1e-20F);
+        read(prefix + "e_score_correction_bias", s.route.experts), gain, result.experts, result.expert_weights,
+        nearest_float(m::router_renorm_floor));
 
     const auto project_expert = [&](unsigned id, moe::ExpertProjection kind,
                                     std::span<const float> value, std::span<float> out) {

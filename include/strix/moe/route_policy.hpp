@@ -288,6 +288,7 @@ inline void validate_route_row(const RoutePolicy& p, std::size_t scores, std::si
 // Shared single-row selection. Callers validate spans and supply experts bytes of scratch.
 // Inputs are already transformed scores. Bias changes selection only.
 // A split projection can supply a separate mixture score plane and expert gains.
+// A positive normalization floor uses max(sum, floor) in place of sum + epsilon.
 inline void route_select_row(const RoutePolicy& p, const float* scores, const float* bias,
                              std::uint32_t* ids, float* weights, std::uint8_t* taken,
                              const float* mixture = nullptr, const float* expert_gain = nullptr,
@@ -325,8 +326,7 @@ inline void route_select_row(const RoutePolicy& p, const float* scores, const fl
     const bool renorm = p.renormalize && (p.top_k > 1U || p.renorm_single);
     float sum = 0.0F;
     for (std::uint32_t k = 0; k < p.top_k; ++k) sum = sum + (ids[k] == p.experts ? empty : mixture[ids[k]]);
-    const float adjusted_sum = sum + p.renorm_eps;
-    const float denominator = renorm_floor > adjusted_sum && renorm_floor > 0.0F ? renorm_floor : adjusted_sum;
+    const float denominator = renorm_floor > 0.0F ? (renorm_floor > sum ? renorm_floor : sum) : sum + p.renorm_eps;
     for (std::uint32_t k = 0; k < p.top_k; ++k) {
         const auto expert = ids[k];
         const float s = expert == p.experts ? empty : mixture[expert];
