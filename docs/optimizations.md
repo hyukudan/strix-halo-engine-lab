@@ -88,7 +88,7 @@ idle-and-resume qualification is pending.
 [Lead](../src/glm/serve/glm_serve_lead.hpp) · [Fixture](../tests/glm_serve_cpu_tests.cpp).
 
 <a id="ernie-ordered-fma"></a>
-### ERNIE ordered host FMA
+### Ordered host FMA dense kernel
 
 `--ordered-simd` uses the shared CPU dense kernel. The matrix-vector
 path interleaves independent outputs, and the batch vocabulary head uses
@@ -101,7 +101,7 @@ The host selects this path when AVX2 and FMA are available.
 | Inkling2 Mini, Qwen3.8 Flash Next, Qwen3.8 27B, DeepSeek V4.1 Flash, GLM 5.3 Flash, MiniMax M3.1 Flash, Hy4 Flash, Nemotron 3.5 Bolt E4B | Unaffected |
 
 <a id="ernie-mxfp4-table"></a>
-### ERNIE table MXFP4 decode
+### Table MXFP4 decode (host)
 
 `--table-mxfp4` uses a shared host lookup for the ordinary E8M0 scale
 range and delegates extreme scales to the scalar decoder. The fixture
@@ -113,7 +113,7 @@ compares signed zeros and all finite scales supported by every E2M1 code.
 | Inkling2 Mini, Qwen3.8 Flash Next, Qwen3.8 27B, DeepSeek V4.1 Flash, GLM 5.3 Flash, MiniMax M3.1 Flash, Hy4 Flash, Nemotron 3.5 Bolt E4B | Unaffected |
 
 <a id="ernie-head-parallel-mla"></a>
-### ERNIE head-parallel MLA
+### Head-parallel MLA host reference (selected-latent layer)
 
 `--parallel-mla` partitions independent key-normalization and attention
 heads. It admits decoded KV-B to the same matrix cache as other projections.
@@ -124,39 +124,54 @@ heads. It admits decoded KV-B to the same matrix cache as other projections.
 | Inkling2 Mini, Qwen3.8 Flash Next, Qwen3.8 27B, DeepSeek V4.1 Flash, GLM 5.3 Flash, MiniMax M3.1 Flash, Hy4 Flash, Nemotron 3.5 Bolt E4B | Unaffected |
 
 <a id="ernie-parallel-checkpoint-decode"></a>
-### ERNIE parallel checkpoint row decoding
+### Parallel microscaled matrix row decoding (host)
 
-Each FP8 or MXFP4 row uses the same decoder on the same codes and scales. The reordered decoder fixture compares FP32 bytes, including a partial FP8 tile. The host code lives in `src/ernie/checkpoint.cpp` and uses `--threads N`. Wall time is pending an official checkpoint A/B.
+Each FP8 or MXFP4 row uses the same decoder on the same codes and scales. The reordered decoder fixture compares FP32 bytes, including a partial FP8 tile. The host code lives in `include/strix/weight/formats/microscaled_matrix.hpp` (ERNIE binds it in `src/ernie/checkpoint.cpp`) and uses `--threads N`. Wall time is pending an official checkpoint A/B.
 
-Engine matrix: inkling2-mini=unaffected, qwen3.8-flash-next=unaffected, qwen3.8-27b=unaffected, deepseek-v4.1-flash=unaffected, glm-5.3-flash=unaffected, minimax-m3.1-flash=unaffected, hy4-flash=unaffected, nemotron-3.5-bolt-e4b=unaffected.
+| Engines | State |
+| --- | --- |
+| ERNIE 5.5 Flash Preview | Opt-in host candidate |
+| Inkling2 Mini, Qwen3.8 Flash Next, Qwen3.8 27B, DeepSeek V4.1 Flash, GLM 5.3 Flash, MiniMax M3.1 Flash, Hy4 Flash, Nemotron 3.5 Bolt E4B | Unaffected |
 
 <a id="ernie-cpu-parallel-projections"></a>
-### ERNIE row-parallel CPU projections
+### Row-parallel streamed CPU projections
 
 Partitions independent output rows and keeps the input order and fused operations of each dot product. Wall time pending an official checkpoint A/B. The host code lives in `src/core/streamed_linear_reference.hpp`. The control is `--threads N`. This row applies to the ERNIE CPU candidate.
 
-Engine matrix: inkling2-mini=unaffected, qwen3.8-flash-next=unaffected, qwen3.8-27b=unaffected, deepseek-v4.1-flash=unaffected, glm-5.3-flash=unaffected, minimax-m3.1-flash=unaffected, hy4-flash=unaffected, nemotron-3.5-bolt-e4b=unaffected.
+| Engines | State |
+| --- | --- |
+| ERNIE 5.5 Flash Preview | Opt-in host candidate |
+| Inkling2 Mini, Qwen3.8 Flash Next, Qwen3.8 27B, DeepSeek V4.1 Flash, GLM 5.3 Flash, MiniMax M3.1 Flash, Hy4 Flash, Nemotron 3.5 Bolt E4B | Unaffected |
 
 <a id="ernie-decoded-matrix-cache"></a>
-### ERNIE bounded decoded matrix cache
+### Bounded decoded matrix cache (host)
 
 Retains immutable FP32 matrices after repeated access and evicts the least recent entries within the byte budget. Avoids rereading and decoding retained matrices. Wall time is pending an official checkpoint A/B. The host code lives in `src/core/streamed_linear_reference.hpp`. The control is `--cache-mib N`. This row applies to the ERNIE CPU candidate.
 
-Engine matrix: inkling2-mini=unaffected, qwen3.8-flash-next=unaffected, qwen3.8-27b=unaffected, deepseek-v4.1-flash=unaffected, glm-5.3-flash=unaffected, minimax-m3.1-flash=unaffected, hy4-flash=unaffected, nemotron-3.5-bolt-e4b=unaffected.
+| Engines | State |
+| --- | --- |
+| ERNIE 5.5 Flash Preview | Opt-in host candidate |
+| Inkling2 Mini, Qwen3.8 Flash Next, Qwen3.8 27B, DeepSeek V4.1 Flash, GLM 5.3 Flash, MiniMax M3.1 Flash, Hy4 Flash, Nemotron 3.5 Bolt E4B | Unaffected |
 
 <a id="ernie-layer-major-prefill"></a>
 ### ERNIE layer-major CPU prefill
 
 Keeps per-layer token order and compares all-logit bits against row-by-row prefill in the synthetic stack. Improves the locality of layer weights. Wall time pending an official checkpoint A/B. The host code lives in `src/ernie/forward.cpp`. This row applies to the ERNIE CPU candidate.
 
-Engine matrix: inkling2-mini=unaffected, qwen3.8-flash-next=unaffected, qwen3.8-27b=unaffected, deepseek-v4.1-flash=unaffected, glm-5.3-flash=unaffected, minimax-m3.1-flash=unaffected, hy4-flash=unaffected, nemotron-3.5-bolt-e4b=unaffected.
+| Engines | State |
+| --- | --- |
+| ERNIE 5.5 Flash Preview | Opt-in host candidate |
+| Inkling2 Mini, Qwen3.8 Flash Next, Qwen3.8 27B, DeepSeek V4.1 Flash, GLM 5.3 Flash, MiniMax M3.1 Flash, Hy4 Flash, Nemotron 3.5 Bolt E4B | Unaffected |
 
 <a id="ernie-head-slabs"></a>
-### ERNIE streamed CPU vocabulary head
+### Streamed CPU vocabulary head projection
 
-Uses the same independent contiguous row dots as the whole matrix. A synthetic tail slab compares bitwise. Bounds the decoded head workspace at 64 MiB for the official shape, plus a 32 MiB input slice. The host code lives in `apps/ernie_cpu_main.cpp`. This row applies to the ERNIE CPU candidate.
+Uses the same independent contiguous row dots as the whole matrix. A synthetic tail slab compares bitwise. Bounds the decoded head workspace at 64 MiB for the official shape, plus a 32 MiB input slice. The host code lives in `src/core/streamed_linear_reference.hpp`. This row applies to the ERNIE CPU candidate.
 
-Engine matrix: inkling2-mini=unaffected, qwen3.8-flash-next=unaffected, qwen3.8-27b=unaffected, deepseek-v4.1-flash=unaffected, glm-5.3-flash=unaffected, minimax-m3.1-flash=unaffected, hy4-flash=unaffected, nemotron-3.5-bolt-e4b=unaffected.
+| Engines | State |
+| --- | --- |
+| ERNIE 5.5 Flash Preview | Opt-in host candidate |
+| Inkling2 Mini, Qwen3.8 Flash Next, Qwen3.8 27B, DeepSeek V4.1 Flash, GLM 5.3 Flash, MiniMax M3.1 Flash, Hy4 Flash, Nemotron 3.5 Bolt E4B | Unaffected |
 
 
 <a id="ds41-single-attention-read-ahead"></a>
@@ -6928,18 +6943,18 @@ A drafting run's plain passes replay the captured one-row step: the drafter tap 
 
 <a id="inkling2-verify-lanes-screened-head"></a>
 
-## Inkling 2 Mini CUDA verify windows pick through the lanes screened head
+## Inkling 2 Mini CUDA verify windows and cohort passes pick through the lanes screened head
 
 **Engine:** `inkling2-mini`. **Control:** STRIX_INK_SCREENED_HEAD=0/1. **Default:** ON in every tier (CUDA).
 
-A greedy verify window of up to 8 rows picks every row through the lanes form of the shared EXACT screened head instead of the full BF16 head per row.
+A greedy verify window of up to 8 rows picks every row through the lanes form of the shared EXACT screened head instead of the full BF16 head per row. A served cohort pass (one decode row per slot) picks every lane the same way when the screened-head lever built its plane and no lane reads its scores: the plane is read once for the cohort instead of the full BF16 head once per lane.
 
 - **Shared home:** src/cuda/core/head_screened.cuh (lanes); src/core/resident_greedy.hpp (enqueue_produced_rows).
 - **Tier and regime:** EXACT, FAST, QUALITY, TURBO; CUDA CLI speculative verify.
-- **Exactness evidence:** EXACT: lane l is bitwise the R=1 screened head (device test cuda_core_screened_head_test, lanes 1-32: 0 lanes differ); RTX q47 ids equal.
+- **Exactness evidence:** EXACT: lane l is bitwise the R=1 screened head (device test cuda_core_screened_head_test, lanes 1-32: 0 lanes differ); RTX q47 ids equal. Cohort passes: lane l is the one-row screened head of its row (the pass-2 body is the incumbent R=1 body, the pick rule is a total order, the bound is rigorous with a fall back to all rows), so ids are the incumbent ids by construction; score rows stay deferred and a read projects them with the same `project_head` over the same hidden rows, so logits read are equal too. RTX ch1 (11-27, build 87b9b21e9e, 8 served requests): ids EQUAL 46 / DIFF 0 vs the full head.
 - **Off switch:** STRIX_INK_SCREENED_HEAD=0.
-- **Measured gain:** Device bench at the Inkling head shape (q47): 8 lanes 696.8 -> 430.6 us per verify head (full head per row vs lanes screened); decode tok/s not measured apart.
-- **Preconditions:** CUDA greedy verify windows of <= 8 rows without a score read.
+- **Measured gain:** Device bench at the Inkling head shape (q47): 8 lanes 696.8 -> 430.6 us per verify head (full head per row vs lanes screened); decode tok/s not measured apart. Cohort: ch1 (11-27, build 87b9b21e9e, 8 requests) 214 -> 241 tok/s aggregate, one run, not an A/B campaign figure.
+- **Preconditions:** CUDA greedy verify windows of <= 8 rows without a score read; cohort passes when the screened-head lever built its plane, no lane reads its scores, lanes <= `max_lanes` and the head is BF16 (a compact head keeps its own pick).
 
 | Model | Binding |
 | --- | --- |
@@ -6948,7 +6963,7 @@ A greedy verify window of up to 8 rows picks every row through the lanes form of
 | DeepSeek V4.1 Flash | not bound: candidate (speculative verify); the lanes head exists, the engine's verify pick does not call it |
 | GLM 5.3 Flash | not bound: candidate (speculative verify); the lanes head exists, the engine's verify pick does not call it |
 | MiniMax M3.1 Flash | not bound: candidate (speculative verify); the lanes head exists, the engine's verify pick does not call it |
-| Inkling 2 Mini | bound: CUDA verify windows (this row) |
+| Inkling 2 Mini | bound: CUDA verify windows and served cohort passes (this row) |
 | Hy4 Flash | not bound: candidate (speculative verify); the lanes head exists, the engine's verify pick does not call it |
 | Nemotron 3.5 Bolt E4B | not bound: candidate (speculative verify); the lanes head exists, the engine's verify pick does not call it |
 <a id="gfx1151-lowbit-rows"></a>
@@ -7194,9 +7209,9 @@ While one lane is live, the HIP and CUDA servers run the command line's speculat
 
 - **Shared home:** src/serve/cohort_decode.cpp (LaneSpeculator, strix-lane-spec receipt), src/spec/drafting.cpp; src/inkling2/inkling2_mini_serve.cpp binding
 - **Tier and regime:** EXACT, FAST, QUALITY, TURBO; HIP and CUDA served decode, one live lane
-- **Exactness evidence:** EXACT: the lone lane verifies every window on the target (LaneSpeculator: the command line's drafter setup, arbiter and verify windows; DSpark drafter on slot 0); sampled lanes draft nothing (max_draft 0). q65: served code C1 ids == CLI Ac 2/2; served C1 == q45 8/8; C8 == C1 8/8 x3. HIP (cluster2 gfx1151, ink_hsrv t1-t3): served ids == CLI auto == CLI --speculation off, 256/256, code and prose, EXACT / FAST / TURBO; 8-slot server C1 / C2 / C4 / C8 ids equal with speculation on and off (t2). Host: strix-cohort-lane-speculation-tests, strix-fixed-kv-cohort-tests, inkling2-mini-serve (both backends bind the lone-lane speculator).
+- **Exactness evidence:** EXACT: the lone lane verifies every window on the target (LaneSpeculator: the command line's drafter setup, arbiter and verify windows; DSpark drafter on slot 0); sampled lanes draft nothing (max_draft 0). q65: served code C1 ids == CLI Ac 2/2; served C1 == q45 8/8; C8 == C1 8/8 x3. HIP (gfx1151, one node, 11-27, build 229647315f): served ids == CLI auto == CLI --speculation off, 256/256, code and prose, EXACT / FAST / TURBO; 8-slot server C1 / C2 / C4 / C8 ids equal with speculation on and off (t2). Host: strix-cohort-lane-speculation-tests, strix-fixed-kv-cohort-tests, inkling2-mini-serve (both backends bind the lone-lane speculator).
 - **Off switch:** --speculation off (every lane on the one-row route)
-- **Measured gain:** q65 (RTX PRO, Inkling 2 Mini CUDA server EXACT, 656-token code prompt, --speculation auto): C1 172.71 tok/s = 0.966x the command line's 178.83 at the same effort (q63 before the slot 0 tape fix: 0.56x); C8 median 215.4 tok/s. The 0.98 served/CLI band is not reached (1.4 points short); the remaining ~0.9 ms per step sits in the served step, not in the decisions (53 vs 51 model passes). HIP (Strix Halo gfx1151, one node, 660-token code / 1,879-token prose chat prompt, 256 tokens; ink_hsrv t1 / t3): served C1 EXACT 48.96 / 48.81 tok/s vs CLI auto 48.92 (1.00x; the campaign build served 25.9 = the context-draft route), FAST 48.76 / 48.25 vs 48.92 (0.99x), TURBO 48.82 / 48.65 vs 47.78 (1.02x); prose 29.19 vs CLI 29.36 and served plain 29.34 (the shared arbiter keeps prose at the plain rate); C2..C8 unchanged (lone lane only): C8 48.49 vs 48.36 with speculation off (t2).
+- **Measured gain:** q65 (RTX PRO, Inkling 2 Mini CUDA server EXACT, 656-token code prompt, --speculation auto): C1 172.71 tok/s = 0.966x the command line's 178.83 at the same effort (q63 before the slot 0 tape fix: 0.56x); C8 median 215.4 tok/s. The 0.98 served/CLI band is not reached (1.4 points short); the remaining ~0.9 ms per step sits in the served step, not in the decisions (53 vs 51 model passes). HIP (Strix Halo gfx1151, one node, 11-27, build 229647315f, 660-token code / 1,879-token prose chat prompt, 256 tokens): served C1 EXACT 48.96 / 48.81 tok/s vs CLI auto 48.92 (1.00x; the campaign build served 25.9 = the context-draft route), FAST 48.76 / 48.25 vs 48.92 (0.99x), TURBO 48.82 / 48.65 vs 47.78 (1.02x); prose 29.19 vs CLI 29.36 and served plain 29.34 (the shared arbiter keeps prose at the plain rate); C2..C8 unchanged (lone lane only): C8 48.49 vs 48.36 with speculation off (t2).
 - **Preconditions:** HIP or CUDA build, resolved speculation auto, exactly one live lane; the model drafter on slot 0 only (another slot, or slot 0 after a grouped forward, drafts lookup-only)
 
 | Model | Binding |
@@ -7206,9 +7221,49 @@ While one lane is live, the HIP and CUDA servers run the command line's speculat
 | DeepSeek V4.1 Flash | not bound: no served lane speculator |
 | GLM 5.3 Flash | not bound: no served lane speculator |
 | MiniMax M3.1 Flash | not bound: no served lane speculator |
-| Inkling 2 Mini | bound: HIP server (ink_hsrv t1-t3) and CUDA server (q65), one live lane |
+| Inkling 2 Mini | bound: HIP server (11-27, build 229647315f) and CUDA server (q65), one live lane |
 | Hy4 Flash | not bound: no served lane speculator |
 | Nemotron 3.5 Bolt E4B | not bound: no served lane speculator |
+
+<a id="expert-promotion-budget"></a>
+
+## Explicit expert promotion budget (tiered residency)
+
+**Engine:** `shared`. **Control:** `--expert-promotion-mib N` / `STRIX_EXPERT_PROMOTION_MIB=N` (0 = the seed only). **Default:** off (the planner's own per-step upload budget).
+
+A hard cap, after initialization, on the expert bytes the residency planner promotes to the card per step; it overrides the planner's own upload budget.
+
+- **Shared home:** src/residency/expert_residency.cpp (resolver), include/strix/residency/expert_residency.hpp (Planner)
+- **Tier and regime:** every tier; tiered expert residency only (a card smaller than the model)
+- **Exactness evidence:** EXACT: residency moves only change where an expert's bytes are read from. Unset, the resolver, the planner and the effective-config JSON are unchanged (legacy JSON test; CLI and environment parity test).
+- **Off switch:** leave `--expert-promotion-mib` and `STRIX_EXPERT_PROMOTION_MIB` unset
+- **Measured gain:** unmeasured.
+- **Preconditions:** tiered expert residency.
+
+| Model | Binding |
+| --- | --- |
+| Qwen3.8 Flash-Next MoE | bound: CUDA tiered residency (strix-cuda-qwen-serve, qwen_decode_bench) |
+| Other engines | not bound: no tiered expert residency |
+
+<a id="pair-price-layer-decode"></a>
+
+## Pair planner: serial decode pricing of layer-owned stages
+
+**Engine:** `shared`. **Control:** `STRIX_PAIR_PRICE_LAYER_DECODE=1` (`pair::chain` `Request::price_layer_owned_decode`). **Default:** off.
+
+When no device holds the whole model, the pair planner can price the serial decode of layer-owned stages with each stage's own rate and both link directions, so the cut it picks also accounts for decode, not only prefill.
+
+- **Shared home:** include/strix/pair/chain.hpp
+- **Tier and regime:** every tier (placement only); pairs with layer-owned state, the decoder is the last stage
+- **Exactness evidence:** EXACT: the price only ranks candidate cuts; every stage runs the same arithmetic. Off, the admission and the choice are unchanged (host test strix-pair-chain-tests).
+- **Off switch:** leave `STRIX_PAIR_PRICE_LAYER_DECODE` unset
+- **Measured gain:** unmeasured.
+- **Preconditions:** a pair where no device holds the whole model.
+
+| Model | Binding |
+| --- | --- |
+| Qwen3.8 Flash-Next MoE | bound: HIP pair app (strix-hip-qwen35-pair), opt-in |
+| Other engines | not bound: their own pair plans or one node |
 
 <a id="inkling2-chat-default-effort"></a>
 
