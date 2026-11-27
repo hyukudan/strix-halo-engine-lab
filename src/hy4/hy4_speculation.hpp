@@ -4,7 +4,6 @@
 // resolver (strix/session/speculation_default.hpp) decides. Host-only.
 #include "strix/session/speculation_default.hpp"
 
-#include <cstdlib>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -28,16 +27,22 @@ struct SpeculationRun {
 };
 // The decode-route facts the rank's argument list spells. Only the options named here own a route; the tier, the KV
 // storage, the prompt, the generation budget and the context are route-neutral (a launcher adds them to every command).
-// `--top 0` is the plain production form (device greedy row); any other --top asks for every step's logits.
-[[nodiscard]] inline SpeculationRun speculation_run_from_arguments(const std::vector<std::string>& args) {
+// `--top 0` (any spelling of the number zero) is the plain production form (device greedy row); any other --top asks for
+// every step's logits. `--teacher F` asks for the per-step route (the rank refuses a teacher file without ids).
+// `environment` is the caller's STRIX_MTP value (read through the shared environment home, never here).
+[[nodiscard]] inline bool top_asks_logits(std::string_view value) {
+    return value.empty() || value.find_first_not_of('0') != std::string_view::npos;
+}
+[[nodiscard]] inline SpeculationRun speculation_run_from_arguments(const std::vector<std::string>& args,
+                                                                   const char* environment) {
     SpeculationRun run;
-    run.environment = std::getenv(::strix::session::speculation_environment);
+    run.environment = environment;
     for (std::size_t i = 0; i < args.size(); ++i) {
         const std::string_view arg = args[i];
         if (::strix::session::speculation_opt_out_argument(arg)) run.no_mtp = true;
         else if (arg == "--mtp") run.explicit_mtp = true;
         else if (arg == "--teacher" || arg == "--dump-logits" || arg == "--timing" || arg == "--gate-ref") run.per_step_route = true;
-        else if (arg == "--top" && i + 1 < args.size() && args[i + 1] != "0") run.per_step_route = true;
+        else if (arg == "--top" && i + 1 < args.size() && top_asks_logits(args[i + 1])) run.per_step_route = true;
     }
     return run;
 }

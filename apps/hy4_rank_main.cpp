@@ -649,7 +649,10 @@ int run(int argc, char** argv) {
         const bool more = i + 1 < args.size();
         if (a == "--print-effective-config") print_config = true;
         else if (a == "--ids-file" && more) prompt = read_ids(args[++i]);
-        else if (a == "--teacher" && more) teacher = read_ids(args[++i]);
+        else if (a == "--teacher" && more) {
+            teacher = read_ids(args[++i]);
+            if (teacher.empty()) throw std::invalid_argument("--teacher: the file holds no token ids");
+        }
         else if (a == "--gen" && more) gen = static_cast<std::uint32_t>(std::stoul(args[++i]));
         else if (a == "--layers" && more) o.depth = static_cast<std::uint32_t>(std::stoul(args[++i]));
         else if (a == "--context" && more) o.context = static_cast<std::uint32_t>(std::stoul(args[++i]));
@@ -723,7 +726,7 @@ int run(int argc, char** argv) {
 
     const bool stage_route = stage_map.empty() && cut == 0U && !pipe_guess && window_costs.empty();
     // The route the argument list spells (hy4_speculation.hpp); the pack and the topology complete it.
-    auto spec_run = strix::hy4::speculation_run_from_arguments(args);
+    auto spec_run = strix::hy4::speculation_run_from_arguments(args, strix::envcfg::text(strix::session::speculation_environment));
     if (!o.parts.empty() && (!print_config || (layer_pair && !pair_receipt.empty())))
         spec_run.block_in_pack = strix::hy4::Config::from_gguf(o.parts.front()).nextn > 0U;
     spec_run.whole_model = o.depth == 0U;
