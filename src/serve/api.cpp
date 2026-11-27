@@ -759,6 +759,9 @@ struct ApiService::Impl {
             m.set("remote_fetch", Json(options.fetch.mode == media::FetchMode::allowlist && options.fetcher ? "allowlist" : "off"));
             out.set(entry.adapter->receipt_name(), std::move(m));
         }
+        // The instance's load-time declines (strix/profile/decline.hpp): absent when nothing was declined.
+        if (const auto declined = profile::process_declines().snapshot(); !declined.empty())
+            out.set("declined", parse_json(profile::declines_json(declined)));
         if (config.capabilities_extra) {
             config.capabilities_extra(out);
             Json canonical = Json::object();
@@ -1736,6 +1739,7 @@ struct ApiService::Impl {
             e.set("draft_sources", std::move(d)); // [shadow, scored, right rows, frame cycles, frame shadows]
         }
         for (const auto& [name, value] : o.stats.engine_extra) e.set(name, parse_json(value));
+        if (!o.stats.declined.empty()) e.set("declined", parse_json(profile::declines_json(o.stats.declined)));
         if (o.constraint && o.stats.constraint) selection_json(e, *o.constraint, *o.stats.constraint, o.stats.sampling == "sampling-v1");
         return e;
     }

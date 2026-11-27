@@ -2,6 +2,7 @@
 
 #include "strix/env_flags.hpp"
 #include "strix/fnv.hpp"
+#include "strix/profile/decline.hpp"
 #include "strix/turbo.hpp"
 
 #include <algorithm>
@@ -665,6 +666,22 @@ struct Entry {
     std::string ladder_reference{};  // the reference the deciding timing rows must name (LadderRow::over)
 };
 
+// True when the entry's column (not an explicit setting) asked for a value this regime does not run: a ladder row
+// lowered it, the column is pending, or the requested value is not the effective one (a regime no row decides, e.g. a
+// device without rows). Resolution::declines() records exactly these.
+[[nodiscard]] inline bool entry_declined(const Entry& entry) {
+    if (entry.ladder_lowered || entry.status == Status::pending) return true;
+    return entry.status != Status::explicit_cli && entry.status != Status::explicit_env && !entry.requested.empty() &&
+           entry.requested != entry.value;
+}
+// The reason a declined entry states: its route line, the pending target, the adapter's reason, else the resolver's.
+[[nodiscard]] inline std::string entry_decline_reason(const Entry& entry) {
+    if (!entry.ladder.empty()) return entry.ladder;
+    if (entry.status == Status::pending) return "pending column: " + entry.target + " is not admitted for this tier";
+    if (!entry.reason.empty()) return entry.reason;
+    return "no ladder row decides this regime for the column's value; the tier below runs";
+}
+
 // Adapters with their own app/option schemas bind the same qualification rule to their value columns.
 template <class Row>
 [[nodiscard]] bool explicit_value_qualified(const Row& lever, std::string_view value, std::string_view off,
@@ -728,6 +745,37 @@ struct Resolution {
     // Bit-changing switches outside the lever table that the engine applied and can attest ("name=value"). The tier
     // notice names them and then never claims the exact column.
     std::vector<std::string> engine_overrides;
+    // The regime resolve() decided in (decline_regime spelling), and the declines the adapter recorded after the
+    // resolver (load, memory, conflict, backend: decline()). Neither enters the fingerprint.
+    std::string decision_regime{};
+    std::vector<Decline> adapter_declines{};
+    // Every lever this run asked for and does not run, in table order then adapter order (strix/profile/decline.hpp):
+    // a ladder row that lowered the column in this regime, a pending column, and each decline() the adapter recorded.
+    // The receipt (json "declined", describe, receipt_lines) states exactly these.
+    [[nodiscard]] std::vector<Decline> declines() const {
+        std::vector<Decline> out;
+        for (const auto& entry : entries)
+            if (entry_declined(entry))
+                out.push_back({std::string(entry.lever->name),
+                               entry.status == Status::pending ? entry.target : entry.requested, entry.value,
+                               DeclineOrigin::resolver, decision_regime, entry_decline_reason(entry)});
+        out.insert(out.end(), adapter_declines.begin(), adapter_declines.end());
+        return out;
+    }
+    // Records a decline decided after the resolver (an empty regime takes the resolution's): writes its line to `out`,
+    // adds it to the process log and to this receipt.
+    void decline(Decline row, std::ostream& out) {
+        if (row.regime.empty()) row.regime = decision_regime;
+        record_decline(row, out);
+        for (const auto& recorded : adapter_declines)
+            if (recorded == row) return;
+        adapter_declines.push_back(std::move(row));
+    }
+    [[nodiscard]] std::vector<std::string> decline_lines() const {
+        std::vector<std::string> out;
+        for (const auto& row : declines()) out.push_back(decline_line(row));
+        return out;
+    }
     // Identity variants resolve() admitted, in declaration order; each points into engine->variants.
     [[nodiscard]] const std::vector<const IdentityVariant*>& identity_variants() const {
         if (!admitted_.empty() && (engine != admitted_engine_ || profile != admitted_profile_))
@@ -863,6 +911,8 @@ struct Resolution {
             }
             out += "]";
         }
+        // "declined" only when some lever is declined: a run that declines nothing keeps its legacy JSON.
+        if (const auto rows = declines(); !rows.empty()) out += ",\"declined\":" + declines_json(rows);
         return out + ",\"levers\":{" + levers + "},\"pending\":[" + pending + "],\"unqualified\":[" + unqualified +
             "],\"provisional\":[" + provisional + "]}";
     }
@@ -925,6 +975,7 @@ struct Resolution {
         std::vector<std::string> out{summary()};
         if (auto notice = tier_notice(); !notice.empty()) out.push_back(std::move(notice));
         if (!incumbent_identity()) out.push_back(identity());  // the incumbent's receipt lines are unchanged
+        for (auto& line : decline_lines()) out.push_back(std::move(line));
         return out;
     }
     // Line form for line-oriented --print-effective-config outputs (appended after the engine's own lines).
@@ -949,6 +1000,7 @@ struct Resolution {
             out += "identity " + std::string(variant->id) + '@' + std::to_string(variant->version) + " (" +
                 (variant->exact_identity ? "exact identity" : "bit-changing") + "; reference " +
                 std::string(variant->reference) + "; changes " + std::string(variant->changes) + ")\n";
+        for (const auto& line : decline_lines()) out += line + "\n";
         return out;
     }
     // FNV-1a 64 of what the ranks of a pair must share: the profile name, the qualification and every lever's
@@ -1642,6 +1694,8 @@ inline Resolution resolve(const Engine& engine, const Inputs& inputs) {
         return column_admission(lever, column, out.allow_pending, preset);
     };
     const auto regime = measured_receipt_regime(inputs.regime, inputs.env);
+    out.decision_regime =
+        decline_regime(regime.phase == Phase::prefill ? "prefill" : "decode", regime.context, regime.lanes, regime.device);
     out.entries = resolve_switches(engine.table, profile_column, regime, out.allow_pending,
         engine.ladder, {}, admit, [&](const Lever& lever) -> std::optional<SwitchSetting> {
             if (const auto* cli = last_setting(inputs.cli, lever.name)) return SwitchSetting{*cli, *cli, true};
@@ -1653,6 +1707,48 @@ inline Resolution resolve(const Engine& engine, const Inputs& inputs) {
     out.admitted_engine_ = &engine;
     out.admitted_profile_ = out.profile;
     return out;
+}
+
+// Weight residency is not per-request selection. An instance keeps the image of a lever's value resident when SOME
+// request inside its extent may select it: the extent's own regime resolves to `value`, or a ladder row of the lever
+// for the device and phase meets [1, max_context] x [1, max_lanes] (max_context 0: not bounded; max_lanes 0: left to
+// the memory budget, any lane count) and its probe at the met band's lower corner resolves to `value`. Each request
+// then resolves in its own regime and runs the value only where a row decides; elsewhere it declines for that request
+// (DeclineOrigin::request), never because of how the process started. `resolve_at(context, lanes)` returns the
+// instance's Resolution in that regime (the adapter spells Regime::execution for the probe).
+struct Residency {
+    bool resident = false;
+    std::string reason;  // resident: the regimes that may select it; not resident: the decline reason
+};
+
+template <class ResolveAt>
+[[nodiscard]] Residency may_select(const Engine& engine, std::string_view lever, std::string_view value, Phase phase,
+                                   std::string_view device, std::uint64_t max_context, std::uint32_t max_lanes,
+                                   ResolveAt&& resolve_at) {
+    const auto selects = [&](std::uint64_t context, std::uint32_t lanes) {
+        const Resolution resolution = resolve_at(context, lanes);
+        const auto* entry = resolution.find(lever);
+        return entry != nullptr && entry->value == value;
+    };
+    const auto bound = [](std::uint64_t v) { return v == 0U ? std::string("any") : std::to_string(v); };
+    const std::string extent = "context<=" + bound(max_context) + " lanes<=" + (max_lanes == 0U ? "auto" : bound(max_lanes));
+    const std::string what = std::string(lever) + "=" + std::string(value);
+    if (selects(max_context, max_lanes == 0U ? 1U : max_lanes)) return {true, what + " selected in the extent's own regime (" + extent + ")"};
+    std::string rows, met;
+    for (const auto& row : engine.ladder) {
+        if (row.lever != lever || row.incumbent || row.device != device || row.phase != phase) continue;
+        if (!row.value.empty() && row.value != value) continue;
+        const auto edge = ladder_min_context(row);
+        const std::string band = std::to_string(row.min_context) + ".." + std::to_string(row.max_context) + " x " +
+                                 std::to_string(row.min_lanes) + ".." + std::to_string(row.max_lanes);
+        rows += (rows.empty() ? "" : ", ") + band;
+        if (edge == 0U || (max_context != 0U && edge > max_context) || (max_lanes != 0U && row.min_lanes > max_lanes))
+            continue;
+        if (selects(edge, row.min_lanes)) met += (met.empty() ? "" : ", ") + band;
+    }
+    if (!met.empty()) return {true, what + " resident: requests in " + met + " (" + extent + ") select it"};
+    return {false, "no " + std::string(device) + " " + (phase == Phase::prefill ? "prefill" : "decode") + " row of " +
+                       what + " meets the extent " + extent + (rows.empty() ? std::string(" (no row)") : " (rows: " + rows + ")")};
 }
 
 // First defect of an engine's ladder rows (empty: none). With any timing receipt, every row of the table declares its

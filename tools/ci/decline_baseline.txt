@@ -1,0 +1,23 @@
+# Error-stream decline diagnostics that predate the strix-decline/v1 record (tools/ci/check_declines.py).
+# Shrink-only: bind a site to profile::record_decline / Resolution::decline / GenerationStats::declined and
+# remove its line. One site per line: path|diagnostic text.
+apps/inkling2_mini_gpu_main.hpp|inkling2 verify window programs declined (unproven for this profile: the identity
+apps/inkling2_mini_gpu_main.hpp|strix-lowbit-pack/v2 declined (
+src/glm/engine/engine.hip|glm prefill seqpar auto declined: %s; legacy path\n
+src/glm/engine/engine.hip|glm prefill seqpar: rows=%u declined (requires even rows >= 2); legacy path\n
+src/hip_deepseek41_prefill.hip|declined
+src/hip_hyper_mix_launcher.hip|persistent HC inject fold declined: %s\n
+src/hip_hyper_mix_launcher.hip|qpf2k HC fold declined: %s\n
+src/hip_hyper_mix_launcher.hip|window HC fold declined: %s\n
+src/hip_indexed_attention_launcher.hip|declined
+src/hip_indexed_attention_launcher.hip|qpf2k qsa mask bit 5 (FP16 KV shadow attend) declined: not byte-exact; default attend runs\n
+src/hip_moe_experts_launcher.hip|window commit + combine fold declined: %s\n
+src/hip_moe_q4k_a8_known_rows.hip|MoE route i8: tier split / down LDS epilogue / down TILE64 declined (they store BF16 route words)\n
+src/hip_moe_q4k_a8_known_rows.hip|qpf2k moe tile64 declined: LDS epilogue organization active\n
+src/hip_moe_q4k_a8_known_rows.hip|qpf2k moe tile64 declined: tier organization active\n
+src/hip_ple_launcher.hip|qpf2k ple rows f16 declined: shape unsupported by q8_rows::tiled\n
+src/inkling2/inkling2_mini_resident_decoder.hpp|Inkling CUDA cohort width=%u capture=declined fallback=eager\n
+src/inkling2/inkling2_mini_resident_decoder.hpp|declined:
+src/inkling2/inkling2_mini_serve_device.hpp|Inkling served_route declined: the command line's chunk
+src/inkling2/inkling2_mini_serve_device.hpp|declined (unproven for this profile)
+src/inkling2/inkling2_mini_serve_device.hpp|verify windows declined

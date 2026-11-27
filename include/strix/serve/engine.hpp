@@ -1,4 +1,5 @@
 #pragma once
+#include "strix/profile/decline.hpp"
 #include "strix/serve/chat_template.hpp"
 
 #include "strix/serve/short_first.hpp"
@@ -254,6 +255,10 @@ struct GenerationStats {
     std::string sampling = "greedy";
     // Engine receipts added to the response's "strix" object: (member name, JSON value text). Empty: none.
     std::vector<std::pair<std::string, std::string>> engine_extra;
+    // Levers this request asked for (its tier column, explicit setting or --all-on) and did not run, one record each
+    // (strix/profile/decline.hpp; DeclineOrigin::request for a resident lever outside the request's regime). The
+    // response's "strix" object states them as "declined"; empty: none (the member is absent).
+    std::vector<profile::Decline> declined;
     // Steady-clock nanoseconds of the job's execution span, stamped by the queue when the job finishes (0: not
     // stamped). The power receipt of a request is taken over this span, not over the time its response is rendered.
     std::int64_t exec_begin_ns = 0, exec_end_ns = 0;

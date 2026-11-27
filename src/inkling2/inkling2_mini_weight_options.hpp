@@ -17,6 +17,7 @@
 #include <cstdint>
 #include <iostream>
 #include <memory>
+#include <limits>
 #include <optional>
 #include <ostream>
 #include <span>
@@ -738,6 +739,36 @@ inline profile::Entry mini_decode_lowbit_head(MiniWeightOptions& options, std::s
     if (entry == nullptr) return {};
     if (!mini_lowbit_head_explicit(*entry)) apply_mini_lowbit_head(options, decoded, hip);
     return *entry;
+}
+
+// The decode-regime decision of the SP4 head column as a recorded decline (strix/profile/decline.hpp), for the
+// command line and the server alike. `requested` are the weight options before mini_decode_lowbit_head applied the
+// decided cell; `decided` its entry. Empty when the column ran (or asked for nothing). Otherwise the reason names the
+// ladder's route line and the residency over the instance's extent (profile::may_select): whether some request inside
+// the extent could select the column. The image is decided once at load on the extent: per-request selection of a
+// resident dual image is not bound on this route, so the reason says that every request runs the tier below.
+inline std::optional<profile::Decline> mini_lowbit_head_decline(const MiniWeightOptions& requested,
+                                                                const profile::Entry& decided, std::string_view device,
+                                                                weight::WeightLoadExtent extent,
+                                                                const MiniPromptExecution& run) {
+    if (decided.lever == nullptr || !profile::entry_declined(decided)) return std::nullopt;
+    const std::string wanted = decided.status == profile::Status::pending ? decided.target : decided.requested;
+    const auto residency = profile::may_select(kMiniProfile, kMiniLowBitHead, wanted, profile::Phase::decode,
+        device, extent.context, extent.lanes, [&](std::uint64_t context, std::uint32_t lanes) {
+            auto inputs = requested.tier;
+            // Probes come from the extent (32-bit) or a row's band edge, never above the extent's context.
+            const auto probe_context = static_cast<std::uint32_t>(
+                std::min<std::uint64_t>(context, std::numeric_limits<std::uint32_t>::max()));
+            const std::string execution = mini_decode_execution(run, weight::WeightLoadExtent{probe_context, lanes});
+            inputs.regime = {profile::Phase::decode, context, lanes, device, execution};
+            return resolve_mini_weight_profile(requested, std::move(inputs));
+        });
+    std::string reason = profile::entry_decline_reason(decided) + "; " + residency.reason;
+    if (residency.resident)
+        reason += "; the weight image is decided at load on the instance's extent (per-request selection of a resident "
+                  "image is not bound on this route): every request runs " + decided.value;
+    return profile::Decline{std::string(kMiniLowBitHead), wanted, decided.value, profile::DeclineOrigin::load,
+                            profile::decline_regime("decode", extent.context, extent.lanes, device), std::move(reason)};
 }
 
 // The run's resolution (receipt, fingerprint) states the decode-regime cell that loaded, not the prompt regime's.

@@ -98,6 +98,12 @@ jobs:
           python3 -B tools/ci/test_check_best_on_record.py
           python3 -B tools/ci/check_best_on_record.py --base HEAD^1
 
+      - name: No unrecorded lever declines
+        run: |
+          set -euo pipefail
+          python3 -B tools/ci/test_check_declines.py
+          python3 -B tools/ci/check_declines.py --base HEAD^1
+
       - name: Install Python test dependency
         shell: bash
         run: |

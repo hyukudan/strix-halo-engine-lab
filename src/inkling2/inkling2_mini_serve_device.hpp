@@ -42,15 +42,22 @@ inline MiniServeCohort make_mini_device_cohort(
     // The SP4 attention + head column in this instance's decode regime (the command line's rule with its own extent).
     {
         const auto probe = mini_weight_scope(opt.checkpoint, opt.tier, weight_options, extent);
-        const auto lowbit_head = mini_decode_lowbit_head(weight_options, probe.device_class, extent,
-            MiniPromptExecution{probe.cost_device, opt.context, opt.prefill_rows}, kServeHip);
+        const MiniPromptExecution run{probe.cost_device, opt.context, opt.prefill_rows};
+        const auto lowbit_head = mini_decode_lowbit_head(weight_options, probe.device_class, extent, run, kServeHip);
         if (!lowbit_head.ladder.empty()) std::cerr << lowbit_head.ladder << '\n';
+        // A lowered column is a recorded decline (startup line, /v1/capabilities), with the extent's residency.
+        if (auto decline = mini_lowbit_head_decline(opt.weight_options, lowbit_head, probe.device_class, extent, run))
+            profile::record_decline(std::move(*decline), std::cerr);
     }
     // Any served route admits the calibrated row: its decoder serves prompts emits-first (mini_served_prompt_emits_first),
     // so the final prompt token stays a BF16 prefill row. Outside the row's measured regime the incumbent loads.
     if (const auto decline = mini_lowbit_row_decline(opt.tier, weight_options, kMiniWeightBackend, extent);
-        !decline.empty())
+        !decline.empty()) {
         std::cerr << "strix-lowbit-pack/v2 declined (" << decline << "); using incumbent weights\n";
+        profile::record_decline({std::string(kMiniLowBitTurbo), "1", "0", profile::DeclineOrigin::load,
+                                 profile::decline_regime("decode", extent.context, extent.lanes), decline},
+                                std::cerr);
+    }
     const auto scope = mini_weight_scope(opt.checkpoint, opt.tier, weight_options, extent);
     auto weights = resolve_mini_resident_weight_load(opt.tier, weight_options, scope.view(), extent);
     if (!(scope.checkpoint == weight::Digest256{})) std::cerr << weight::weight_load_scope_receipt(scope.view()) << '\n';

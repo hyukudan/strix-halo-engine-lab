@@ -668,6 +668,31 @@ void profile_parity() {
                 if (std::string_view(tier) != "exact" && c.device == "gfx1151" && c.extent.lanes == 1U)
                     require(entry.ladder.find("decode ctx=") != std::string::npos,
                             "the decode cell prints its ladder route line");
+                // No silent decline: a column that does not run in this regime is one recorded decline, with the
+                // residency over the extent (some request inside it may select the row: gfx1151, >= 916 positions).
+                const auto decline = mini::mini_lowbit_head_decline(cli.weights, entry, c.device, c.extent,
+                    mini::MiniPromptExecution{"gfx1151 test product", c.extent.context, 128U});
+                require(decline.has_value() == strix::profile::entry_declined(entry),
+                        "every declined SP4 head cell is a recorded decline");
+                if (std::string_view(tier) != "exact")
+                    require(decline.has_value() == (entry.value != "sp4t-attn"),
+                            "the SP4 head column declines exactly outside its decode band");
+                if (decline) {
+                    require(decline->origin == strix::profile::DeclineOrigin::load && decline->requested == "sp4t-attn" &&
+                                decline->effective == "0" && !decline->reason.empty() &&
+                                decline->regime.rfind("phase=decode", 0) == 0U,
+                            "the decline names the requested and effective values, its origin and regime");
+                    const bool resident = c.device == "gfx1151" && c.extent.context >= 916U;
+                    require((decline->reason.find(" resident: requests in 916..2141 x 1..1") != std::string::npos) ==
+                                resident,
+                            ("residency is decided over the extent, not by the extent's own regime: ctx " +
+                             std::to_string(c.extent.context) + " lanes " + std::to_string(c.extent.lanes) + " dev " +
+                             std::string(c.device) + " | " + decline->reason).c_str());
+                    require(strix::profile::decline_line(*decline).rfind(
+                                "strix-decline/v1 lever=inkling2-mini-lowbit-head@1 requested=sp4t-attn effective=0 "
+                                "origin=load regime=\"phase=decode", 0) == 0U,
+                            "the decline prints its one strix-decline/v1 line");
+                }
                 strix::profile::Resolution receipt = cli.tier;
                 mini::mini_record_decode_entry(receipt, entry);
                 const auto* recorded = receipt.find(mini::kMiniLowBitHead);

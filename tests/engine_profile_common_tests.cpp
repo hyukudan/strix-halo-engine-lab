@@ -344,7 +344,11 @@ int main() try {
                                     .quality_rows = false, .turbo_version = "two-turbo-v1", .ladder = std::span(&applied_timing, 1)};
         const auto applied = resolve(two, in);
         require(applied.summary() == "profile fast levers applied=1", "applied lever listed, pending one not");
-        require(applied.tier_notice().empty() && applied.receipt_lines().size() == 1U, "no loud line once applied");
+        // No tier notice once applied; the pending column is the one recorded decline (no silent decline).
+        require(applied.tier_notice().empty() && applied.receipt_lines().size() == 2U &&
+                    applied.receipt_lines()[1].rfind("strix-decline/v1 lever=waiting requested=x effective=0 "
+                                                     "origin=resolver regime=\"phase=prefill context=8 ", 0) == 0U,
+                "no loud line once applied; the pending column is a recorded decline");
         static constexpr std::array<Lever, 1> pending_rows{rows[1]};
         static constexpr Engine waiting{.tag = "pending-engine", .allow_env = "STRIX_TEST_ALLOW", .table = pending_rows,
                                         .quality_rows = false, .turbo_version = "p-turbo-v1"};
