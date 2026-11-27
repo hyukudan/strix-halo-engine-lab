@@ -74,7 +74,7 @@ ResolvedService resolve(const serve::ServiceSelection& selection, const MiniServ
     // resolver and weight load as the command line (BF16 image prefills, the SP4 copies decode; needs
     // STRIX_LOWBIT_PACK, else the shared loader declines to the incumbent weights with its receipt line).
     apply_mini_lowbit_head(out.weight_options, resolution,
-                           resolved.backend.empty() ? backends.hip : resolved.backend == "hip");
+                           resolved.backend.empty() ? static_cast<bool>(backends.hip) : resolved.backend == "hip");
     if (out.weight_options.qualify != nullptr && out.weight_options.qualify_decode_only)
         std::cerr << "STRIX_INK_LOWBIT_HEAD: served decode-only arm " << out.weight_options.qualify->id.name
                   << " (served speed receipt pending)\n";
