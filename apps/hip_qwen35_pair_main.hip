@@ -317,6 +317,12 @@ int main(int argc, char** argv) try {
         if (up) { up->send(std::as_bytes(std::span(&w, 1))); up->receive(std::as_writable_bytes(std::span(&w, 1))); }
         if (down) down->send(std::as_bytes(std::span(&w, 1)));
     };
+    {   // Layer wire version before anything else crosses the line: a rank of another build is refused by name.
+        layers::Link hu, hd;
+        if (up) { hu.send = [&](std::span<const std::byte> b) { up->send(b); }; hu.receive = [&](std::span<std::byte> b) { up->receive(b); }; }
+        if (down) { hd.send = [&](std::span<const std::byte> b) { down->send(b); }; hd.receive = [&](std::span<std::byte> b) { down->receive(b); }; }
+        layers::line_hello(up ? &hu : nullptr, down ? &hd : nullptr);
+    }
     const auto count = layers::windows(prompt.size(), a.wide).size();
     const auto make_pipe = [&](strix::dist::Transport* t, unsigned role, std::uint32_t cut) {
         strix::pair::PipeOptions po;
@@ -390,6 +396,7 @@ int main(int argc, char** argv) try {
             if (img.size() != E->state_bytes(layer, layer + 1U)) throw std::runtime_error("state relay: byte count differs from this engine's layer");
             E->import_state(layer, layer + 1U, E->committed(), img.data());
         };
+        rops.layer_bytes = [&](std::uint32_t layer) { return static_cast<std::uint64_t>(E->state_bytes(layer, layer + 1U)); };
         rops.checksum = [](std::span<const std::byte> img) { return strix::dist::crc32c(img); };   // hardware CRC32C
         barrier();
         const auto rs = layers::relay_state(place, decoder_stage, first_token, up ? &ru : nullptr, down ? &rd : nullptr, rops);

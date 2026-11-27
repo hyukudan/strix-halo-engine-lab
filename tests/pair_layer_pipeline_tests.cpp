@@ -11,10 +11,12 @@
 #include <cstring>
 #include <deque>
 #include <exception>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "strix/pair/layer_pipeline.hpp"
@@ -459,6 +461,80 @@ int main() {
     // a stage with another model/plan identity is refused by name (and nothing hangs)
     const auto bad = run_chain(m, prompt, width, gen, {0, 3, 7}, 1U);
     expect(bad[1].error.find("seam header mismatch") != std::string::npos, "identity mismatch refused: got '" + bad[1].error + "'");
+    // Line hello: same version passes; another version or a build without the hello (its first word is the line barrier
+    // word) is refused by name on the new side, and nothing hangs (the refusing side closes the link).
+    {
+        const auto pair_run = [](const std::function<void(const layers::Link&)>& upper,
+                                 const std::function<void(const layers::Link&)>& lower) {
+            Channel ch;   // q[0]: upper -> lower, q[1]: lower -> upper
+            layers::Link to_lower{[&](std::span<const std::byte> b) { ch.send(0, b); }, [&](std::span<std::byte> b) { ch.receive(1, b); }};
+            layers::Link to_upper{[&](std::span<const std::byte> b) { ch.send(1, b); }, [&](std::span<std::byte> b) { ch.receive(0, b); }};
+            std::string err[2];
+            std::thread tu([&] { try { upper(to_lower); } catch (const std::exception& e) { err[0] = e.what(); ch.close(); } });
+            std::thread tl([&] { try { lower(to_upper); } catch (const std::exception& e) { err[1] = e.what(); ch.close(); } });
+            tu.join();
+            tl.join();
+            return std::pair{err[0], err[1]};
+        };
+        const auto hello_up = [](std::uint64_t v) { return [v](const layers::Link& l) { layers::line_hello(nullptr, &l, v); }; };
+        const auto hello_low = [](std::uint64_t v) { return [v](const layers::Link& l) { layers::line_hello(&l, nullptr, v); }; };
+        const auto same = pair_run(hello_up(layers::wire_version), hello_low(layers::wire_version));
+        expect(same.first.empty() && same.second.empty(), "line hello, same version: '" + same.first + "' / '" + same.second + "'");
+        const auto other = pair_run(hello_up(layers::wire_version), hello_low(layers::wire_version + 1U));
+        const std::string want = "wire version mismatch: this build speaks version ";
+        expect(other.first.find(want + std::to_string(layers::wire_version) + ", the downstream peer version " +
+                                std::to_string(layers::wire_version + 1U)) != std::string::npos,
+               "line hello, other version refused by the upper rank: got '" + other.first + "'");
+        expect(other.second.find(want + std::to_string(layers::wire_version + 1U) + ", the upstream peer version " +
+                                 std::to_string(layers::wire_version)) != std::string::npos,
+               "line hello, other version refused by the lower rank: got '" + other.second + "'");
+        const auto old_low = pair_run(hello_up(layers::wire_version), [](const layers::Link& l) { layers::line_barrier(&l, nullptr); });
+        expect(old_low.first.find("downstream peer sent no wire hello") != std::string::npos,
+               "line hello, a lower rank without the hello refused: got '" + old_low.first + "'");
+        const auto old_up = pair_run([](const layers::Link& l) { layers::line_barrier(nullptr, &l); }, hello_low(layers::wire_version));
+        expect(old_up.second.find("upstream peer sent no wire hello") != std::string::npos,
+               "line hello, an upper rank without the hello refused: got '" + old_up.second + "'");
+    }
+    // A damaged message HEADER (length or layer) is a named protocol error before any payload is allocated or read.
+    {
+        const auto relay_error = [](std::uint64_t layer, std::uint64_t length, bool exact) {
+            Channel ch;
+            const std::uint64_t count = 4U, header[5] = {layers::state_magic, layer, length, 0U, 1U};
+            ch.send(0, std::as_bytes(std::span(&count, 1)));
+            ch.send(0, std::as_bytes(std::span(header)));
+            layers::Link from{[&](std::span<const std::byte> b) { ch.send(1, b); }, [&](std::span<std::byte> b) { ch.receive(0, b); }};
+            layers::RelayOps ops;
+            ops.load = [](std::uint32_t, std::span<const std::byte>) {};
+            if (exact) ops.layer_bytes = [](std::uint32_t) { return std::uint64_t{64}; };
+            try {
+                (void)layers::relay_state(layers::Placement{{0, 3, 7}, 1}, 1U, 0U, &from, nullptr, ops);
+            } catch (const std::exception& e) { return std::string(e.what()); }
+            return std::string("no error");
+        };
+        const auto huge = relay_error(0U, std::uint64_t{1} << 40, false);
+        expect(huge.find("message length 1099511627776 bytes for layer 0, bound 4294967296 (protocol error)") != std::string::npos,
+               "relay header with a huge length refused before allocation: got '" + huge + "'");
+        const auto off = relay_error(1U, 65U, true);
+        expect(off.find("message length 65 bytes for layer 1, expected 64 (protocol error)") != std::string::npos,
+               "relay header with a wrong layer length refused: got '" + off + "'");
+        const auto layer = relay_error(9U, 64U, true);
+        expect(layer.find("message names layer 9 of a 7-layer plan") != std::string::npos,
+               "relay header naming a layer outside the plan refused: got '" + layer + "'");
+        Channel ch;
+        const std::uint64_t header[5] = {layers::tail_magic, 0U, std::uint64_t{1} << 40, 0U, 4U};
+        ch.send(0, std::as_bytes(std::span(header)));
+        layers::Link from{[&](std::span<const std::byte> b) { ch.send(1, b); }, [&](std::span<std::byte> b) { ch.receive(0, b); }};
+        layers::TailOps tail;
+        tail.row_bytes = 16U;
+        tail.load = [](std::uint32_t, const layers::Window&, std::span<const std::byte>) {};
+        std::string got = "no error";
+        try {
+            (void)layers::return_rows(layers::Placement{{0, 3, 7}, 0}, 10U, 4U, nullptr, &from, tail);
+        } catch (const std::exception& e) { got = e.what(); }
+        expect(got.find("tail rows: message does not match the window (window 0, length 1099511627776 bytes, expected 64)") !=
+                   std::string::npos,
+               "tail header with a damaged length refused before allocation: got '" + got + "'");
+    }
     // stage/cut validation
     bool threw = false;
     try { layers::Placement{{0, 3, 3, 7}, 0}.check(); } catch (const std::invalid_argument&) { threw = true; }
