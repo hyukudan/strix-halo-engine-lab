@@ -106,6 +106,9 @@ namespace fast {
 inline constexpr std::string_view levers = "fast";
 } // namespace fast
 inline constexpr std::string_view native_kv = "bf16";
+namespace native_resolution {
+inline constexpr std::string_view hip[] = {"implicit", "exact"};
+} // namespace native_resolution
 namespace turbo {
 namespace hip {
 inline constexpr std::string_view levers = "turbo";

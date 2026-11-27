@@ -142,7 +142,7 @@ void identity_reference_binding(std::mt19937& rng) {
         codebook = codebook && R::bits_of(R::mul1(state)) == R::bits_of(strix::core::trellis::mul1_value(state));
     check(codebook, "the identity reference codebook equals the shared MUL1 value on all 65536 states");
     for (const unsigned bits : {2U, 3U, 4U, 5U, 6U, 8U})
-        for (const auto shape : {std::pair{32U, 48U}, std::pair{128U, 256U}, std::pair{256U, 16U}}) {
+        for (const auto& shape : {std::pair{32U, 48U}, std::pair{128U, 256U}, std::pair{256U, 16U}}) {
             const auto [input, output] = shape;
             std::vector<std::uint32_t> words(std::size_t{input / 16U} * (output / 16U) * bits * 8U);
             for (auto& w : words) w = static_cast<std::uint32_t>(rng());

@@ -153,6 +153,7 @@
       "value": "1",
       "implementation": "v1",
       "execution_key": "bind_band_receipts/LadderArms::over",
+      "capture": "pending",
       "execution_scope": "HIP USB4 pair ready, admitted 8192-row chunk; full or routed scratch",
       "timing_receipt": "GLM pair 8K FAST bundle vs EXACT cores (gate v2 8K route replay PASS), docs/optimizations.md#glm-pf-wmma-x; lower edge 2,049: EXACT 3.83 s, FAST 2.79 s (x1.37); 4,096: x1.47",
       "gate_receipt": "FAST gate v2 PASS (corrected gate: R3 held-out labels, absolute bars, no null floor), pair, held-out set tools/strix-gate/heldout/v1 (gate_r 11-27): prompts of 2,304 and 8,192 tokens, 9 windows after the reference-only pre-filter (1 of 10 dropped, label == reference top-1 0.996), 2,295 rows. Route replay: KL < 0.00001, top-1 0.9991, dNLL -0.00003 (se 0.00004), free route-flip ratio 1.08. Free-running: 2,304-token class 1,275 rows KL 0.0039, top-1 0.979, dNLL -0.0036 (se 0.0031); 8,192-token class 1,020 rows KL 0.0032, top-1 0.985, dNLL -0.0006 (se 0.0026); pooled KL 0.0036, top-1 0.982 (one-ulp free null KL 0.0031 / 0.0026). Two exact runs bitwise equal (head dumps and routes, 10 of 10 windows). The earlier free-running KL 0.363 came from two windows of the 11-19 set (JSON, a 32K-document slice) where the exact arm's own one-ulp null reached KL 0.69 / 1.06 (route cascade).",
