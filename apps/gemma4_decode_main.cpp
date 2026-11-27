@@ -3,6 +3,7 @@
 #include "gemma4/ref/npz.hpp"
 #include "gemma4_prefill_ab.hpp"
 #include "bitcalc_measurement.hpp"
+#include "strix/env_flags.hpp"
 #ifdef STRIX_GEMMA4_DEVICE_BACKEND
 #include "gemma4/engine/pair.hpp"
 #include "strix/pair/link.hpp"
@@ -96,7 +97,7 @@ int main(int argc, char** argv) {
         // Quality-kit capture (shared apps/bitcalc_measurement.hpp): STRIX_BITCALC_FORCE_TOKENS / STRIX_BITCALC_LOGITS_OUT
         // for one prompt, or STRIX_BITCALC_CASES=FILE ("FORCE OUT PROMPT_IDS" per line) for a list served by one model load.
         std::vector<strix::decode_cli::BitcalcCase> bitcalc_cases;
-        if (const char* list = std::getenv("STRIX_BITCALC_CASES"); list && *list) {
+        if (const char* list = strix::envcfg::text("STRIX_BITCALC_CASES"); list && *list) {
             if (!prompts.empty() || !options.ids.empty() || !options.prompt.empty())
                 throw std::invalid_argument("STRIX_BITCALC_CASES names the prompts itself (no --ids/--prompt/--fixture)");
             bitcalc_cases = strix::decode_cli::read_bitcalc_cases(list);

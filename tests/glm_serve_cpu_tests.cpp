@@ -2212,10 +2212,10 @@ int main(int argc, char** argv) {
             CHECK(gs::decode(gs::encode(old_peer)).version == gs::kControlVersion);
             std::printf("v5-layout peer block: refused at the version check\n");
         }
-        // Builds of earlier layouts (v13: no stop decision in a sampled window; v12: the 10-word sampled decision; v11: the
-        // contributor's; v9: main before this change) are refused at the first exchange on either rank, before any later
-        // field is read.
-        for (const std::uint32_t old : {13U, 12U, 11U, 9U})
+        // Builds of earlier layouts (v14: the idle heartbeat cannot retire posted GPU-direct receives; v13: no stop
+        // decision in a sampled window; v12: the 10-word sampled decision; v11: the contributor's; v9: main before this
+        // change) are refused at the first exchange on either rank, before any later field is read.
+        for (const std::uint32_t old : {14U, 13U, 12U, 11U, 9U})
             for (const std::uint32_t rank : {0U, 1U}) {
                 gs::Channel ch(
                     [&](std::span<const std::byte> out, std::span<std::byte> in, std::uint32_t, std::uint64_t) {
@@ -2228,7 +2228,8 @@ int main(int argc, char** argv) {
                 gs::Control hello;
                 hello.cmd = static_cast<std::uint32_t>(gs::Cmd::heartbeat);
                 CHECK(throws_with([&] { (void)ch.exchange(hello); },
-                                  "protocol version " + std::to_string(old) + " from the peer, expected 14"));
+                                  "protocol version " + std::to_string(old) + " from the peer, expected " +
+                                      std::to_string(gs::kControlVersion)));
             }
         std::printf("v13 / v12 / v11 / v9 peers: refused at the first exchange on rank 0 and rank 1\n");
         std::vector<gs::WireRow> rows = {{0, 1, 3}, {1, 1, 3}, {2, 1, 9}};
