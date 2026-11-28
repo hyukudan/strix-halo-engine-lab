@@ -1,3 +1,4 @@
+#include "strix/profile/promotion_scope.hpp"
 #include "strix/model_content_hash.hpp"
 
 #include <algorithm>
@@ -331,6 +332,43 @@ int main() {
     }
     expect(duplicate_rejected,
            "aggregate identity rejects duplicate logical shard names");
+
+    // Pack content identity (the "pack=" scope of a promotion key): known answers shared with
+    // tools/strix-gate/promote.py pack_identity().
+    const auto pack = root / "pack";
+    std::filesystem::create_directories(pack / "sub");
+    std::filesystem::create_directories(pack / ".cache");
+    write_file(pack / "model.safetensors", "weights");
+    write_file(pack / "sub" / "config.json", "{}");
+    write_file(pack / ".cache" / "download.lock", "noise");
+    expect(strix::model_content_identity_hex(strix::pack_content_identity(pack)) ==
+               "d90fb2f77c1417081f16b123f054938d0597156d879eb65ed8450dbfbdce95a6",
+           "pack identity covers every file by relative path, dot paths skipped");
+    expect(strix::model_content_identity_hex(strix::pack_content_identity(pack / "model.safetensors")) ==
+               "ae0cc1e3f634297485d68cbbd048bfdcbb16ffa889cc441c44f12009c4d6d5ab",
+           "a single-file pack is named by its file name");
+    write_file(pack / ".cache" / "download.lock", "other noise");
+    expect(strix::model_content_identity_hex(strix::pack_content_identity(pack)) ==
+               "d90fb2f77c1417081f16b123f054938d0597156d879eb65ed8450dbfbdce95a6",
+           "dot paths never change the pack identity");
+    write_file(pack / "sub" / "extra.bin", "x");
+    expect(strix::model_content_identity_hex(strix::pack_content_identity(pack)) !=
+               "d90fb2f77c1417081f16b123f054938d0597156d879eb65ed8450dbfbdce95a6",
+           "a new pack file changes the pack identity");
+    bool missing_rejected = false;
+    try {
+        static_cast<void>(strix::pack_content_identity(root / "no-such-pack"));
+    } catch (const std::invalid_argument&) {
+        missing_rejected = true;
+    }
+    expect(missing_rejected, "a missing pack has no identity");
+    expect(!strix::profile::promotion_scope(false, "product", root / "no-such-pack", "cli", 1).known(),
+           "a run that does not want the promotion key reads no pack");
+    const auto scope = strix::profile::promotion_scope(true, "product", pack / "model.safetensors", "cli", 2);
+    expect(scope.known() && scope.scope().pack_sha256 ==
+               "ae0cc1e3f634297485d68cbbd048bfdcbb16ffa889cc441c44f12009c4d6d5ab" &&
+               scope.scope().route == "cli" && scope.scope().ranks == 2U && scope.product == "product",
+           "the promotion scope carries the pack identity, route and rank count");
 
     std::filesystem::remove_all(
         root,

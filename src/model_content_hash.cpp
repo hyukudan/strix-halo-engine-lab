@@ -884,6 +884,29 @@ SingleModelContentIdentity hash_single_model_content_file(const ModelContentFile
     if(!identity.valid() || !digest.digest.valid()) throw std::logic_error("model content SHA-256 identity unexpectedly all zero");
     return {digest.digest,identity,digest.bytes};
 }
+std::vector<ModelContentFile> pack_content_files(const std::filesystem::path& pack) {
+    namespace fs = std::filesystem;
+    std::vector<ModelContentFile> files;
+    if (fs::is_regular_file(pack)) {
+        files.push_back({pack.filename().generic_string(), pack});
+        return files;
+    }
+    if (!fs::is_directory(pack)) throw std::invalid_argument("pack is neither a file nor a directory: " + pack.string());
+    for (auto it = fs::recursive_directory_iterator(pack); it != fs::recursive_directory_iterator(); ++it) {
+        if (it->path().filename().string().starts_with(".")) {
+            if (it->is_directory()) it.disable_recursion_pending();
+            continue;
+        }
+        if (it->is_regular_file()) files.push_back({fs::relative(it->path(), pack).generic_string(), it->path()});
+    }
+    if (files.empty()) throw std::invalid_argument("pack directory holds no file: " + pack.string());
+    std::sort(files.begin(), files.end(), [](const auto& a, const auto& b) { return a.logical_name < b.logical_name; });
+    return files;
+}
+ModelContentIdentity pack_content_identity(const std::filesystem::path& pack) {
+    const auto files = pack_content_files(pack);
+    return build_model_content_identity(files);
+}
 std::string model_content_identity_hex(
     const ModelContentIdentity& identity) {
     constexpr char digits[] =

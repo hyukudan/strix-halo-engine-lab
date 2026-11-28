@@ -83,4 +83,12 @@ struct SingleModelContentIdentity {
 [[nodiscard]] std::string model_content_identity_hex(
     const ModelContentIdentity& identity);
 
+// The content identity of a weight pack (the "pack=" scope of a promotion key, profile::LadderScope): the
+// STRIX-MODEL-CONTENT-V1 identity of its files. A regular file is one file named by its file name; a directory is
+// every regular file below it named by its relative generic path, skipping any path component that starts with '.'
+// (download caches and editor state are not the pack). Uses the persistent file digest cache (a warm start reads
+// file metadata only). std::invalid_argument when the path is neither, or the directory holds no file.
+[[nodiscard]] std::vector<ModelContentFile> pack_content_files(const std::filesystem::path& pack);
+[[nodiscard]] ModelContentIdentity pack_content_identity(const std::filesystem::path& pack);
+
 }  // namespace strix
