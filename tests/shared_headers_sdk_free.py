@@ -85,6 +85,7 @@ NATIVE_HEADERS = {
     "src/core/fma_bf16_rows.hpp",
     "src/core/fma_rows.hpp",
     "src/core/gemv_rows.hpp",
+    "src/core/gemv_tree.hpp",  # HIP block-tree GEMV body of the launchers' reference projections.
     "src/core/hadamard.hpp",
     "src/core/hc_core.hpp",
     "src/core/hc_expand_rows.hpp",
@@ -97,6 +98,7 @@ NATIVE_HEADERS = {
     "src/core/iu4a4_projections.hpp",
     "src/core/lowbit_f16_staging.hpp",  # HIP FP16 staging and packed-code operands.
     "src/core/moe_i4_chain.hpp",
+    "src/core/null_ulp.hpp",  # host / device one-ulp null; its HIP launch is the device half.
     "src/core/ordered_reduce.hpp",
     "src/core/pointwise.hpp",
     "src/core/q8_f16_staging.hpp",

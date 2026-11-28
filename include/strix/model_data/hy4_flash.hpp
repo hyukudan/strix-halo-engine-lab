@@ -19,6 +19,10 @@ inline constexpr std::string_view axis = "layer";
 inline constexpr std::int64_t ranks = 2;
 inline constexpr std::string_view wire = "reference";
 } // namespace layers
+namespace replica {
+inline constexpr std::string_view objective = "throughput";
+inline constexpr std::int64_t ranks = 2;
+} // namespace replica
 namespace tensor {
 inline constexpr std::string_view draft_placement = "split";
 inline constexpr std::string_view expert_partition = "slots";

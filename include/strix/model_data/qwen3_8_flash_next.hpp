@@ -73,6 +73,14 @@ inline constexpr bool hidden_state_source_layer_explicit = false;
 inline constexpr bool use_dedicated_embeddings = false;
 } // namespace mtp
 namespace multi_device {
+inline constexpr std::string_view default_ = "single";
+inline constexpr std::string_view fallback = "single";
+namespace forms {
+namespace replica {
+inline constexpr std::string_view objective = "throughput";
+inline constexpr std::int64_t ranks = 2;
+} // namespace replica
+} // namespace forms
 namespace legacy_env {
 inline constexpr std::string_view STRIX_PAIR_STAGE_MAP = "forms.layers.cut";
 inline constexpr std::string_view STRIX_QWEN_PAIR_CHUNK_POLICY = "forms.layers.window_rows";
@@ -81,6 +89,7 @@ inline constexpr std::string_view STRIX_QWEN_PF_PIPE = "forms.layers";
 inline constexpr std::string_view STRIX_QWEN_PF_PIPE_CHUNK = "forms.layers.window_rows";
 inline constexpr std::string_view STRIX_QWEN_PF_PIPE_CUT = "forms.layers.cut";
 } // namespace legacy_env
+inline constexpr std::int64_t version = 1;
 } // namespace multi_device
 inline constexpr std::string_view name = "qwen3.8-flash-next";
 namespace norm {
@@ -112,6 +121,7 @@ inline constexpr std::string_view hip[] = {"implicit", "exact"};
 namespace turbo {
 namespace hip {
 inline constexpr std::string_view levers = "turbo";
+inline constexpr std::string_view weights_pack = "Qwen3.8-Flash-Next-UD-Q4_K_XL-merged.turbo-q4g64-v1.lowbit-pack";
 } // namespace hip
 inline constexpr std::string_view levers = "fast";
 } // namespace turbo

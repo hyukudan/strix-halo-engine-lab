@@ -50,6 +50,12 @@ inline int unsetenv(const char* name) { return _putenv_s(name,""); }
 using namespace strix;
 using namespace strix::decode_cli;
 namespace {
+// The default options as one named object: GCC 15 reports the string members of an Options{} temporary as maybe
+// uninitialised when only a field of it is read or it is moved from.
+const Options& default_options() {
+    static const Options defaults{};
+    return defaults;
+}
 // Synthetic CPU kernel fixture: compares compiler identities without HIP launchers.
 strix::kernels::KernelVariant config_test_variant(
     std::string id,
@@ -1193,7 +1199,7 @@ void serve_prefill_admission_tests(const ModelContract& model, const ModelManife
             if (mode==0) copied.options.residency=HipModelResidencyMode::resident_copy;
             if (mode==1) copied.options.model_copy_tier=HipModelCopyTier::normalization;
             if (mode==2) copied.environment["STRIX_MODEL_COPY_ALL"]="1";
-            copied.options.numerical_profile=Options{}.numerical_profile;
+            copied.options.numerical_profile=default_options().numerical_profile;
             copied.options.prefill_numerical_profile.reset();
             copied.options.model_copy_payload_bytes=mode==1?std::optional<std::uint64_t>(1):std::nullopt;
             copied.options.model_retained_budget=128*gib_bytes;
@@ -1551,7 +1557,7 @@ void yarn_owner_inventory_regression(RequestedOptions request, const gguf::FileI
     for(const auto context:{262144U,1048576U}) for(const bool mtp:{false,true}) {
         auto candidate=request;
         if(!mtp) {
-            candidate.options=Options{};
+            candidate.options=default_options();
             candidate.options.context_explicit=true;
             candidate.options.generate_tokens=128U;
         }
