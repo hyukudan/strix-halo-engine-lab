@@ -213,7 +213,7 @@ void test_resolution() {
     require(refused, "malformed W4A4 switch must be refused");
 }
 
-// TURBO iu4 runs only in the measured prefill regimes of its ladder rows (gfx1151, prompts of 1,143..32,760 tokens);
+// TURBO iu4 runs only in the measured prefill regimes of its ladder rows (gfx1151, prompts of 1,143..35,170 tokens);
 // every other regime, device and tier keeps the BF16 tile; explicit switches run as set.
 void test_ladder() {
     using A = strix::moe_core::grouped_w4a4::Activations;
@@ -227,9 +227,9 @@ void test_ladder() {
         options.tier = inputs(tier, value);
         return mini::mini_prompt_moe(options, device, tokens, false, nullptr, run);
     };
-    for (const std::uint64_t tokens : {1143ULL, 1148ULL, 4306ULL, 4307ULL, 4309ULL, 8192ULL, 8236ULL, 8237ULL, 32758ULL, 32760ULL})
+    for (const std::uint64_t tokens : {1143ULL, 1148ULL, 4306ULL, 4307ULL, 4309ULL, 8192ULL, 8236ULL, 8237ULL, 32758ULL, 32760ULL, 35170ULL})
         require(prompt(profile::Name::turbo, "gfx1151", tokens) == A::iu4_rot, "TURBO prefill inside the rows runs iu4");
-    for (const std::uint64_t tokens : {0ULL, 1ULL, 1142ULL, 32761ULL, 59258ULL, 131072ULL})
+    for (const std::uint64_t tokens : {0ULL, 1ULL, 1142ULL, 35171ULL, 59258ULL, 131072ULL})
         require(prompt(profile::Name::turbo, "gfx1151", tokens) == A::bf16, "unmeasured prompt sizes keep the BF16 tile");
     require(prompt(profile::Name::turbo, "sm_120", 8236U) == A::bf16, "other devices keep the BF16 tile");
     require(prompt(profile::Name::turbo, "", 8236U) == A::bf16, "an unknown device keeps the BF16 tile");

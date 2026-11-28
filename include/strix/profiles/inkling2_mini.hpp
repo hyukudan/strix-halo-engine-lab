@@ -329,11 +329,13 @@ inline constexpr std::array<profile::Lever, 19> kMiniLevers{{
 // tokens): 4K x1.1211 / x1.1171, 8K x1.0915 / x1.0944, 32K x1.0689 / x1.0861. A band takes the lower speedup of its
 // two ends, rounded down. Low band (receipts T6 / S7, iu4 alone against the TURBO default outside the band, i.e. the BF16
 // tile; CLI ABBA, served off / on with the command line's route): 1,143 tokens CLI x1.234 / x1.233, 1,148 tokens served
-// x1.239 / x1.238; its upper end is the 4K end above. Above 32,760 tokens the served 59,258-token end measured x1.002
-// (CLI 59,253 x1.080 / x1.086): no band there. Prompts below 1,143 or above 32,760 tokens are unmeasured and keep the tier
-// below.
+// x1.239 / x1.238; its upper end is the 4K end above. The top band ends at a served 35,170-token prompt (36,864-position
+// server, first request at the length, TURBO default 18.215 / 18.268 s vs iu4 16.774 / 16.810 s, x1.086; the 32K ends
+// above stay inside the band and keep its speedup). Above it the served 59,258-token end measured x1.002 (CLI 59,253
+// x1.080 / x1.086): no band there. Prompts below 1,143 or above 35,170 tokens are unmeasured and keep the tier below.
 inline constexpr std::string_view kMiniIu4PrefillReceipt =
-    "grouped-iu4a4-rot-v1 prefill timing, gfx1151, CLI + served, EXACT/TURBO interleaved, prompts of 4,307..32,760 tokens";
+    "grouped-iu4a4-rot-v1 prefill timing, gfx1151, CLI + served, EXACT/TURBO interleaved, prompts of 4,307..32,760 tokens; "
+    "served TURBO default vs iu4 at 35,170 tokens x1.086";
 inline constexpr std::string_view kMiniIu4PrefillLowReceipt =
     "grouped-iu4a4-rot-v1 prefill timing, gfx1151, CLI ABBA + served off/on, TURBO default vs iu4, prompts of 1,143 / "
     "1,148 tokens with the 4,307 / 4,309-token ends";
@@ -376,9 +378,9 @@ inline constexpr std::array<profile::LadderRow, 4> kMiniLadder{{
      .speedup = 1.091, .noise = 0.01, .receipt = kMiniIu4PrefillReceipt, .identity = "v1", .band_bound = true,
      .band_evidence = {{4307, 4309, 8234, 8236}, {}, kMiniIu4Gate}},
     {.lever = kMiniMoeW4a4, .value = "iu4", .tier = profile::Name::turbo, .phase = profile::Phase::prefill,
-     .device = "gfx1151", .min_context = 8237, .max_context = 32760, .min_lanes = 1, .max_lanes = 1,
+     .device = "gfx1151", .min_context = 8237, .max_context = 35170, .min_lanes = 1, .max_lanes = 1,
      .speedup = 1.068, .noise = 0.01, .receipt = kMiniIu4PrefillReceipt, .identity = "v1", .band_bound = true,
-     .band_evidence = {{8234, 8236, 32758, 32760}, {}, kMiniIu4Gate}},
+     .band_evidence = {{8234, 8236, 35170, 35170}, {}, kMiniIu4Gate}},
 }};
 
 // The lever table must stay bound here: an unbound row is never resolved, so its switch is silently ignored.
