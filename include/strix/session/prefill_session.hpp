@@ -30,6 +30,14 @@ public:
     [[nodiscard]] virtual std::uint32_t units_total() const noexcept { return 0; }
 };
 
+// Rows of the next piece of a prompt cut into pieces of at most `max_rows` rows. `even`: every multi-row piece is
+// even (an odd piece gives its last row to the next piece, so only a final 1-row piece or a 1-row prompt is odd).
+[[nodiscard]] constexpr std::uint32_t even_piece_rows(std::uint64_t remaining, std::uint32_t max_rows, bool even) noexcept {
+    auto n = static_cast<std::uint32_t>(std::min<std::uint64_t>(remaining, max_rows));
+    if (even && n > 1U && n % 2U == 1U) --n;
+    return n;
+}
+
 // Unit arithmetic of a prompt prefilled in pieces of at most `piece_rows` rows, each piece one pass over `layers`
 // layers that may pause at any layer boundary (pure; both ranks and the scheduler derive the same numbers).
 // Unit u (0-based) is layer u % layers of piece u / layers.
@@ -37,10 +45,15 @@ struct LayerUnits {
     std::uint64_t rows = 0;        // prompt rows of the session
     std::uint32_t piece_rows = 0;  // rows per piece (the engine's max_rows)
     std::uint32_t layers = 0;      // layers per pass
+    bool even = false;             // pieces by even_piece_rows (the pair's sequence-parallel prefill needs even pieces)
 
     [[nodiscard]] constexpr bool valid() const noexcept { return rows != 0 && piece_rows != 0 && layers != 0; }
     [[nodiscard]] constexpr std::uint64_t pieces() const noexcept {
-        return valid() ? (rows + piece_rows - 1U) / piece_rows : 0U;
+        if (!valid()) return 0U;
+        if (!even) return (rows + piece_rows - 1U) / piece_rows;
+        std::uint64_t count = 0;
+        for (std::uint64_t done = 0; done < rows; done += even_piece_rows(rows - done, piece_rows, true)) ++count;
+        return count;
     }
     [[nodiscard]] constexpr std::uint64_t total() const noexcept { return pieces() * layers; }
     // Admission must cover every piece, including the short tail, before a session starts.
@@ -48,6 +61,14 @@ struct LayerUnits {
     template<class Pausable>
     [[nodiscard]] constexpr bool all_pieces_pausable(Pausable pausable) const {
         if (!valid()) return false;
+        if (even) {
+            for (std::uint64_t done = 0; done < rows;) {
+                const auto n = even_piece_rows(rows - done, piece_rows, true);
+                if (!pausable(n)) return false;
+                done += n;
+            }
+            return true;
+        }
         if (!pausable(static_cast<std::uint32_t>(std::min<std::uint64_t>(rows, piece_rows)))) return false;
         const auto tail = static_cast<std::uint32_t>(rows % piece_rows);
         return rows <= piece_rows || tail == 0 || pausable(tail);
@@ -55,6 +76,11 @@ struct LayerUnits {
     // Rows of the piece unit `u` belongs to (the last piece may be short).
     [[nodiscard]] constexpr std::uint64_t piece_rows_at(std::uint64_t u) const noexcept {
         if (!valid() || u >= total()) return 0;
+        if (even) {
+            std::uint64_t first = 0;
+            for (std::uint64_t k = u / layers; k != 0; --k) first += even_piece_rows(rows - first, piece_rows, true);
+            return even_piece_rows(rows - first, piece_rows, true);
+        }
         const std::uint64_t first = (u / layers) * piece_rows;
         return std::min<std::uint64_t>(piece_rows, rows - first);
     }
