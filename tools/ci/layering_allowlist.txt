@@ -129,7 +129,7 @@ model-kernel src/h3/vae/fast_decoder.hip 2
 model-kernel src/h3/vae/vae_kernels.hip 8
 model-kernel src/hip_deepseek41_batch_forward.hip 5
 model-kernel src/hip_deepseek41_device_forward.hip 5
-model-kernel src/hip_deepseek41_prefill.hip 6
+model-kernel src/hip_deepseek41_prefill.hip 5
 model-kernel src/hip_ds41_attention.hip 24
 model-kernel src/hip_ds41_attention_f16wmma.inl 2
 model-kernel src/hip_ds41_attention_flash.inl 2
