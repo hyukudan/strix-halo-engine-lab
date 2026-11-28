@@ -499,6 +499,16 @@ their corresponding replayed arms. The promotion receipt records the verified
 plan, witness, binary and pack digests. Sealed-arm comparisons remain available
 for historical evidence and bit-identity checks.
 
+`promote.py` is that launcher, one band spec (`strix-promotion-band/v1`, data only) per ladder band:
+`promote.py band SPEC --stage reference` captures the reference and null arms and freezes the plan (window IDs,
+classes, per-window reference NLL, null envelope); it refuses once a candidate capture exists, so publish the
+printed plan SHA-256 first. `promote.py band SPEC --stage candidate --receipt RUN.log` captures the candidate arms,
+writes the witness, runs `qual --promotion`, takes the manifest draft from the `promotion_reference` the engine's
+profile receipt reports for the lever (the promotion key: full device product and `pack=|route=|ranks=` scope),
+times ABBA at both band ends and the recorded run (or reads `--samples` from an external harness), and seals the
+entry with `check_promotion_manifest.seal()` (`--manifest` appends it). The pack identity is
+`strix::pack_content_identity()` (`promote.py pack PATH` prints the same digest).
+
 For preregistered qualification, `qual --frozen-qualification PLAN.json SHA256` pins the complete case set, content
 classes, IDs and class-specific R4 reference distribution. Publish the SHA-256 before collecting the candidate.
 The plan has `schema` equal to `strix-gate-frozen-qualification/v1`, a `windows` map from case to
