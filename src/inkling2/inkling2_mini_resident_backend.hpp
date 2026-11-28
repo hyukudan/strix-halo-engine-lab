@@ -843,9 +843,13 @@ private:
         auto* attended = take(kQueryWidth);
         auto* gated = take(kQueryWidth);
 #if defined(__HIPCC__)
-        // The prefill projections' BF16 operand image: rows x the widest projection input (u16).
-        const std::span<std::uint16_t> operand_image(reinterpret_cast<std::uint16_t*>(take(kQueryWidth / 2U)),
-                                                     std::size_t{max_rows_} * kQueryWidth);
+        // The prefill projections' BF16 operand image: rows x the widest projection input (u16). A moments capture runs
+        // without it: the fused output gate (attn_core::PreparedGqaGateImage) stores the gated rows only as that image,
+        // and the output-input moments read the FP32 gated rows (the routed entry without an image: same bits).
+        auto* const operand_rows = reinterpret_cast<std::uint16_t*>(take(kQueryWidth / 2U));
+        const std::span<std::uint16_t> operand_image =
+            calibration_ != nullptr ? std::span<std::uint16_t>{}
+                                    : std::span<std::uint16_t>(operand_rows, std::size_t{max_rows_} * kQueryWidth);
 #endif
         const auto* lag = mini_convolution_layer(lag_weights_.data(), visit);
         auto* failure = flags_.data() + visit.logical_layer;
