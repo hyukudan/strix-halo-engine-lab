@@ -764,11 +764,11 @@ struct Entry {
     std::string promotion_reference{};  // the same over the promotion execution (what a sealed promotion row records)
 };
 
-// True when the entry's column (not an explicit setting) asked for a value this regime does not run: a ladder row
-// lowered it, the column is pending, or the requested value is not the effective one (a regime no row decides, e.g. a
-// device without rows). Resolution::declines() records exactly these.
+// True when the entry's column (not an explicit setting) asked for a value this regime does not run, or the column
+// is pending. A lower ladder tier can supply the same requested value (e.g. TURBO inheriting FAST): its route notice
+// remains, but it is not a decline. Resolution::declines() records actual refusals.
 [[nodiscard]] inline bool entry_declined(const Entry& entry) {
-    if (entry.ladder_lowered || entry.status == Status::pending) return true;
+    if (entry.status == Status::pending) return true;
     return entry.status != Status::explicit_cli && entry.status != Status::explicit_env && !entry.requested.empty() &&
            entry.requested != entry.value;
 }
