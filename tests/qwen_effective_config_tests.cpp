@@ -50,10 +50,10 @@ inline int unsetenv(const char* name) { return _putenv_s(name,""); }
 using namespace strix;
 using namespace strix::decode_cli;
 namespace {
-// The default options as one named object: GCC 15 reports the string members of an Options{} temporary as maybe
-// uninitialised when only a field of it is read or it is moved from.
+// The default options as one static object, default-initialised (zero-initialised first, as any static): GCC 15
+// reports the string members of an aggregate-initialised Options{} as maybe uninitialised on its cleanup path.
 const Options& default_options() {
-    static const Options defaults{};
+    static Options defaults;
     return defaults;
 }
 // Synthetic CPU kernel fixture: compares compiler identities without HIP launchers.
