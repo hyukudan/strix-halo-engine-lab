@@ -83,19 +83,19 @@ inline constexpr std::int64_t residual_block_layers = 6;
 } // namespace schedule
 inline constexpr std::string_view schema = "strix-model/v1";
 namespace speculation {
-inline constexpr std::string_view block_drafter = "dflash2";
-inline constexpr std::string_view drafter = "mtp.safetensors";
-inline constexpr std::int64_t max_draft_by_live[] = {7, 0};
 namespace block_by_default {
 inline constexpr bool exact = true;
 inline constexpr bool fast = true;
 inline constexpr bool turbo = true;
 } // namespace block_by_default
+inline constexpr std::string_view block_drafter = "dflash2";
 namespace block_wins_ties {
 inline constexpr bool exact = true;
 inline constexpr bool fast = false;
 inline constexpr bool turbo = false;
 } // namespace block_wins_ties
+inline constexpr std::string_view drafter = "mtp.safetensors";
+inline constexpr std::int64_t max_draft_by_live[] = {7, 0};
 namespace probe_loss {
 inline constexpr double cuda = 0x1.eb851eb851eb8p-7 /* 0.015 */;
 } // namespace probe_loss
