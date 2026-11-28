@@ -6592,6 +6592,35 @@ it in `src/inkling2/inkling2_mini_weight_options.hpp` (qualifiable policy), `src
 | inkling2-mini | bound (HIP, explicit decode-only arm, command line) |
 | qwen3.8-flash-next, qwen3.8-27b, deepseek-v4.1-flash, glm-5.3-flash, minimax-m3.1-flash, hy4-flash, nemotron-3.5-bolt-e4b | not bound: no resident low-bit attention route on the shared projection dispatch and no calibrated `strix.sp4t` pack |
 
+<a id="inkling2-sp4t-attention-gate"></a>
+## Inkling 2 Mini decode attention output gate: Strix pack SP4 (`strix.sp4t`) as a per-role gate storage
+
+**Engine:** `inkling2-mini` (HIP). **Control:** `STRIX_INK_LOWBIT_HEAD=sp4t-attn-gate` (command line, `--profile fast` /
+`turbo`) or `--qualify-decode-weights weights.attention_gate_head.sp4t@1`, with `STRIX_LOWBIT_PACK` naming a calibrated
+`strix.sp4t` pack of `attn.wq_du`, `attn.wk_dv`, `attn.wv_dv`, `attn.wo_ud`, `attn.gate_attn` and `llm.unembed`
+(`--technique both --damp 0.1`; the query input of the moments lists `gate_attn` as its second consumer).
+**Default:** off in every tier; an explicit decode-only qualification arm.
+
+**Shared home:** the load policy gains a per-role `gate` storage (`WeightLoadPolicy::gate`, `RoleStorage::gate`,
+`WeightLoadPlan::gate_storage` in `include/strix/weight/levers.hpp`; `src/weight/resolve.cpp` requires a consumer for it).
+Every existing policy resolves the gate as BF16 and prints an unchanged receipt; the new policy
+`weights.attention_gate_head.sp4t@1` prints `gate strix.sp4t@1`. Inkling names its output gate as data (the
+`gate_attn` suffix of its tensor map); the gate joins the grouped SP4 run of the query input (`{gate, k, v}`), while the
+relative and sink projections stay BF16.
+
+- **Exactness evidence:** bit-changing (lossy weights). Policies without a gate role are unchanged (host tests of the
+  resolver, receipts and profile tables).
+- **Calibration note:** moments are captured without the BF16 operand image (`src/inkling2/inkling2_mini_resident_backend.hpp`):
+  the fused output gate stores the gated rows only as that image, so a long-prompt capture read an unwritten buffer.
+- **Measured gain:** CLI B=1, one request, 255 tokens, gfx1151, tokens/s EXACT / `sp4t-attn` / `sp4t-attn-gate`: plain
+  (context 660) 29.66 / 35.12 / 37.95 (-2.1 ms per token); DFlash code 64.79 / 52.78 / 72.37 (tokens per pass 5.67 /
+  4.11 / 5.43); DFlash prose (context 1879) 32.45 / 40.84 / 45.71. Token ids are equal with and without DFlash.
+- **Quality (gate v2, decode, 39 windows, head 64):** no verdict: the held-out check refuses four windows (code-04,
+  code-10, structured-01, structured-13) where every label equals the top-1 of both arms. Without them (diagnostic, not a
+  qualification): TURBO passes every class (replay KL 0.0037, top-1 0.978, dNLL +0.0028; free-running KL 0.0072) but code
+  and structured fall to 693 rows (unresolved below 800); FAST fails six windows on dNLL (+0.017 to +0.030).
+- **Off switch:** do not pass the qualification arm.
+
 <a id="shared-sp4t-grouped-projections"></a>
 ## Grouped Strix pack SP4 resident projections (`strix.sp4t`)
 
