@@ -2005,6 +2005,19 @@ void band_chain() {
 // No silent declines (strix/profile/decline.hpp): one record form, a reason always, a process log that collapses
 // repeats.
 void decline_record() {
+    // TURBO can inherit a measured FAST cell without refusing the requested value.
+    // Keep the lower-tier route notice, but report a decline only when the value is not delivered.
+    p::Entry inherited{};
+    inherited.requested = "sp4t-attn";
+    inherited.value = inherited.requested;
+    inherited.status = p::Status::set;
+    inherited.ladder_lowered = true;
+    require(!p::entry_declined(inherited), "a lower-tier route supplying the requested value is not a decline");
+    inherited.value = "0";
+    require(p::entry_declined(inherited), "a lower-tier route refusing the requested value is a decline");
+    inherited.status = p::Status::pending;
+    inherited.target = "sp4t-attn";
+    require(p::entry_declined(inherited), "a pending column is still a decline");
     const p::Decline row{"lever@1", "on", "off", p::DeclineOrigin::request,
                          p::decline_regime("decode", 0U, 0U, "gfx1151"), "say \"why\"\nnow"};
     require(p::decline_line(row) ==
