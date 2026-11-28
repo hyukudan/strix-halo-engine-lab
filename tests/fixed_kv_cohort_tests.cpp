@@ -1141,6 +1141,67 @@ struct HookDecoder : WindowDecoder {
     void control(std::span<const std::uint32_t> words) { controls.insert(controls.end(), words.begin(), words.end()); }
 };
 
+// The round forms: one drafter pass for the round's lanes and the round's sampled rows in one call.
+struct RoundHookDecoder : HookDecoder {
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> round;  // slot, room of the last propose_slots
+    std::vector<std::uint32_t> sampled_rows;
+    bool in_round = true;
+    void propose_slots(std::span<const strix::serve::CohortProposal> lanes) {
+        if (std::ranges::any_of(staged, [](std::uint32_t r) { return r != 0U; }))
+            throw std::logic_error("round proposal over a staged window");
+        round.clear();
+        for (const auto& p : lanes) round.emplace_back(p.lane, p.room);
+    }
+    [[nodiscard]] bool samples_in_round() const { return in_round; }
+    void sample_slot_rows(std::span<strix::serve::CohortSample> rows) {
+        for (auto& s : rows) {
+            sampled_rows.push_back(s.lane);
+            s.token = sample_slot_row(s.lane, *s.sampler, s.position);
+        }
+    }
+};
+
+void test_round_slot_hooks() {
+    // Without the round hooks: CohortBackend defaults (no round sampling; the default sample_round = sample_final).
+    {
+        FixedKvCohort<HookDecoder> plain(std::make_unique<HookDecoder>(), 64U, 8U, 3U);
+        check(!plain.samples_in_round(), "no sample_slot_rows: no round sampling");
+    }
+    auto decoder = std::make_unique<RoundHookDecoder>();
+    auto* raw = decoder.get();
+    FixedKvCohort<RoundHookDecoder> cohort(std::move(decoder), 64U, 8U, 3U);
+    const strix::serve::CohortProposal asks[] = {{2U, 3U}, {0U, 1U}};
+    const CohortGroup window[] = {{1U, 3U, false}, {0U, 1U}};
+    const std::uint32_t window_tokens[] = {50U, 51U, 52U, 53U};
+    std::uint32_t window_top[4] = {};
+    cohort.verify(window, window_tokens, window_top);
+    cohort.propose_round(asks);
+    check(raw->discarded == 1U, "a round proposal discards an unresolved staged window first");
+    check(raw->round == std::vector<std::pair<std::uint32_t, std::uint32_t>>{{2U, 3U}, {0U, 1U}},
+          "propose_round forwards every (slot, room) in order");
+
+    // Round sampling: entries name the lanes; the decoder sees the score rows of the pending window.
+    const CohortGroup ones[] = {{1U, 1U}, {0U, 1U}};
+    const std::uint32_t one_tokens[] = {40U, 41U};
+    std::uint32_t one_top[2] = {};
+    cohort.verify(ones, one_tokens, one_top);
+    strix::TokenSamplingPolicy policy;
+    policy.temperature = 0.7f;
+    strix::TokenSampler a(policy, strix::TokenSamplerOptions{}), b(policy, strix::TokenSamplerOptions{});
+    check(cohort.samples_in_round(), "sample_slot_rows: round sampling");
+    strix::serve::CohortSample samples[] = {{0U, &a, 3U, 0U}, {1U, &b, 4U, 0U}};
+    cohort.sample_round(samples);
+    check(raw->sampled_rows == std::vector<std::uint32_t>{1U, 0U}, "the decoder samples the lanes' window rows");
+    check(samples[0].token == cohort.sample_final(0U, a, 3U) && samples[1].token == cohort.sample_final(1U, b, 4U),
+          "each entry's id is sample_final's");
+    strix::serve::CohortSample outside[] = {{2U, &a, 3U, 0U}};
+    check(throws([&] { cohort.sample_round(outside); }), "a lane outside the window is refused");
+    const std::uint32_t keep_ones[] = {1U, 1U};
+    cohort.commit(keep_ones);
+    raw->in_round = false;
+    check(!cohort.samples_in_round(), "the decoder may decline round sampling at run time");
+}
+
 // Emits-first decoder offering the group pass: grouping stays off on that route.
 struct EmitsGroupDecoder : EmitsGreedyDecoder {
     [[nodiscard]] strix::serve::PrefillGroupCapacity prefill_group_capacity() const {
@@ -1249,6 +1310,7 @@ void test_optional_slot_hooks() {
 
 int main() {
     test_optional_slot_hooks();
+    test_round_slot_hooks();
     test_prompt_tail();
     test_geometry();
     test_greedy_window();

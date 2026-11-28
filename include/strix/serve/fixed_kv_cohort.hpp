@@ -79,6 +79,11 @@ struct SlotRows {
 //    on the plain prefill route: with emits-first the capacity reads one member (no grouping).
 //  - samples_on_device() const -> bool and sample_slot_row(row, sampler, position) -> id: device sampling of the
 //    row read_slot_logits(row, ...) would return (CohortBackend::samples_on_device / sample_final).
+//  - propose_slots(proposals): one drafter pass for the round's lanes (CohortBackend::propose_round), before the
+//    round's propose_slot calls; offered with propose_slot only.
+//  - samples_in_round() const -> bool and sample_slot_rows(samples): the round's sampled rows in one call
+//    (CohortBackend::samples_in_round / sample_round); each entry's lane field names the score row sample_slot_row
+//    would read. Offered with sample_slot_row only.
 //  - bind_slot(slot, request_id, traits) and control(words): per-request words and engine control messages.
 class FixedKvLaneBinding {
 public:
@@ -378,6 +383,14 @@ public:
             CohortBackend::propose(lane, room, tokens, probability);
         }
     }
+    void propose_round(std::span<const CohortProposal> lanes) override {
+        if constexpr (kRoundProposes) {
+            before_work();
+            decoder_->propose_slots(lanes);
+        } else {
+            CohortBackend::propose_round(lanes);
+        }
+    }
 
     [[nodiscard]] std::uint64_t restore(std::uint32_t lane, std::span<const std::uint32_t> prompt) override {
         if constexpr (kRetains) {
@@ -428,6 +441,20 @@ public:
             return decoder_->sample_slot_row(final_row(lane), sampler, position);
         } else {
             return CohortBackend::sample_final(lane, sampler, position);
+        }
+    }
+    [[nodiscard]] bool samples_in_round() const override {
+        if constexpr (kRoundSamples) return decoder_->samples_in_round();
+        else return false;
+    }
+    void sample_round(std::span<CohortSample> lanes) override {
+        if constexpr (kRoundSamples) {
+            round_samples_.assign(lanes.begin(), lanes.end());
+            for (auto& s : round_samples_) s.lane = final_row(s.lane);
+            decoder_->sample_slot_rows(std::span<CohortSample>(round_samples_));
+            for (std::size_t i = 0; i < lanes.size(); ++i) lanes[i].token = round_samples_[i].token;
+        } else {
+            CohortBackend::sample_round(lanes);
         }
     }
 
@@ -518,6 +545,14 @@ private:
     static constexpr bool kSamples = requires(Decoder& decoder, const Decoder& view, TokenSampler& sampler) {
         { view.samples_on_device() } -> std::convertible_to<bool>;
         { decoder.sample_slot_row(std::uint32_t{}, sampler, std::uint64_t{}) } -> std::convertible_to<std::uint32_t>;
+    };
+    static constexpr bool kRoundProposes = kProposes && requires(Decoder& decoder, std::span<const CohortProposal> lanes) {
+        decoder.propose_slots(lanes);
+    };
+    static constexpr bool kRoundSamples = kSamples && requires(Decoder& decoder, const Decoder& view,
+                                                               std::span<CohortSample> rows) {
+        { view.samples_in_round() } -> std::convertible_to<bool>;
+        decoder.sample_slot_rows(rows);
     };
     static constexpr bool kBinds = requires(Decoder& decoder, std::span<const std::uint32_t> traits) {
         decoder.bind_slot(std::uint32_t{}, std::uint64_t{}, traits);
@@ -694,6 +729,7 @@ private:
     std::vector<std::uint32_t> mixed_top_, mixed_keep_;
     bool mixed_staged_ = false;
     std::vector<std::uint32_t> pending_releases_;  // kReleases: lanes released while a window was staged
+    std::vector<CohortSample> round_samples_;      // kRoundSamples: the round's entries with score rows for lanes
     std::vector<float> logits_;
     // emits-first: the lane of the last prefill call and its first id, valid until the next backend call; kept apart
     // from the verify window, so a commit right after a prefill is refused.

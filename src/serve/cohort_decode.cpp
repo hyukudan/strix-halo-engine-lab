@@ -29,6 +29,21 @@ std::uint32_t CohortBackend::sample_final(std::uint32_t, TokenSampler&, std::uin
     throw std::logic_error("temperature: this cohort backend does not sample on the device");
 }
 
+std::span<const float> CohortBackend::read_row_logits(std::uint32_t, std::uint32_t) {
+    throw std::logic_error("sampled drafts: this cohort backend cannot read window rows");
+}
+
+std::uint32_t CohortBackend::sample_row(std::uint32_t, std::uint32_t, TokenSampler&, std::uint64_t) {
+    throw std::logic_error("sampled drafts: this cohort backend cannot sample window rows on the device");
+}
+
+void CohortBackend::sample_round(std::span<CohortSample> lanes) {
+    for (auto& s : lanes) {
+        if (s.sampler == nullptr) throw std::logic_error("cohort backend: a round sample without its sampler");
+        s.token = sample_final(s.lane, *s.sampler, s.position);
+    }
+}
+
 void CohortBackend::propose(std::uint32_t, std::uint32_t, std::vector<std::uint32_t>& tokens,
                             std::vector<double>& probability) {
     tokens.clear();
@@ -79,6 +94,12 @@ std::uint32_t sample_lane(CohortBackend& backend, std::uint32_t lane, TokenSampl
     if (backend.samples_on_device()) return backend.sample_final(lane, sampler, position);
     return sampler.decide(backend.read_final_logits(lane), position, nullptr).token;
 }
+// The sampled id of row `row` of a lane's window (sampled drafts): decided as without a draft at its position.
+std::uint32_t sample_window_row(CohortBackend& backend, std::uint32_t lane, std::uint32_t row, TokenSampler& sampler,
+                                std::uint64_t position) {
+    if (backend.samples_on_device()) return backend.sample_row(lane, row, sampler, position);
+    return sampler.decide(backend.read_row_logits(lane, row), position, nullptr).token;
+}
 // The lane's counters of one request (CohortResult::lane_speculation): integers and booleans only.
 struct LaneSpecCounts {
     std::uint64_t steps = 0, suspends = 0, resumes = 0;
@@ -120,6 +141,7 @@ struct CohortDecoder::Lane {
     std::uint64_t bytes = 0;
     std::unique_ptr<MtpContextDraft> drafter;
     std::optional<TokenSampler> sampler;
+    bool sampled_drafts = false;  // a sampled lane that takes device drafts (CohortConfig::sampled_drafts)
     // Lone-lane speculation (CohortConfig::lane_speculation): the lane's speculator, made at its first speculator step
     // and kept for the request (suspended while the lane takes the round), and the ids it emitted that the context
     // drafter has not seen yet (fed to it when the lane takes the round again), after the pending token spec_anchor.
@@ -168,6 +190,10 @@ struct CohortDecoder::StepScratch {
     std::vector<LaneDemand> demands;
     std::vector<std::uint32_t> device;
     std::vector<double> device_p, acc, device_acc;
+    std::vector<std::uint32_t> rooms;       // each decoding lane's draft room this round
+    std::vector<CohortProposal> proposals;  // the round's device proposal (CohortBackend::propose_round)
+    std::vector<CohortSample> samples;      // the round's sampled lanes (CohortBackend::sample_round)
+    std::vector<std::uint32_t> sampled;     // per decoding lane: index into samples + 1 (0 = not a round sample)
     RowPlanner row_planner;
     std::vector<std::unique_ptr<MtpSelectionReceipt>> receipts;
 };
@@ -344,6 +370,13 @@ void CohortDecoder::admit() {
             // options carry it: the default identity, or the one the engine's own job sampler would have drawn).
             lane->sampler.emplace(lane->request.sampling, lane->request.sampler_options);
             lane->result.sampling = "sampling-v1";
+            // coupled acceptance keeps the ids of the run without drafts; rejection acceptance keeps one row
+            if (config_.sampled_drafts && lane->sampler->coupled() && backend_.reads_window_rows() &&
+                backend_.device_drafts()) {
+                lane->sampled_drafts = true;
+                lane->tried.assign(config_.max_draft, 0.0);
+                lane->kept.assign(config_.max_draft, 0.0);
+            }
         } else if (config_.context_draft || backend_.device_drafts()) {
             if (config_.context_draft) {
                 // the drafter's context is what the lane holds; the pending token joins at the first step (the last
@@ -896,6 +929,27 @@ void CohortDecoder::step() {
     auto& device_p = round.device_p;
     auto& acc = round.acc;
     auto& device_acc = round.device_acc;
+    // Each lane's draft room, first for every lane: a drafter that serves the round's lanes in one pass gets them all
+    // at once (CohortBackend::propose_round) before the per-lane proposals below.
+    auto& rooms = round.rooms;
+    auto& proposals = round.proposals;
+    rooms.resize(n);
+    proposals.clear();
+    const bool drafts_on_device = backend_.device_drafts();
+    for (std::size_t k = 0; k < n; ++k) {
+        const Lane& l = *run[k];
+        const std::uint64_t left = token_limit(l.request) - l.result.ids.size();
+        const std::uint64_t room_pos = backend_.max_positions() - l.position - 1U;
+        // a selection that reads logits decides one row per step from the lane's final logits
+        const bool one_row = l.request.selection && l.request.selection_reads_logits;
+        // the backend's own cap on the lane's window (pending row + drafts)
+        const std::uint64_t window_cap = std::max<std::uint32_t>(backend_.max_window(decode_ids[k]), 1U) - 1U;
+        rooms[k] = one_row ? 0U : static_cast<std::uint32_t>(std::min<std::uint64_t>(
+                                      {draft_cap, left - 1U, room_pos, window_cap}));
+        if (drafts_on_device && (!l.sampler || l.sampled_drafts) && rooms[k] != 0U)
+            proposals.push_back({decode_ids[k], rooms[k]});
+    }
+    if (!proposals.empty()) backend_.propose_round(proposals);
     for (std::size_t k = 0; k < n; ++k) {
         Lane& l = *run[k];
         auto& temp = round.decode[k];
@@ -906,17 +960,11 @@ void CohortDecoder::step() {
         accept.clear();
         device_rows = 0;
         const std::uint64_t left = token_limit(l.request) - l.result.ids.size();
-        const std::uint64_t room_pos = backend_.max_positions() - l.position - 1U;
-        // a selection that reads logits decides one row per step from the lane's final logits
-        const bool one_row = l.request.selection && l.request.selection_reads_logits;
-        // the backend's own cap on the lane's window (pending row + drafts)
-        const std::uint64_t window_cap = std::max<std::uint32_t>(backend_.max_window(decode_ids[k]), 1U) - 1U;
-        const std::size_t room = one_row ? 0U : static_cast<std::size_t>(std::min<std::uint64_t>(
-                                                     {draft_cap, left - 1U, room_pos, window_cap}));
+        const std::size_t room = rooms[k];
         acc.clear();
         device.clear();
         device_p.clear();
-        if (!l.sampler && room != 0 && backend_.device_drafts()) {
+        if (drafts_on_device && (!l.sampler || l.sampled_drafts) && room != 0) {
             backend_.propose(decode_ids[k], static_cast<std::uint32_t>(room), device, device_p);
             if (device.size() > room) device.resize(room);
         }
@@ -1026,6 +1074,20 @@ void CohortDecoder::step() {
         return;
     }
     keep.resize(n);
+    // Round sampling: a backend that samples on the device may decide every sampled lane of the step in one call.
+    auto& samples = round.samples;
+    auto& sampled = round.sampled;
+    samples.clear();
+    sampled.assign(n, 0U);
+    if (backend_.samples_on_device() && backend_.samples_in_round()) {
+        for (std::size_t k = 0; k < n; ++k) {
+            Lane& l = *run[k];
+            if (l.request.selection || !l.sampler || groups[k].rows != 1U) continue;  // a drafted window: by row
+            samples.push_back({groups[k].lane, &*l.sampler, l.position + 1U, 0U});
+            sampled[k] = static_cast<std::uint32_t>(samples.size());
+        }
+        if (!samples.empty()) backend_.sample_round(samples);
+    }
     auto& receipts = round.receipts;
     receipts.resize(n);
     const StepScratch::Receipts clear_receipts{receipts};
@@ -1055,12 +1117,24 @@ void CohortDecoder::step() {
             }
             keep[k] = std::max<std::uint32_t>(1U, static_cast<std::uint32_t>(chosen.size()));
         } else {
-            if (auto& sampler = l.sampler) {
-                // Context drafts have no lossless sampled acceptance. This lane holds just its pending row.
-                top[base] = sample_lane(backend_, groups[k].lane, *sampler, l.position + 1U);
-            }
             std::uint32_t a = 1;  // the pending row is always kept; each draft row equal to the target's choice is too
-            while (a < rows && tokens[base + a] == top[base + a - 1U]) ++a;
+            if (auto& sampler = l.sampler) {
+                if (rows == 1U) {
+                    top[base] = sampled[k] != 0U ? samples[sampled[k] - 1U].token
+                                                 : sample_lane(backend_, groups[k].lane, *sampler, l.position + 1U);
+                } else {
+                    // Sampled drafts (coupled): row r is decided as without a draft at its position, so a draft row is
+                    // kept while it equals the id before it; rows after a rejection or a stop id are not decided.
+                    a = 0;
+                    do {
+                        top[base + a] = sample_window_row(backend_, groups[k].lane, a, *sampler, l.position + 1U + a);
+                        ++a;
+                    } while (a < rows && tokens[base + a] == top[base + a - 1U] &&
+                             std::ranges::find(l.request.stop, top[base + a - 1U]) == l.request.stop.end());
+                }
+            } else {
+                while (a < rows && tokens[base + a] == top[base + a - 1U]) ++a;
+            }
             keep[k] = a;
             chosen.assign(top.begin() + static_cast<std::ptrdiff_t>(base),
                           top.begin() + static_cast<std::ptrdiff_t>(base + a));

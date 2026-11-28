@@ -78,6 +78,18 @@ public:
     // collective_reads it is a rank 0 query.
     [[nodiscard]] bool samples_on_device() const override;
     std::uint32_t sample_final(std::uint32_t lane, TokenSampler& sampler, std::uint64_t position) override;
+    // Round sampling follows sample_final: samples_in_round is a rank 0 query; with collective_reads sample_round is ONE
+    // call carrying every entry's lane, position, policy and options (rank 1 rebuilds equal samplers), else a rank 0
+    // query.
+    [[nodiscard]] bool samples_in_round() const override;
+    void sample_round(std::span<CohortSample> lanes) override;
+    // Window rows (sampled drafts) follow read_final_logits / sample_final: reads_window_rows is a rank 0 query;
+    // with collective_reads read_row_logits and sample_row are calls (rank 1 makes the same read or decision and
+    // discards it), else rank 0 queries.
+    [[nodiscard]] bool reads_window_rows() const override;
+    std::span<const float> read_row_logits(std::uint32_t lane, std::uint32_t row) override;
+    std::uint32_t sample_row(std::uint32_t lane, std::uint32_t row, TokenSampler& sampler,
+                             std::uint64_t position) override;
     void commit(std::span<const std::uint32_t> accept) override;
     void release(std::uint32_t lane) override;
     // Optional hooks. Device drafts and the group capacity / route class are rank 0 queries (drafts reach rank 1 as
@@ -89,6 +101,9 @@ public:
     [[nodiscard]] bool device_drafts() const override;
     void propose(std::uint32_t lane, std::uint32_t room, std::vector<std::uint32_t>& tokens,
                  std::vector<double>& probability) override;
+    // The round's drafter pass follows propose: with collective_reads ONE call carrying every (lane, room), else a rank
+    // 0 query.
+    void propose_round(std::span<const CohortProposal> lanes) override;
     [[nodiscard]] std::uint64_t restore(std::uint32_t lane, std::span<const std::uint32_t> prompt) override;
     void capture(std::uint32_t lane, std::span<const std::uint32_t> committed) override;
     [[nodiscard]] PrefillGroupCapacity prompt_group_capacity() const override;

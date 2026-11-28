@@ -35,7 +35,8 @@
 //
 // Greedy requests verify shared context drafts (merged with the backend's device drafts when it has a drafter)
 // against the target's greedy choice; a per-lane selection transaction (JSON, thinking budget) may cut the window. Sampled requests use a single
-// row per lane per step. Every request's ids equal its solo run under the backend's batch invariance contract.
+// row per lane per step, or, with coupled acceptance and a backend that decides every window row, the device drafts
+// (CohortConfig::sampled_drafts). Every request's ids equal its solo run under the backend's batch invariance contract.
 //
 // Lone-lane speculation (CohortConfig::lane_speculation, off by default): while at most max_live requests are live,
 // each greedy decoding lane runs the command line's speculator step instead of the round (spec::BlockSpeculator over a
@@ -68,6 +69,21 @@ struct CohortPrompt {
     std::uint32_t lane = 0;
     std::span<const std::uint32_t> tokens = {};
     bool first = true;
+};
+
+// One lane of a round proposal (CohortBackend::propose_round): the lane and the most draft rows its window may carry.
+struct CohortProposal {
+    std::uint32_t lane = 0;
+    std::uint32_t room = 0;
+};
+
+// One sampled lane of a decode round (CohortBackend::sample_round). token is the answer: the id
+// sample_final(lane, *sampler, position) would return.
+struct CohortSample {
+    std::uint32_t lane = 0;
+    TokenSampler* sampler = nullptr;
+    std::uint64_t position = 0;
+    std::uint32_t token = 0;
 };
 
 // Engine side of the contract. Lanes are independent sessions held by the backend.
@@ -120,6 +136,30 @@ public:
     [[nodiscard]] virtual bool device_drafts() const { return false; }
     virtual void propose(std::uint32_t lane, std::uint32_t room, std::vector<std::uint32_t>& tokens,
                          std::vector<double>& probability);
+    // Round proposal: a drafter that serves N lanes in one pass (one draft forward per round instead of one per lane).
+    // When device_drafts() is true and the round asks at least one lane, the decoder calls propose_round ONCE per
+    // decode round, before that round's propose calls, with every lane it will ask (greedy lanes with room > 0, in
+    // the order of the propose calls, each with the room propose will receive). propose(lane, room) then hands out
+    // what the round left for the lane. The ids are the same as without the round: propose's answer must not depend
+    // on whether propose_round ran. Default: no-op (each propose drafts on its own).
+    virtual void propose_round(std::span<const CohortProposal> /*lanes*/) {}
+    // Round sampling (device sampling): when samples_on_device() and samples_in_round() are both true, the decoder
+    // decides a step's sampled lanes with ONE sample_round call after verify and before any read_final_logits of the
+    // step, lanes in group order; each entry's token must be the id sample_final(lane, *sampler, position) returns,
+    // with the same draws and counts on each lane's own sampler. Default false; the default sample_round calls
+    // sample_final per entry in order.
+    [[nodiscard]] virtual bool samples_in_round() const { return false; }
+    virtual void sample_round(std::span<CohortSample> lanes);
+    // Sampled-lane drafts (CohortConfig::sampled_drafts, coupled acceptance only): true when any row of a sampled
+    // lane's pending window can be decided, not only its last: read_row_logits(lane, row) returns the final logits of
+    // row `row` (0-based in the lane's group of the last verify; valid until the next backend call), and with
+    // samples_on_device sample_row(lane, row, sampler, position) returns the id sample_final would return for that row
+    // (same draws and count). A lane's rows after the first are asked only in order and only while the draft row before
+    // them was kept. Default false: never called.
+    [[nodiscard]] virtual bool reads_window_rows() const { return false; }
+    virtual std::span<const float> read_row_logits(std::uint32_t lane, std::uint32_t row);
+    virtual std::uint32_t sample_row(std::uint32_t lane, std::uint32_t row, TokenSampler& sampler,
+                                     std::uint64_t position);
     // Retained prefixes (the backend's own prefix store). Before a lane's first prompt rows: restores the longest
     // retained prefix of `prompt` into the lane and returns its rows, at most prompt.size() - 1 (0 = none: the lane then
     // starts with prefill(first = true)). The lane's state after restore(n) equals prefill(prompt[0, n), first = true).
@@ -298,6 +338,12 @@ struct CohortConfig {
     bool trace_steps = false;
     // Use the backend's shared verify pass and price equal-width windows.
     bool uniform_verify_windows = false;
+    // Drafts on sampled lanes (default on; false = the off switch): a sampled request whose sampler uses COUPLED
+    // acceptance (TokenSamplerOptions::acceptance) takes the backend's device drafts when the backend has a drafter
+    // and can decide every row of its window (CohortBackend::reads_window_rows). Row r is decided as without a draft
+    // at its position and a draft row is kept while it equals the id before it, so the lane's ids equal its run
+    // without drafts; rows after a rejected draft or a stop id are not decided. Rejection acceptance keeps one row.
+    bool sampled_drafts = true;
     // Lone-lane speculation (off by default: every engine keeps the round). While live() <= max_live, a greedy decoding
     // lane (no sampler, no selection policy) runs one spec::BlockSpeculator step per scheduler step instead of the round:
     // at most max_rows rows (anchor + drafts; also capped by rows_per_forward, the backend's max_window and the lane's

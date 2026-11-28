@@ -15,7 +15,7 @@ namespace strix::serve {
 namespace {
 
 // Control block layout (32-bit words).
-constexpr std::uint32_t kMagic = 0x53524332U;  // "SRC2" (SRC1 + prefill_scoped)
+constexpr std::uint32_t kMagic = 0x53524333U;  // "SRC3" (SRC2 + round and window-row calls)
 enum Word : std::uint32_t {
     kWMagic = 0, kWOp, kWRoundLo, kWRoundHi, kWAckLo, kWAckHi, kWRank, kWArg, kWFlag,
     kWRecords,       // deferred commit / release records
@@ -31,6 +31,11 @@ enum Op : std::uint32_t {
     kOpPropose = 7,  // collective_reads: propose(arg, room = flag)
     kOpSample = 8,   // collective_reads: sample_final(arg, sampler, position); body = sample_words()
     kOpPrefillScoped = 9,  // prefill_scoped(arg, tokens, flag, prompt_tokens); body = prompt_tokens lo, hi, tokens
+    kOpProposeRound = 10,  // collective_reads: propose_round(arg entries); body = lane, room per entry
+    kOpSampleRound = 11,   // collective_reads: sample_round(arg entries); body = lane + sample_words() per entry
+    kOpRowLogits = 12,     // collective_reads: read_row_logits(arg, row = flag)
+    kOpSampleRow = 13,     // collective_reads: sample_row(arg, row = flag, sampler, position); body = sample_words()
+    kOpLast = kOpSampleRow,
 };
 // Variable records: [kind, n, n words]. Commit: accept[]. Capture: lane, committed[]. Restore: lane, rows, prompt[0, rows]
 // (prompt[0, rows) when the whole prompt was restored).
@@ -136,6 +141,30 @@ bool ReplicatedCohort::samples_on_device() const { return local_.samples_on_devi
 std::uint32_t ReplicatedCohort::sample_final(std::uint32_t lane, TokenSampler& sampler, std::uint64_t position) {
     if (options_.collective_reads) send(kOpSample, lane, 0U, sample_words(sampler, position));
     return local_.sample_final(lane, sampler, position);
+}
+bool ReplicatedCohort::samples_in_round() const { return local_.samples_in_round(); }
+bool ReplicatedCohort::reads_window_rows() const { return local_.reads_window_rows(); }
+std::span<const float> ReplicatedCohort::read_row_logits(std::uint32_t lane, std::uint32_t row) {
+    if (options_.collective_reads) send(kOpRowLogits, lane, row, {});
+    return local_.read_row_logits(lane, row);
+}
+std::uint32_t ReplicatedCohort::sample_row(std::uint32_t lane, std::uint32_t row, TokenSampler& sampler,
+                                           std::uint64_t position) {
+    if (options_.collective_reads) send(kOpSampleRow, lane, row, sample_words(sampler, position));
+    return local_.sample_row(lane, row, sampler, position);
+}
+void ReplicatedCohort::sample_round(std::span<CohortSample> lanes) {
+    if (options_.collective_reads) {
+        body_.clear();
+        for (const auto& s : lanes) {
+            if (s.sampler == nullptr) throw std::logic_error("cohort replica: a round sample without its sampler");
+            body_.push_back(s.lane);
+            const auto w = sample_words(*s.sampler, s.position);
+            body_.insert(body_.end(), w.begin(), w.end());
+        }
+        send(kOpSampleRound, words_of(lanes.size(), "samples"), 0U, body_);
+    }
+    local_.sample_round(lanes);
 }
 bool ReplicatedCohort::prefill_emits_first() const { return local_.prefill_emits_first(); }
 std::uint32_t ReplicatedCohort::prefill_top(std::uint32_t lane) { return local_.prefill_top(lane); }
@@ -318,6 +347,16 @@ void ReplicatedCohort::propose(std::uint32_t lane, std::uint32_t room, std::vect
     local_.propose(lane, room, tokens, probability);
 }
 
+void ReplicatedCohort::propose_round(std::span<const CohortProposal> lanes) {
+    // a two-rank drafter runs the round's pass on both ranks; a rank 0 drafter is a query like propose
+    if (options_.collective_reads) {
+        body_.clear();
+        for (const auto& p : lanes) body_.insert(body_.end(), {p.lane, p.room});
+        send(kOpProposeRound, words_of(lanes.size(), "proposals"), 0U, body_);
+    }
+    local_.propose_round(lanes);
+}
+
 PrefillGroupCapacity ReplicatedCohort::prompt_group_capacity() const { return local_.prompt_group_capacity(); }
 
 std::uint32_t ReplicatedCohort::prompt_route_class(std::uint64_t rows) const { return local_.prompt_route_class(rows); }
@@ -367,6 +406,9 @@ std::uint64_t follow_cohort(CohortBackend& local, dist::Transport& link, Replica
     std::vector<CohortPrompt> members;
     std::vector<std::uint32_t> drafts;
     std::vector<double> probability;
+    std::vector<CohortProposal> proposals;
+    std::vector<CohortSample> samples;
+    std::vector<TokenSampler> samplers;
     try {
         for (;;) {
             const auto mine = header_for(round, 1U);
@@ -374,8 +416,9 @@ std::uint64_t follow_cohort(CohortBackend& local, dist::Transport& link, Replica
             link.exchange(std::as_bytes(std::span(out)), std::as_writable_bytes(std::span(in)));
             pair::check_pair(mine, get_header(in));
             const std::uint32_t op = in[kWOp], words = in[kWPayload], deferred = in[kWDeferred];
-            if (op < kOpPrefill || op > kOpPrefillScoped) throw pair::ProtocolError("cohort replica: unknown operation");
-            if ((op == kOpLogits || op == kOpPropose || op == kOpSample) && !options.collective_reads)
+            if (op < kOpPrefill || op > kOpLast) throw pair::ProtocolError("cohort replica: unknown operation");
+            if ((op == kOpLogits || op == kOpPropose || op == kOpSample || op == kOpProposeRound ||
+                 op == kOpSampleRound || op == kOpRowLogits || op == kOpSampleRow) && !options.collective_reads)
                 throw pair::ProtocolError("cohort replica: collective read on a follower without collective_reads");
             if (deferred > words) throw pair::ProtocolError("cohort replica: deferred section beyond the payload");
             payload.resize(words);
@@ -430,11 +473,21 @@ std::uint64_t follow_cohort(CohortBackend& local, dist::Transport& link, Replica
                 std::uint64_t rows = 0;
                 for (std::uint64_t m = 0; m < n; ++m) rows += body[3U * m + 2U];
                 if (rows != body.size() - 3U * n) throw pair::ProtocolError("cohort replica: group rows and tokens disagree");
-            } else if (op == kOpSample) {
+            } else if (op == kOpSample || op == kOpSampleRow) {
                 if (body.size() != kSampleWords || body[8] > static_cast<std::uint32_t>(SampledAcceptance::coupled))
                     throw pair::ProtocolError("cohort replica: bad sample call");
             } else if (op == kOpPrefillScoped) {
                 if (body.size() < 2U) throw pair::ProtocolError("cohort replica: truncated scoped prefill");
+            } else if (op == kOpProposeRound) {
+                if (in[kWArg] == 0U || body.size() != 2ULL * in[kWArg])
+                    throw pair::ProtocolError("cohort replica: bad round proposal");
+            } else if (op == kOpSampleRound) {
+                const std::uint64_t n = in[kWArg];
+                if (n == 0U || body.size() != n * (1U + kSampleWords))
+                    throw pair::ProtocolError("cohort replica: bad round sample");
+                for (std::uint64_t i = 0; i < n; ++i)
+                    if (body[i * (1U + kSampleWords) + 1U + 8U] > static_cast<std::uint32_t>(SampledAcceptance::coupled))
+                        throw pair::ProtocolError("cohort replica: bad round sample");
             } else if (op != kOpPrefill && !body.empty()) {
                 throw pair::ProtocolError("cohort replica: body on a call without one");
             }
@@ -502,6 +555,30 @@ std::uint64_t follow_cohort(CohortBackend& local, dist::Transport& link, Replica
             case kOpPropose:
                 local.propose(in[kWArg], in[kWFlag], drafts, probability);  // rank 1's share; rank 0's drafts rule
                 break;
+            case kOpRowLogits:
+                (void)local.read_row_logits(in[kWArg], in[kWFlag]);  // rank 1's share of the gather; rank 0 decides
+                break;
+            case kOpSampleRow: {
+                auto sampler = sampler_of(body);  // rank 1's share of the device decision; rank 0's id rules
+                (void)local.sample_row(in[kWArg], in[kWFlag], sampler, join(body[0], body[1]));
+                break;
+            }
+            case kOpProposeRound:
+                proposals.clear();
+                for (std::size_t i = 0; i + 1U < body.size(); i += 2U) proposals.push_back({body[i], body[i + 1U]});
+                local.propose_round(proposals);  // rank 1's share of the round's drafter pass
+                break;
+            case kOpSampleRound: {
+                // rank 1's share of the device decisions, with samplers equal to rank 0's; rank 0's ids rule
+                const std::size_t n = in[kWArg], stride = 1U + kSampleWords;
+                samplers.clear();
+                samples.clear();
+                for (std::size_t i = 0; i < n; ++i) samplers.push_back(sampler_of(body.subspan(i * stride + 1U, kSampleWords)));
+                for (std::size_t i = 0; i < n; ++i)
+                    samples.push_back({body[i * stride], &samplers[i], join(body[i * stride + 1U], body[i * stride + 2U]), 0U});
+                local.sample_round(samples);
+                break;
+            }
             case kOpStop:
                 return round;
             default:
