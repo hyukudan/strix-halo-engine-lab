@@ -91,8 +91,8 @@ inline constexpr bool turbo = true;
 inline constexpr std::string_view block_drafter = "dflash2";
 namespace block_wins_ties {
 inline constexpr bool exact = true;
-inline constexpr bool fast = false;
-inline constexpr bool turbo = false;
+inline constexpr bool fast = true;
+inline constexpr bool turbo = true;
 } // namespace block_wins_ties
 inline constexpr std::string_view drafter = "mtp.safetensors";
 inline constexpr std::int64_t max_draft_by_live[] = {7, 0};

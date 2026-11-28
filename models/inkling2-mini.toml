@@ -67,11 +67,11 @@ cuda = 0.015
 
 # The block drafter's arm under the shared per-regime selector (include/strix/spec/arm_selector.hpp), per tier, HIP.
 # by_default: the selector over both drafters is the run's default when the directory is beside the checkpoint.
-# wins_ties: the block arm takes an inconclusive probe episode; declared from the tier's own device receipts. EXACT
-# (gfx1151, selector vs the MTP sidecar alone, ids equal): code 53.1 -> 61.0 tok/s, prose 29.3 -> 30.8 / 32.1. FAST and
-# TURBO verify on the low-bit target, where the block drafter does not win ties (served, one lane: prose 0.991x, document
-# 8K 0.89x of the sidecar; code 1.115x, a margin the switch rule takes without the tie rule); the EXACT declaration there
-# measured prose 41.2 -> 39.1 / 39.0 (the tie handed prose to the slower arm), code 46.2 -> 48.7 / 50.9.
+# wins_ties: the block arm takes an inconclusive probe episode; declared from the tier's own device receipts (gfx1151
+# CLI, one request, 255 tokens, ids equal between arms). EXACT, selector vs the MTP sidecar alone: code 53.1 -> 61.0
+# tok/s, prose 29.3 -> 30.8 / 32.1. FAST (SP4 attention + head image; TURBO decodes the same image), 7 prompts (5 code, 2
+# prose) x 2 repetitions: selector vs the sidecar alone geomean 1.089x with ties to the block arm (min 0.978x), 1.081x
+# with ties kept by the sidecar (min 0.956x); the two declarations differ by 0.7 %, the block arm's no worse anywhere.
 [speculation.block_by_default]
 exact = true
 fast = true
@@ -79,8 +79,8 @@ turbo = true
 
 [speculation.block_wins_ties]
 exact = true
-fast = false
-turbo = false
+fast = true
+turbo = true
 
 # Chat: the reasoning effort of a request that names none, one default for the command line (--messages) and the
 # server (serve::inkling2_reasoning_effort); a request's own reasoning_effort overrides it. "none" = the served effort.

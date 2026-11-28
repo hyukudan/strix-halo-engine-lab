@@ -175,8 +175,8 @@ public:
     }
 
     // Both drafters bound: the incumbent MTP sidecar (arm 0, the fallback) and the block drafter under the shared
-    // per-regime selector. The block arm declares wins_ties from its tier's device receipts (mini_block_arm: EXACT
-    // yes, the low-bit tiers no) and needs no probe gate (its pass costs ~1 ms more).
+    // per-regime selector. The block arm declares wins_ties from its tier's device receipts (mini_block_arm, model
+    // data) and needs no probe gate (its pass costs ~1 ms more).
     std::vector<ChainArm> chain_arms(std::uint32_t anchor, std::uint32_t position) override {
         if (!dflash_ || !drafter_) return {};
         drafter_->start(anchor, position);

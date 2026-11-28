@@ -7516,18 +7516,18 @@ grid dimension, so the groups read each plane row together; the screen is now si
 | Nemotron 3.5 Bolt E4B | not bound: no served cohort screened head on HIP |
 
 <a id="inkling-hip-exact-drafter-selector"></a>
-## Inkling 2 Mini HIP EXACT CLI: the MTP sidecar and DFlash 2 under the shared per-regime selector
+## Inkling 2 Mini HIP CLI: the MTP sidecar and DFlash 2 under the shared per-regime selector (every tier)
 
-**Engine:** `inkling2-mini`. **Control:** `--dflash DIR|off`, `--dspark FILE|off`. **Default:** on (HIP, EXACT, CLI resident route).
+**Engine:** `inkling2-mini`. **Control:** `--dflash DIR|off`, `--dspark FILE|off`. **Default:** on (HIP, EXACT / FAST / TURBO, CLI resident route; per tier by model data).
 
 With both drafters beside the checkpoint (the MTP sidecar and the `dflash2` block-diffusion directory), the HIP EXACT CLI
-binds both and runs them under the shared per-regime selector; the block arm wins ties. FAST prose was slower under the
-selector (-5.1 / -5.3 %, both repetitions), so FAST, TURBO and CUDA keep the MTP sidecar alone and bind the block drafter only
-when it is named.
+binds both and runs them under the shared per-regime selector, in every tier the model data names
+(models/inkling2-mini.toml [speculation.block_by_default] / [speculation.block_wins_ties]; the block arm wins ties in all
+three). CUDA keeps the MTP sidecar alone and binds the block drafter only when it is named.
 
 - **Shared home:** include/strix/spec/arm_selector.hpp, src/serve/serial_generation_cli.cpp (chain_arms), include/strix/spec/drafter_source.hpp; binding in apps/inkling2_mini_gpu_main.hpp
-- **Tier and regime:** EXACT; one-request CLI decode with speculation
+- **Tier and regime:** EXACT, FAST, TURBO; one-request CLI decode with speculation
 - **Exactness evidence:** drafters only propose; ids equal with and without the selector (code and prose)
 - **Off switch:** `--dflash off` or `--dspark off`
-- **Measured gain:** gfx1151, 255 decode tokens: code 53.1 -> 61.0 tok/s (+14.8 %, two repetitions each), prose 29.3 -> 30.8 / 32.1 (+5.1..+9.6 %). FAST code 46.2 -> 48.7 / 50.9, FAST prose 41.2 -> 39.1 / 39.0 (stays off).
-- **Preconditions:** HIP build, EXACT, greedy auto speculation, both drafters present and valid
+- **Measured gain:** gfx1151, 255 decode tokens: code 53.1 -> 61.0 tok/s (+14.8 %, two repetitions each), prose 29.3 -> 30.8 / 32.1 (+5.1..+9.6 %). FAST (SP4 attention + head image), 7 prompts (5 code, 2 prose) x 2 repetitions, selector vs the MTP sidecar alone: geomean 1.089x (min 0.978x) with ties to the block arm, 1.081x (min 0.956x) with ties kept by the sidecar; code sc / c1 / c2 / c3 / c5 47.8 / 51.1 / 44.0 / 48.6 / 46.4 vs 46.6 / 42.0 / 43.5 / 49.7 / 38.3, prose sp / p1 39.5 / 41.5 vs 37.7 / 36.0. An earlier FAST pair on another build (prose 41.2 -> 39.1 / 39.0) did not reproduce.
+- **Preconditions:** HIP build, EXACT / FAST / TURBO, greedy auto speculation, both drafters present and valid
