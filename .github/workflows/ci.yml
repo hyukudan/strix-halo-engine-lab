@@ -46,8 +46,6 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 2
-        with:
-          fetch-depth: 2
 
       - name: Benchmark completion-marker regression (CPU-only)
         shell: bash
