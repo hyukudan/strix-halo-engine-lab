@@ -573,6 +573,19 @@ void test_capacity_and_pack_fallback() {
     std::filesystem::remove(path);
 }
 
+void test_block_arm_per_tier() {
+    // The block drafter's arm under the shared selector is model data per tier (models/inkling2-mini.toml): every
+    // measured tier binds it by default; only EXACT declares that it wins ties (the low-bit tiers measured prose 0.991x
+    // and document 0.89x of the MTP sidecar); a tier without a row binds it only when named.
+    using strix::profile::Name;
+    constexpr auto exact = mini::mini_block_arm(Name::standard), fast = mini::mini_block_arm(Name::fast),
+                   turbo = mini::mini_block_arm(Name::turbo), quality = mini::mini_block_arm(Name::quality);
+    require(exact.by_default && exact.wins_ties, "EXACT: block drafter by default, wins ties");
+    require(fast.by_default && !fast.wins_ties, "FAST: block drafter by default, ties stay with the sidecar");
+    require(turbo.by_default && !turbo.wins_ties, "TURBO: block drafter by default, ties stay with the sidecar");
+    require(!quality.by_default && !quality.wins_ties, "a tier without a row: named only, no ties");
+}
+
 void test_calibrated_row_speculation_admission() {
     // One rule for the command line and the server (mini_speculation_policy): speculation and a requested low-bit row
     // never share a run; the explicit request wins.
@@ -762,6 +775,7 @@ int main() {
         test_pack_admission();
         test_capacity_and_pack_fallback();
         test_calibrated_row_speculation_admission();
+        test_block_arm_per_tier();
         test_calibrated_pack_requires_complete_inventory();
         test_token_bytes();
     } catch (const std::exception& error) {

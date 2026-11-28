@@ -47,10 +47,10 @@ public:
                      bool combine_image = false, bool prepared_round_fold = false, bool narrow_experts = false,
                      bool controller_one_plane = false, bool attn_projected_bias = false, bool screened_head = false,
                      unsigned verify_rows = 0U, MiniLowBitRows lowbit = {}, bool plain_program = false,
-                     const char* dflash = nullptr)
+                     const char* dflash = nullptr, bool block_wins_ties = false)
         : decoder_(load.checkpoint, load.positions, load.prefill_chunk, load.packed_decode, step_graphs, storage,
                    load.verify_rows, dspark != nullptr || dflash != nullptr, 1U, load.prefill_tail, narrow_experts, controller_one_plane, false, lowbit),
-          projected_bias_(attn_projected_bias) {
+          projected_bias_(attn_projected_bias), block_wins_ties_(block_wins_ties) {
         const auto levers = configure_mini_decoder(decoder_, moe_w4a4, combine_image, prepared_round_fold,
                                                    attn_projected_bias, screened_head, verify_rows);
         require_mini_calibrated_cli_slot(lowbit, decoder_.slot_bytes());
@@ -175,13 +175,13 @@ public:
     }
 
     // Both drafters bound: the incumbent MTP sidecar (arm 0, the fallback) and the block drafter under the shared
-    // per-regime selector. The block arm declares wins_ties from its device receipts (never slower than the sidecar on
-    // code / reasoning / prose) and needs no probe gate (its pass costs ~1 ms more).
+    // per-regime selector. The block arm declares wins_ties from its tier's device receipts (mini_block_arm: EXACT
+    // yes, the low-bit tiers no) and needs no probe gate (its pass costs ~1 ms more).
     std::vector<ChainArm> chain_arms(std::uint32_t anchor, std::uint32_t position) override {
         if (!dflash_ || !drafter_) return {};
         drafter_->start(anchor, position);
         dflash_->start(anchor, position);
-        return {{&*drafter_, "dspark", 0.0, false}, {dflash_.get(), "dflash2", 0.0, true}};
+        return {{&*drafter_, "dspark", 0.0, false}, {dflash_.get(), "dflash2", 0.0, block_wins_ties_}};
     }
 
     spec::ChainDrafter* chain_drafter(std::uint32_t anchor, std::uint32_t position) override {
@@ -236,6 +236,7 @@ private:
     std::string taps_path_;
     std::vector<std::uint32_t> prompt_ids_;
     bool projected_bias_ = false;
+    bool block_wins_ties_ = false;
 };
 
 inline void run_gate(const char* checkpoint, const Options& options, std::span<const session::HeadGateWindow> windows,
@@ -514,13 +515,13 @@ int main(int argc, char** argv) {
         // reserved for it; a directory it refuses is declined with its reason). When both bind, both run under the
         // shared per-regime selector (DeviceCliDecoder::chain_arms). An explicit --dspark FILE / off excludes the
         // registry's block drafter; --dflash off keeps the MTP sidecar alone, --dflash DIR --dspark off the block alone.
-        // HIP EXACT binds the block drafter beside the checkpoint by default: on gfx1151 the selector over both drafters
-        // was never slower than the MTP sidecar alone there (code 53.1 -> 61.0 tok/s, prose 29.3 -> 30.8 / 32.1, ids
-        // equal). FAST keeps the sidecar alone (code +5.4 %, but prose 41.2 -> 39.1 / 39.0, -5.1 / -5.3 %) until the
-        // selector policy is never slower there, and CUDA keeps it until its own device receipt: in those runs the block
-        // drafter binds only when named, and --dflash DIR alone runs it alone.
+        // HIP binds the block drafter beside the checkpoint by default in the tiers of the model data, each with its own
+        // tie declaration (mini_block_arm, models/inkling2-mini.toml [speculation.block_by_default] / block_wins_ties).
+        // CUDA keeps it until its own device receipt: there the block drafter binds only when named, and --dflash DIR
+        // alone runs it alone.
+        const auto block_arm = mini_block_arm(options.tier.profile);
 #if defined(__HIPCC__)
-        const bool block_by_default = options.tier.profile == strix::profile::Name::standard;
+        const bool block_by_default = block_arm.by_default;
 #else
         constexpr bool block_by_default = false;
 #endif
@@ -567,7 +568,7 @@ int main(int argc, char** argv) {
         else
 #endif
         family.load = [&loaded, &resolve_weights, &options, &weight_options, step_graphs, &drafter, &block_drafter, plain_program,
-                       parsed_weights = weight_options, device = early.scope.device_class,
+                       block_arm, parsed_weights = weight_options, device = early.scope.device_class,
                        product = early.scope.cost_device,
                        combine_image = mini_combine_image(options.tier),
                        round_fold = mini_prepared_round_fold(options.tier),
@@ -603,7 +604,7 @@ int main(int argc, char** argv) {
                                      extent, [&](MiniLowBitRows lowbit) {
                 return std::make_unique<cli::DeviceCliDecoder>(load, step_graphs, loaded->plan.roles(), dspark,
                     moe_w4a4, combine_image, round_fold, narrow, controller_one_plane, projected_bias, screened_head,
-                    verify_rows, std::move(lowbit), plain_program, dflash);
+                    verify_rows, std::move(lowbit), plain_program, dflash, block_arm.wins_ties);
             });
         };
         // The rows the decoder was loaded with once the shared load fell back (strix-prefill-chunk line): a second load

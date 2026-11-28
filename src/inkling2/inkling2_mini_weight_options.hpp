@@ -417,6 +417,25 @@ inline constexpr MiniSpeculationPolicy mini_speculation_policy(bool requested, b
     return policy;
 }
 
+// The block drafter's arm of a tier under the shared per-regime selector (spec::ArmSelector), from the model data
+// (models/inkling2-mini.toml [speculation.block_by_default] / [speculation.block_wins_ties]): by_default = the block
+// drafter beside the checkpoint binds beside the MTP sidecar without being named; wins_ties = its inconclusive probe
+// episodes hand it the decode. A tier without a row binds it only when named and never takes ties.
+struct MiniBlockArm {
+    bool by_default = false;
+    bool wins_ties = false;
+};
+
+inline constexpr MiniBlockArm mini_block_arm(profile::Name tier) noexcept {
+    namespace spec_data = strix::model_data::inkling2_mini::speculation;
+    switch (tier) {
+    case profile::Name::standard: return {spec_data::block_by_default::exact, spec_data::block_wins_ties::exact};
+    case profile::Name::fast: return {spec_data::block_by_default::fast, spec_data::block_wins_ties::fast};
+    case profile::Name::turbo: return {spec_data::block_by_default::turbo, spec_data::block_wins_ties::turbo};
+    default: return {};
+    }
+}
+
 // "strix-speculation/v1 requested auto|off source row|flag effective auto|off verify_rows N[ declined <reason>]": the
 // effective speculation of a run, printed alike by the command line and the server.
 inline std::string mini_speculation_line(const MiniSpeculationPolicy& policy, unsigned verify_rows) {
