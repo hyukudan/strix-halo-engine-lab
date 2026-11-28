@@ -249,6 +249,20 @@ public:
         log.push_back("X" + join(words));
         ++controls;
     }
+    // The prompt length each scoped slice carried (a route chosen by it), then the plain prefill.
+    void prefill_scoped(std::uint32_t lane, std::span<const std::uint32_t> tokens, bool first,
+                        std::uint64_t prompt_tokens) override {
+        scopes.push_back(prompt_tokens);
+        prefill(lane, tokens, first);
+    }
+    std::uint32_t prompt_tail_rows() const override { return tail; }
+    PromptPieceRule prompt_piece_rule() const override { return rule; }
+    std::uint64_t prompt_call_chunk(std::uint64_t rows) const override { return call_chunk ? std::min(rows, call_chunk) : rows; }
+    std::uint32_t max_batch_verify_rows() const override { return batch_rows; }
+    std::vector<std::uint64_t> scopes;
+    std::uint32_t tail = 0, batch_rows = 0;
+    std::uint64_t call_chunk = 0;
+    PromptPieceRule rule{};
     std::vector<std::vector<std::uint32_t>> retained;
     std::function<void()> on_verify;
     bool restores = true;  // false: this rank's store cannot restore (a diverging replica)
@@ -496,6 +510,49 @@ void run_bind_control(bool local_ops) {
     // local: 2 prefills + verify + close; sent: also 4 binds, 4 controls, commit and release
     check(follower.rounds == (local_ops ? 4U : 14U),
           name + ": control message count (" + std::to_string(follower.rounds) + ")");
+}
+
+// A scoped prefill carries the whole prompt's length to rank 1 (a route chosen by it is the same on both ranks), also
+// across follow-up frames and for a 64-bit length; prompt cuts and the batch verify rectangle are rank 0's answers.
+void run_scoped_prefill(bool local_ops) {
+    const std::string name = std::string("scoped prefill (") + (local_ops ? "local" : "sent") + ")";
+    Pair link;
+    FakeBackend be0(2, 8, 23), be1(2, 8, 23);
+    be0.tail = 16U;
+    be0.batch_rows = 24U;
+    be0.call_chunk = 50U;
+    be0.rule = PromptPieceRule{64U, 8U};
+    ReplicaOptions options;
+    options.local_ops = local_ops;
+    options.frame_words = 5;
+    Follower follower;
+    follower.start(be1, link.t1, options);
+    std::vector<std::uint32_t> head(70U), tail(3U);
+    for (std::size_t i = 0; i < head.size(); ++i) head[i] = static_cast<std::uint32_t>(i % 23U);
+    for (std::size_t i = 0; i < tail.size(); ++i) tail[i] = static_cast<std::uint32_t>(i + 1U);
+    const std::uint64_t huge = (std::uint64_t{1} << 33U) + 7U;
+    {
+        ReplicatedCohort rep(be0, link.t0, options);
+        check(rep.prompt_tail_rows() == 16U && rep.max_batch_verify_rows() == 24U && rep.prompt_call_chunk(100U) == 50U &&
+                  rep.prompt_piece_rule().align == 64U && rep.prompt_piece_rule().short_rows == 8U,
+              name + ": prompt cuts and the batch rectangle are rank 0's");
+        rep.prefill_scoped(0, head, true, 73U);
+        rep.prefill_scoped(0, tail, false, 73U);
+        rep.prefill_scoped(1, tail, true, huge);
+        const CohortGroup groups[2] = {{0, 1}, {1, 1}};
+        const std::uint32_t tokens[2] = {4, 5};
+        std::uint32_t top[2] = {};
+        rep.verify(groups, tokens, top);
+        const std::uint32_t accept[2] = {1, 1};
+        rep.commit(accept);
+        rep.close();
+    }
+    follower.thread.join();
+    check(follower.error.empty(), name + ": rank 1 finished cleanly (" + follower.error + ")");
+    check(be1.scopes == std::vector<std::uint64_t>{73U, 73U, huge} && be0.scopes == be1.scopes,
+          name + ": rank 1 ran each slice with rank 0's prompt length");
+    check(be0.log == be1.log && be0.state() == be1.state(), name + ": same calls and state on both ranks");
+    check(be1.state()[0].size() == 74U, name + ": the framed slice arrived whole");
 }
 
 // The verify frame carries no score-read flag: both ranks run every group as read whatever rank 0 was told, so a
@@ -958,6 +1015,8 @@ int main() {
     run_frames();
     run_bind_control(true);
     run_bind_control(false);
+    run_scoped_prefill(true);
+    run_scoped_prefill(false);
     run_whole_restore(true, true);
     run_whole_restore(false, true);
     run_whole_restore(true, false);

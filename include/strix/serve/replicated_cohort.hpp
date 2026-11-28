@@ -58,6 +58,14 @@ public:
     [[nodiscard]] std::uint32_t rows_per_forward() const override;
     [[nodiscard]] std::uint32_t max_positions() const override;
     void prefill(std::uint32_t lane, std::span<const std::uint32_t> tokens, bool first) override;
+    // A call: rank 1 runs prefill_scoped with the same prompt length (a route chosen by it is the same on both ranks).
+    void prefill_scoped(std::uint32_t lane, std::span<const std::uint32_t> tokens, bool first,
+                        std::uint64_t prompt_tokens) override;
+    // Rank 0 queries: where prompt slices may be cut, how one prefill call chunks, and the batch verify rectangle.
+    [[nodiscard]] std::uint32_t prompt_tail_rows() const override;
+    [[nodiscard]] PromptPieceRule prompt_piece_rule() const override;
+    [[nodiscard]] std::uint64_t prompt_call_chunk(std::uint64_t rows) const override;
+    [[nodiscard]] std::uint32_t max_batch_verify_rows() const override;
     void verify(std::span<const CohortGroup> groups, std::span<const std::uint32_t> tokens,
                 std::span<std::uint32_t> top) override;
     [[nodiscard]] bool supports_final_logits() const override;

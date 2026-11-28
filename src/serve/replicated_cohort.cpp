@@ -15,7 +15,7 @@ namespace strix::serve {
 namespace {
 
 // Control block layout (32-bit words).
-constexpr std::uint32_t kMagic = 0x53524331U;  // "SRC1"
+constexpr std::uint32_t kMagic = 0x53524332U;  // "SRC2" (SRC1 + prefill_scoped)
 enum Word : std::uint32_t {
     kWMagic = 0, kWOp, kWRoundLo, kWRoundHi, kWAckLo, kWAckHi, kWRank, kWArg, kWFlag,
     kWRecords,       // deferred commit / release records
@@ -30,6 +30,7 @@ enum Op : std::uint32_t {
     kOpLogits = 6,   // collective_reads: read_final_logits(arg)
     kOpPropose = 7,  // collective_reads: propose(arg, room = flag)
     kOpSample = 8,   // collective_reads: sample_final(arg, sampler, position); body = sample_words()
+    kOpPrefillScoped = 9,  // prefill_scoped(arg, tokens, flag, prompt_tokens); body = prompt_tokens lo, hi, tokens
 };
 // Variable records: [kind, n, n words]. Commit: accept[]. Capture: lane, committed[]. Restore: lane, rows, prompt[0, rows]
 // (prompt[0, rows) when the whole prompt was restored).
@@ -196,6 +197,23 @@ void ReplicatedCohort::prefill(std::uint32_t lane, std::span<const std::uint32_t
     local_.prefill(lane, tokens, first);
 }
 
+// The whole prompt's length travels with the slice: a backend whose prefill route depends on it (prefill_scoped) runs
+// the same route on both ranks.
+void ReplicatedCohort::prefill_scoped(std::uint32_t lane, std::span<const std::uint32_t> tokens, bool first,
+                                      std::uint64_t prompt_tokens) {
+    body_.assign({lo(prompt_tokens), hi(prompt_tokens)});
+    body_.insert(body_.end(), tokens.begin(), tokens.end());
+    send(kOpPrefillScoped, lane, first ? 1U : 0U, body_);
+    local_.prefill_scoped(lane, tokens, first, prompt_tokens);
+}
+
+// Prompt cuts and the batch verify rectangle are rank 0 queries: rank 1 runs the calls rank 0 makes, cut where rank 0
+// cut them, so both ranks read the same rows.
+std::uint32_t ReplicatedCohort::prompt_tail_rows() const { return local_.prompt_tail_rows(); }
+PromptPieceRule ReplicatedCohort::prompt_piece_rule() const { return local_.prompt_piece_rule(); }
+std::uint64_t ReplicatedCohort::prompt_call_chunk(std::uint64_t rows) const { return local_.prompt_call_chunk(rows); }
+std::uint32_t ReplicatedCohort::max_batch_verify_rows() const { return local_.max_batch_verify_rows(); }
+
 void ReplicatedCohort::verify(std::span<const CohortGroup> groups, std::span<const std::uint32_t> tokens,
                               std::span<std::uint32_t> top) {
     std::uint64_t rows = 0;
@@ -356,7 +374,7 @@ std::uint64_t follow_cohort(CohortBackend& local, dist::Transport& link, Replica
             link.exchange(std::as_bytes(std::span(out)), std::as_writable_bytes(std::span(in)));
             pair::check_pair(mine, get_header(in));
             const std::uint32_t op = in[kWOp], words = in[kWPayload], deferred = in[kWDeferred];
-            if (op < kOpPrefill || op > kOpSample) throw pair::ProtocolError("cohort replica: unknown operation");
+            if (op < kOpPrefill || op > kOpPrefillScoped) throw pair::ProtocolError("cohort replica: unknown operation");
             if ((op == kOpLogits || op == kOpPropose || op == kOpSample) && !options.collective_reads)
                 throw pair::ProtocolError("cohort replica: collective read on a follower without collective_reads");
             if (deferred > words) throw pair::ProtocolError("cohort replica: deferred section beyond the payload");
@@ -415,6 +433,8 @@ std::uint64_t follow_cohort(CohortBackend& local, dist::Transport& link, Replica
             } else if (op == kOpSample) {
                 if (body.size() != kSampleWords || body[8] > static_cast<std::uint32_t>(SampledAcceptance::coupled))
                     throw pair::ProtocolError("cohort replica: bad sample call");
+            } else if (op == kOpPrefillScoped) {
+                if (body.size() < 2U) throw pair::ProtocolError("cohort replica: truncated scoped prefill");
             } else if (op != kOpPrefill && !body.empty()) {
                 throw pair::ProtocolError("cohort replica: body on a call without one");
             }
@@ -451,6 +471,9 @@ std::uint64_t follow_cohort(CohortBackend& local, dist::Transport& link, Replica
             switch (op) {
             case kOpPrefill:
                 local.prefill(in[kWArg], body, in[kWFlag] != 0U);
+                break;
+            case kOpPrefillScoped:
+                local.prefill_scoped(in[kWArg], body.subspan(2U), in[kWFlag] != 0U, join(body[0], body[1]));
                 break;
             case kOpPrefillGroup: {
                 const std::size_t n = in[kWArg];

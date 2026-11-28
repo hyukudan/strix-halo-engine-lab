@@ -1090,7 +1090,165 @@ void test_mixed_pass() {
 }
 
 
+// Optional slot hooks: a window decoder that also drafts on the device, retains prefixes, groups prompts, samples on
+// the device and takes per-request words. Every call is recorded.
+struct HookDecoder : WindowDecoder {
+    std::vector<std::uint32_t> released, captured, bound, controls, grouped;
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> proposed;  // slot, room
+    std::uint64_t restore_rows = 0;
+    bool drafter_loaded = true;
+    void release_slot(std::uint32_t slot) {
+        if (staged.at(slot) != 0U) throw std::logic_error("release under a staged window");
+        released.push_back(slot);
+    }
+    [[nodiscard]] bool device_drafts() const { return drafter_loaded; }
+    void propose_slot(std::uint32_t slot, std::uint32_t room, std::vector<std::uint32_t>& tokens,
+                      std::vector<double>& probability) {
+        if (std::ranges::any_of(staged, [](std::uint32_t r) { return r != 0U; }))
+            throw std::logic_error("propose over a staged window");
+        proposed.emplace_back(slot, room);
+        tokens.assign(room, 30U + slot);
+        probability.assign(room, 0.5);
+    }
+    std::uint64_t restore_slot(std::uint32_t slot, std::span<const std::uint32_t> prompt) {
+        const auto rows = std::min<std::uint64_t>(restore_rows, prompt.size());
+        history.at(slot).assign(prompt.begin(), prompt.begin() + static_cast<std::ptrdiff_t>(rows));
+        return rows;
+    }
+    void capture_slot(std::uint32_t slot, std::span<const std::uint32_t> committed) {
+        captured.push_back(slot * 100U + static_cast<std::uint32_t>(committed.size()));
+    }
+    [[nodiscard]] strix::serve::PrefillGroupCapacity prefill_group_capacity() const {
+        strix::serve::PrefillGroupCapacity c;
+        c.members = 3U;
+        c.rows = 96U;
+        return c;
+    }
+    [[nodiscard]] std::uint32_t prefill_route_class(std::uint64_t rows) const { return rows > 64U ? 2U : 1U; }
+    void prefill_slots(std::span<const strix::serve::CohortPrompt> members) {
+        for (const auto& m : members) {
+            prefill_slot(m.lane, m.tokens, m.first);
+            grouped.push_back(m.lane);
+        }
+    }
+    [[nodiscard]] bool samples_on_device() const { return true; }
+    std::uint32_t sample_slot_row(std::uint32_t row, strix::TokenSampler&, std::uint64_t position) {
+        return 500U + 10U * row + static_cast<std::uint32_t>(position);
+    }
+    void bind_slot(std::uint32_t slot, std::uint64_t id, std::span<const std::uint32_t> traits) {
+        bound.push_back(slot * 1000U + static_cast<std::uint32_t>(id) * 10U + static_cast<std::uint32_t>(traits.size()));
+    }
+    void control(std::span<const std::uint32_t> words) { controls.insert(controls.end(), words.begin(), words.end()); }
+};
+
+// Emits-first decoder offering the group pass: grouping stays off on that route.
+struct EmitsGroupDecoder : EmitsGreedyDecoder {
+    [[nodiscard]] strix::serve::PrefillGroupCapacity prefill_group_capacity() const {
+        strix::serve::PrefillGroupCapacity c;
+        c.members = 4U;
+        return c;
+    }
+    [[nodiscard]] std::uint32_t prefill_route_class(std::uint64_t) const { return 1U; }
+    void prefill_slots(std::span<const strix::serve::CohortPrompt>) {}
+};
+
+void test_optional_slot_hooks() {
+    // A decoder without the hooks keeps every CohortBackend default.
+    {
+        FixedKvCohort<GreedyDecoder> plain(std::make_unique<GreedyDecoder>(), 64U, 4U, 2U);
+        const std::uint32_t prompt[] = {1U, 2U, 3U};
+        check(!plain.device_drafts(), "no propose_slot: no device drafts");
+        check(plain.restore(0U, prompt) == 0U, "no restore_slot: nothing restored");
+        check(plain.prompt_group_capacity().members < 2U, "no prefill_slots: no grouping");
+        check(!plain.samples_on_device(), "no sample_slot_row: host sampling");
+        check(!throws([&] { plain.release(1U); }), "release without release_slot is bookkeeping only");
+    }
+    auto decoder = std::make_unique<HookDecoder>();
+    auto* raw = decoder.get();
+    FixedKvCohort<HookDecoder> cohort(std::move(decoder), 64U, 8U, 3U);
+    const std::uint32_t prompt[] = {31U, 32U, 33U, 34U};
+
+    // Retained prefixes: the decoder's rows, never the whole prompt (the last row is a prefill call's).
+    raw->restore_rows = 2U;
+    check(cohort.restore(0U, prompt) == 2U, "restore returns the decoder's rows");
+    raw->restore_rows = 4U;
+    check(throws([&] { (void)cohort.restore(0U, prompt); }), "a restore of the whole prompt is refused");
+    const std::uint32_t committed[] = {1U, 2U, 3U, 4U, 5U};
+    cohort.capture(2U, committed);
+    check(raw->captured == std::vector<std::uint32_t>{205U}, "capture forwards the slot and its committed ids");
+
+    // Per-request words and control messages.
+    const std::uint32_t traits[] = {9U, 9U};
+    cohort.bind_lane(1U, 4U, traits);
+    const std::uint32_t words[] = {77U, 78U};
+    cohort.control(words);
+    check(raw->bound == std::vector<std::uint32_t>{1042U}, "bind_lane forwards slot, request id and traits");
+    check(raw->controls == std::vector<std::uint32_t>{77U, 78U}, "control forwards the words");
+
+    // Grouped prompts on the plain prefill route.
+    check(cohort.prompt_group_capacity().members == 3U && cohort.prompt_group_capacity().rows == 96U,
+          "group capacity is the decoder's");
+    check(cohort.prompt_route_class(100U) == 2U && cohort.prompt_route_class(10U) == 1U, "route class is the decoder's");
+    const strix::serve::CohortPrompt members[] = {{0U, std::span(prompt).first(2), true},
+                                                  {1U, std::span(prompt).first(3), true}};
+    cohort.prefill_group(members);
+    check(raw->grouped == std::vector<std::uint32_t>{0U, 1U}, "one group pass over the members");
+    check(raw->history[1] == std::vector<std::uint32_t>{31U, 32U, 33U}, "a member's state is its prompt");
+
+    // Device drafts, and the run-time decline.
+    check(cohort.device_drafts(), "propose_slot: device drafts");
+    std::vector<std::uint32_t> drafts;
+    std::vector<double> probability;
+    cohort.propose(1U, 3U, drafts, probability);
+    check(raw->proposed.size() == 1U && raw->proposed[0] == std::pair<std::uint32_t, std::uint32_t>{1U, 3U} &&
+              drafts == std::vector<std::uint32_t>(3U, 31U) && probability.size() == 3U,
+          "propose forwards slot and room, returns the decoder's drafts");
+    raw->drafter_loaded = false;
+    check(!cohort.device_drafts(), "a decoder without a loaded drafter declines device drafts");
+    raw->drafter_loaded = true;
+
+    // Device sampling reads the lane's row of the pending one-row window.
+    const CohortGroup ones[] = {{1U, 1U}, {0U, 1U}};
+    const std::uint32_t one_tokens[] = {40U, 41U};
+    std::uint32_t one_top[2] = {};
+    cohort.verify(ones, one_tokens, one_top);
+    strix::TokenSamplingPolicy policy;
+    policy.temperature = 0.7f;
+    strix::TokenSampler sampler(policy, strix::TokenSamplerOptions{});
+    check(cohort.samples_on_device(), "sample_slot_row: device sampling");
+    check(cohort.sample_final(0U, sampler, 3U) == 513U, "sample_final samples the lane's row");
+    check(throws([&] { (void)cohort.sample_final(2U, sampler, 3U); }), "a lane outside the window is refused");
+    const std::uint32_t keep_ones[] = {1U, 1U};
+    cohort.commit(keep_ones);
+
+    // A release while a window is staged reaches the decoder only after the stage is resolved.
+    const CohortGroup window[] = {{1U, 3U, false}, {0U, 1U}};
+    const std::uint32_t window_tokens[] = {50U, 51U, 52U, 53U};
+    std::uint32_t window_top[4] = {};
+    cohort.verify(window, window_tokens, window_top);
+    cohort.release(1U);
+    check(raw->released.empty(), "release deferred while the lane's window is staged");
+    const std::uint32_t keep_window[] = {2U, 1U};
+    cohort.commit(keep_window);
+    check(raw->released == std::vector<std::uint32_t>{1U}, "the deferred release follows the commit");
+    check(raw->discarded == 1U, "the released lane's window was discarded, not kept");
+    cohort.release(2U);
+    check(raw->released == std::vector<std::uint32_t>{1U, 2U}, "with nothing staged a release is immediate");
+
+    // A hook that may touch device state resolves a staged window first (as a prefill does).
+    cohort.verify(window, window_tokens, window_top);
+    cohort.propose(0U, 1U, drafts, probability);
+    check(raw->discarded == 2U, "propose discards an unresolved staged window first");
+    check(throws([&] { cohort.commit(keep_window); }), "no commit after the window was discarded");
+
+    // Emits-first: the group pass is not offered.
+    FixedKvCohort<EmitsGroupDecoder> emits(std::make_unique<EmitsGroupDecoder>(), 64U, 4U, 2U);
+    check(emits.prompt_group_capacity().members < 2U, "emits-first route: no grouped prompts");
+    check(throws([&] { emits.prefill_group(members); }), "emits-first route: a group pass is refused");
+}
+
 int main() {
+    test_optional_slot_hooks();
     test_prompt_tail();
     test_geometry();
     test_greedy_window();
