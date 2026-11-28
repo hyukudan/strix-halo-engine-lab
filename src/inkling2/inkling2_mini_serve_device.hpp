@@ -196,8 +196,8 @@ inline MiniServeCohort make_mini_device_cohort(
                 // The same rule for a whole waiting prompt: one the policy would run in the integer class stays alone.
                 decoder->set_prompt_integer_rows([options = weight_options, device = scope.device_class,
                                                   product = scope.cost_device, context = std::uint64_t{opt.context},
-                                                  chunk](std::uint64_t rows) {
-                    return mini_prompt_moe(options, device, rows, true, nullptr,
+                                                  chunk](std::uint64_t prompt_rows) {
+                    return mini_prompt_moe(options, device, prompt_rows, true, nullptr,
                                            MiniPromptExecution{product, context, chunk}) ==
                            moe_core::grouped_w4a4::Activations::iu4_rot;
                 });
