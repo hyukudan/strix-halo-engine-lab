@@ -1,4 +1,6 @@
 #include "strix/token_sampling.hpp"
+#include "device/hip_cost_identity.hpp"
+#include "strix/profile/promotion_scope.hpp"
 #include "strix/hip/legacy_intrinsics.hpp"
 #include "strix/env_arms.hpp"
 #include "strix/device/hip_gate.hpp"
@@ -434,6 +436,11 @@ int main(int argc, char** argv) {
         std::shared_ptr<strix::glm::xfer::XferExchange> xfer_exchange;
         bool turbo_prefill_pair = false;
         std::string_view pair_link = rd::kMeasuredPrefillLayouts[0];  // the negotiated layout (execution key)
+        // The promotion scope (device product, pack content identity, route, ranks): read once, only when this run
+        // spells the promotion key (a sealed pf_wmma row or STRIX_PROMOTION_KEY=1).
+        const bool promotion_wanted = rd::promotion_key_wanted(rd::process_env());
+        const auto promotion = strix::profile::promotion_scope(promotion_wanted,
+            promotion_wanted ? strix::device::hip_cost_device_identity() : std::string{}, opt.model_dir, "cli", opt.world);
         const char* lt = std::getenv("STRIX_GLM_LOAD_TEST");
         if (opt.world == 2 && !(lt != nullptr && std::string(lt) == "1")) {
             if (transport_spec.empty()) throw std::invalid_argument("--world 2 needs --transport");
@@ -442,10 +449,11 @@ int main(int argc, char** argv) {
             (void)::setenv("STRIX_DIST_WAIT_TIMEOUT_MS", "600000", 0);
             auto opened = strix::dist::open_pair(transport_spec, opt.rank);
             pair_link = rd::prefill_link(opened.usb4_topology.streams, opened.direct != nullptr);
-            turbo_prefill_pair = rd::select_prefill_wmma(request, eff, rd::process_env(),
-                rd::single_lane_prefill(rd::ordinary_lossy_prefill(request, eff) &&
+            auto probe = rd::single_lane_prefill(rd::ordinary_lossy_prefill(request, eff) &&
                     rd::measured_prefill_pair(opened.usb4_topology.streams, opened.direct != nullptr) && !deployment.plan,
-                    rd::kPrefillProbePrompt, opt.capacity, opt.max_rows, decode_n, true, pair_link));
+                    rd::kPrefillProbePrompt, opt.capacity, opt.max_rows, decode_n, true, pair_link);
+            rd::apply_promotion_scope(probe, promotion);
+            turbo_prefill_pair = rd::select_prefill_wmma(request, eff, rd::process_env(), probe);
             auto transport = std::move(opened.host);
             const auto& receipt = opened.receipt;
             if (deployment.provider) deployment.resolve_live(opt, *transport);
@@ -1100,9 +1108,10 @@ int main(int argc, char** argv) {
                 if (peer != mine) throw std::runtime_error("prefill timer barrier: peer at prompt " + std::to_string(peer));
                 std::printf("rank %u prefill timer barrier: waited %.3f s for the peer\n", opt.rank, secs(tb, Clock::now()));
             }
-            const auto work = rd::single_lane_prefill(startup_handshake && turbo_prefill_pair && mtp_spec_on &&
+            auto work = rd::single_lane_prefill(startup_handshake && turbo_prefill_pair && mtp_spec_on &&
                     rd::measured_prefill_layout(eng.prefill_pipeline()) && embed_splice.empty() && bitcalc_cases.empty(),
                 toks.size(), opt.capacity, opt.max_rows, decode_n, rd::routed_prefill_scratch(), pair_link);
+            rd::apply_promotion_scope(work, promotion);
             const bool turbo = rd::select_prefill_wmma(request, eff, rd::process_env(), work);
             if (rd::ordinary_lossy_prefill(request, eff) && !strix::glm::pf::wmma_x::enabled())
                 rd::report_prefill_wmma(opt.rank, request, eff, rd::process_env(), work, turbo);

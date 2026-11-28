@@ -69,6 +69,8 @@ inline void report_prefill_wmma(unsigned rank, const Request& r, const Effective
     const auto product = resolve_product(r, env, e.baseline, work);
     const auto* row = product ? product->find("pf_wmma") : nullptr;
     if (row != nullptr && !row->ladder.empty()) std::fprintf(stderr, "rank %u %s\n", rank, row->ladder.c_str());
+    // The promotion key this prompt ran under (tools/strix-gate/promote.py drafts the manifest entry from it).
+    if (product && !work.scope.pack_sha256.empty()) std::fprintf(stderr, "profile %s\n", product->json().c_str());
 }
 
 }  // namespace strix::glm::rank_defaults

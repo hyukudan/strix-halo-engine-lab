@@ -50,6 +50,8 @@
 // C1 MTP: with one request in flight (none waiting) it decodes through the engine's exact single-slot self-speculation
 // (verify / commit / adaptive K, the CLI --decode route); rank 1 replays mtp_enter / mtp_run / mtp_leave. Any second
 // request ends the decoder at a cycle boundary (deferred rows flushed) and batched plain steps follow.
+#include "device/hip_cost_identity.hpp"
+#include "strix/profile/promotion_scope.hpp"
 #include "strix/glm/pair_state.hpp"
 #include "strix/pair/state_decls.hpp"
 #include "strix/device/hip_gate.hpp"
@@ -1376,13 +1378,21 @@ int main(int argc, char** argv) {
         ops.idle_communicator = comm.get();
         const bool turbo_candidate = turbo_prefill_device && rd::measured_prefill_layout(eng.prefill_pipeline()) &&
             !deployment.plan && !serial && rtx_prefill.empty() && import_listen.empty();
-        ops.turbo_prefill_pair = rd::select_prefill_wmma(request, eff, rd::process_env(),
-            rd::serve_prefill_work(turbo_candidate, true, rd::kPrefillProbePrompt, opt.capacity, opt.max_rows,
-                                   rd::kTurboPrefillGenerated, rd::routed_prefill_scratch(), pair_link));
+        // The promotion scope (device product, pack content identity, route, ranks): read once, only when this
+        // server spells the promotion key (a sealed pf_wmma row or STRIX_PROMOTION_KEY=1).
+        const bool promotion_wanted = rd::promotion_key_wanted(rd::process_env());
+        const auto promotion = strix::profile::promotion_scope(promotion_wanted,
+            promotion_wanted ? strix::device::hip_cost_device_identity() : std::string{}, opt.model_dir, "serve",
+            opt.world);
+        auto probe = rd::serve_prefill_work(turbo_candidate, true, rd::kPrefillProbePrompt, opt.capacity, opt.max_rows,
+                                            rd::kTurboPrefillGenerated, rd::routed_prefill_scratch(), pair_link);
+        rd::apply_promotion_scope(probe, promotion);
+        ops.turbo_prefill_pair = rd::select_prefill_wmma(request, eff, rd::process_env(), probe);
         if (rd::ordinary_lossy_prefill(request, eff) && !strix::glm::pf::wmma_x::enabled()) {
             ops.turbo_prefill_policy = [&](std::uint64_t prompt, unsigned generated, bool fresh) {
-                const auto work = rd::serve_prefill_work(ops.turbo_prefill_pair, fresh, prompt, opt.capacity, opt.max_rows,
-                                                         generated, rd::routed_prefill_scratch(), pair_link);
+                auto work = rd::serve_prefill_work(ops.turbo_prefill_pair, fresh, prompt, opt.capacity, opt.max_rows,
+                                                   generated, rd::routed_prefill_scratch(), pair_link);
+                rd::apply_promotion_scope(work, promotion);
                 const bool selected = rd::select_prefill_wmma(request, eff, rd::process_env(), work);
                 rd::report_prefill_wmma(opt.rank, request, eff, rd::process_env(), work, selected);
                 return selected;

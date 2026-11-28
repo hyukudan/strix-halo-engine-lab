@@ -15,6 +15,7 @@
 #include "glm/prefill/glm_pf_variants.hpp"
 #include "glm/prefill/glm_pf_capacity_policy.hpp"
 #include "strix/engine_profile.hpp"
+#include "strix/profile/promotion_scope.hpp"
 #include "strix/env_flags.hpp"
 #include "strix/session/kv_precision.hpp"
 #include "strix/glm_pair_profile_table.hpp"
@@ -349,7 +350,23 @@ struct PrefillWork {
     // The pair link layout of the run (strix::dist::LinkLayout::key(), one of kMeasuredPrefillLayouts): part of the
     // execution key, so a literal row timed on one layout decides only that layout.
     std::string_view link = kMeasuredPrefillLayouts[0];
+    // The promotion scope of the run (profile::PromotionScope, read once per process when promotion_key_wanted()):
+    // the full device product and the pack / route / rank scope of the promotion key. Empty: no promotion row decides.
+    std::string_view product{};
+    strix::profile::LadderScope scope{};
 };
+
+// Whether a GLM run spells the promotion key: a sealed pf_wmma promotion row, or STRIX_PROMOTION_KEY=1 (the captures
+// of a promotion). Only then the rank reads its promotion scope (profile::promotion_scope()).
+inline bool promotion_key_wanted(const EnvGet& env) {
+    const char* request = env(std::string(strix::profile::kPromotionKeySwitch).c_str());
+    return strix::profile::promotion_key_wanted(product_ladder_rows, request != nullptr ? request : "");
+}
+inline void apply_promotion_scope(PrefillWork& work, const strix::profile::PromotionScope& scope) {
+    if (!scope.known()) return;
+    work.product = scope.product;
+    work.scope = scope.scope();
+}
 
 // Rank runs its prompt loop serially. Serve calls this for a fresh whole prompt
 // with no decoding cohort. The reserved slot capacity is not a workload lane.
@@ -388,6 +405,9 @@ inline std::optional<strix::profile::Resolution> resolve_product(const Request& 
                                            : std::string{};
     inputs.regime = {p::Phase::prefill, work.prompt, work.lanes,
                      execution.empty() ? std::string_view{} : kTurboPrefillDevice, execution};
+    const auto promotion = execution.empty() ? std::string{} : p::ladder_promotion_execution({"hip", work.product,
+            {work.prompt, work.capacity, work.lanes, work.rows, work.rows, 1, 0, work.generated}, settings, work.scope});
+    inputs.regime.promotion_execution = promotion;
     auto product = p::resolve(product_profile_engine, inputs);
     // Baseline vetoes profile additions; explicit environment values still win.
     if (baseline) for (auto& entry : product.entries) {
