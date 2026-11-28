@@ -220,14 +220,13 @@ def plan(band, headroom=1.0):
 
 
 def arm_control(band, case, arm, control):
-    """The order-only control a null arm applied: declared in the spec, or "stderr" (its strix-route-file/v1 receipt)."""
+    """The control a null arm applied: declared in the spec, or "stderr" (the null record of its strix-route-file/v1
+    receipt, as the engine wrote it: an order-only control or the route one-ulp nudge)."""
     if control == "stderr":
         receipt = v2.route_receipt((band.out / "log" / f"{case}.{arm}.stderr").read_bytes(), f"{case}.{arm}")
-        control = receipt.get("null", {})
-        control = {"order": control.get("order"), "applications": control.get("applications")}
-    check(isinstance(control, dict) and isinstance(control.get("order"), str) and control["order"].strip()
-          and type(control.get("applications")) is int and control["applications"] > 0,
-          f"{case}.{arm}: the null control needs an order and a positive application count")
+        control = receipt.get("null")
+    check(v2.witnessed_null_control(control), f"{case}.{arm}: the null control needs an applied order-only control "
+          "(order, applications) or route nudge (layer, seed, nudged)")
     return control
 
 

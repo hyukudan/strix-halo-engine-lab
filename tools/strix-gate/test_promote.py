@@ -152,6 +152,23 @@ class Promote(unittest.TestCase):
         with self.assertRaisesRegex(promote.PromotionError, "null control"):
             promote.witness(self.band())
 
+    def test_route_nudge_null_promotes(self):
+        # The MoE route-file null (one FP32 ulp on layer L) is recorded as its receipt reports it, not as an order.
+        nudge = {"layer": 3, "seed": 1, "nudged": 262144}
+        self.spec["execution"]["controls"] = {"n0": nudge}
+        self.spec_path.write_text(json.dumps(self.spec), encoding="utf-8")
+        band = self.band()
+        promote.plan(band)
+        self.capture_candidate()
+        promote.witness(band)
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(promote.gate(band), (0, "PASS"))
+        accepted = promote.v2.witnessed_null_control
+        self.assertTrue(accepted({"order": "rms-swap@1", "applications": 2}) and accepted(nudge))
+        for bad in (None, {}, {"order": " ", "applications": 1}, {"order": "x", "applications": 0},
+                    {**nudge, "nudged": 0}, {**nudge, "layer": -1}, {**nudge, "extra": 1}, {"layer": 3, "seed": 1}):
+            self.assertFalse(accepted(bad), bad)
+
 
 if __name__ == "__main__":
     unittest.main()

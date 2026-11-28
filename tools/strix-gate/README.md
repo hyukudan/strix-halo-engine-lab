@@ -482,7 +482,8 @@ The document is `{"schema":"strix-gate-null-witness/v1","cases":{CASE:{ARM:RECOR
 and every null arm for every scored case. Each record carries `binary_sha256`, `model_sha256`,
 `numerical_config_sha256`, `logits_sha256`, and `control`. The binary, model and configuration excluding the control
 must match the exact reference. Its control is JSON null. A null control has the engine's versioned `order` and positive
-integer `applications`. For head captures also bind `head_ids_sha256` to the SHA-256 of the full prompt's little-endian
+integer `applications`, or is the MoE route-file one-ulp control exactly as its `strix-route-file/v1` receipt reports
+it (`layer`, `seed`, positive `nudged`). For head captures also bind `head_ids_sha256` to the SHA-256 of the full prompt's little-endian
 uint32 IDs. Step and spool captures include their labels in the hashed logit file. The launcher must collect these facts
 from the executed arms. The checker validates the binding of that record to the inputs. Disabling the check permits
 historical fixtures with no launcher record.

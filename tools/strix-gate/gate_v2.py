@@ -671,6 +671,19 @@ def document_uncertainty(windows, frozen):
             "dnll_cluster_se": cluster_se}
 
 
+def witnessed_null_control(control):
+    """An applied null control as a launcher records it: an engine's versioned order-only control
+    {"order": NAME, "applications": N > 0}, or the MoE route-file one-ulp control exactly as its strix-route-file/v1
+    receipt reports it {"layer": L >= 0, "seed": S >= 0, "nudged": N > 0} (the control null_control_applied() accepts)."""
+    if not isinstance(control, dict):
+        return False
+    if "order" in control:
+        return (isinstance(control["order"], str) and bool(control["order"].strip())
+                and type(control.get("applications")) is int and control["applications"] > 0)
+    return (set(control) == {"layer", "seed", "nudged"} and all(type(control[k]) is int for k in control)
+            and control["layer"] >= 0 and control["seed"] >= 0 and control["nudged"] > 0)
+
+
 def verify_null_witness(witness, case, arms, capture_hashes, head_ids):
     """Bind a launcher's control evidence to the consumed files and exact baseline identity."""
     records = witness.get(case)
@@ -694,9 +707,8 @@ def verify_null_witness(witness, case, arms, capture_hashes, head_ids):
         else:
             if identity != baseline:
                 raise GateError(f"{case}.{arm}: null witness differs from the reference binary, model or configuration")
-            if (not isinstance(control, dict) or not isinstance(control.get("order"), str) or not control["order"].strip()
-                    or type(control.get("applications")) is not int or control["applications"] <= 0):
-                raise GateError(f"{case}.{arm}: null witness needs an applied order-only control")
+            if not witnessed_null_control(control):
+                raise GateError(f"{case}.{arm}: null witness needs an applied order-only or route-nudge control")
 
 
 def verify_promotion_pair(records, case, arm, info, baseline, labels_sha, expected_config=None):
