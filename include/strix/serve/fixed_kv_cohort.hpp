@@ -75,8 +75,8 @@ struct SlotRows {
 //    (CohortBackend::restore / capture). Through this adapter a restore covers at most prompt.size() - 1 rows: the
 //    lane's last prompt row is always read by a prefill call (a larger answer is refused as a contract error).
 //  - prefill_group_capacity() -> PrefillGroupCapacity, prefill_route_class(rows) -> class and prefill_slots(members):
-//    one grouped prompt pass (CohortBackend::prompt_group_capacity / prompt_route_class / prefill_group). Offered only
-//    on the plain prefill route: with emits-first the capacity reads one member (no grouping).
+//    one grouped prompt pass (CohortBackend::prompt_group_capacity / prompt_route_class / prefill_group) on the plain
+//    prefill route; the emits-first route groups through prefill_group_first (above), else reads one member.
 //  - samples_on_device() const -> bool and sample_slot_row(row, sampler, position) -> id: device sampling of the
 //    row read_slot_logits(row, ...) would return (CohortBackend::samples_on_device / sample_final).
 //  - propose_slots(proposals): one drafter pass for the round's lanes (CohortBackend::propose_round), before the
@@ -137,8 +137,8 @@ public:
         if constexpr (kPlainPrefill) decoder_->prefill_slot(lane, tokens, first);
     }
 
-    // Grouped whole prompts (emits-first decoders offering prefill_group_first): the decoder's capacity and route class,
-    // else the backend defaults (no grouping, the solo loop).
+    // Grouped whole prompts: emits-first decoders through prefill_group_first (capacity capped at the lanes), plain-route
+    // decoders through prefill_slots; else the backend defaults (no grouping, the solo loop).
     [[nodiscard]] PrefillGroupCapacity prompt_group_capacity() const override {
         if constexpr (kGroups) {
             if (emits_first_) {
@@ -147,11 +147,17 @@ public:
                 return capacity;
             }
         }
+        if constexpr (kSlotGroups) {
+            if (!emits_first_) return decoder_->prefill_group_capacity();  // the plain route's grouped prompt pass
+        }
         return CohortBackend::prompt_group_capacity();
     }
     [[nodiscard]] std::uint32_t prompt_route_class(std::uint64_t rows) const override {
         if constexpr (kGroups) {
             if (emits_first_) return decoder_->prefill_route_class(rows);
+        }
+        if constexpr (kSlotGroups) {
+            if (!emits_first_) return decoder_->prefill_route_class(rows);
         }
         return CohortBackend::prompt_route_class(rows);
     }
@@ -174,7 +180,13 @@ public:
                 return;
             }
         }
-        CohortBackend::prefill_group(members);
+        if constexpr (kSlotGroups) {
+            if (emits_first_) throw std::logic_error("fixed KV cohort: no grouped prompt pass on the emits-first route");
+            before_work();
+            decoder_->prefill_slots(members);
+        } else {
+            CohortBackend::prefill_group(members);
+        }
     }
 
     [[nodiscard]] std::uint32_t prefill_top(std::uint32_t lane) override {
@@ -412,26 +424,6 @@ public:
         }
     }
 
-    [[nodiscard]] PrefillGroupCapacity prompt_group_capacity() const override {
-        if constexpr (kGroups) {
-            if (!emits_first_) return decoder_->prefill_group_capacity();
-        }
-        return CohortBackend::prompt_group_capacity();
-    }
-    [[nodiscard]] std::uint32_t prompt_route_class(std::uint64_t rows) const override {
-        if constexpr (kGroups) return decoder_->prefill_route_class(rows);
-        else return CohortBackend::prompt_route_class(rows);
-    }
-    void prefill_group(std::span<const CohortPrompt> members) override {
-        if constexpr (kGroups) {
-            if (emits_first_) throw std::logic_error("fixed KV cohort: no grouped prompt pass on the emits-first route");
-            before_work();
-            decoder_->prefill_slots(members);
-        } else {
-            CohortBackend::prefill_group(members);
-        }
-    }
-
     [[nodiscard]] bool samples_on_device() const override {
         if constexpr (kSamples) return decoder_->samples_on_device();
         else return false;
@@ -536,8 +528,8 @@ private:
         { decoder.restore_slot(std::uint32_t{}, tokens) } -> std::convertible_to<std::uint64_t>;
         decoder.capture_slot(std::uint32_t{}, tokens);
     };
-    static constexpr bool kGroups = requires(Decoder& decoder, const Decoder& view,
-                                             std::span<const CohortPrompt> members) {
+    static constexpr bool kSlotGroups = requires(Decoder& decoder, const Decoder& view,
+                                                 std::span<const CohortPrompt> members) {
         { view.prefill_group_capacity() } -> std::convertible_to<PrefillGroupCapacity>;
         { view.prefill_route_class(std::uint64_t{}) } -> std::convertible_to<std::uint32_t>;
         decoder.prefill_slots(members);
