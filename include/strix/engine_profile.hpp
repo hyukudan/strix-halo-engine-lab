@@ -1852,7 +1852,9 @@ template <class ResolveAt>
     const auto bound = [](std::uint64_t v) { return v == 0U ? std::string("any") : std::to_string(v); };
     const std::string extent = "context<=" + bound(max_context) + " lanes<=" + (max_lanes == 0U ? "auto" : bound(max_lanes));
     const std::string what = std::string(lever) + "=" + std::string(value);
-    if (selects(max_context, max_lanes == 0U ? 1U : max_lanes)) return {true, what + " selected in the extent's own regime (" + extent + ")"};
+    // The extent's own regime as the instance resolves it (max_lanes 0 = lanes left to the memory budget, the regime the
+    // load decided in); a lane count inside it that a row decides is found by the row probes below.
+    if (selects(max_context, max_lanes)) return {true, what + " selected in the extent's own regime (" + extent + ")"};
     std::string rows, met;
     for (const auto& row : engine.ladder) {
         if (row.lever != lever || row.incumbent || row.device != device || row.phase != phase) continue;
